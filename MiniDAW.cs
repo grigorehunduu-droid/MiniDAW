@@ -489,23 +489,87 @@ class Effect
     }
 }
 
+// A pattern placed on the playlist. It plays from Start for its length; a clip longer than its pattern repeats it, and a
+// trimmed clip skips the pattern's first Offset 16ths.
+class Clip
+{
+    public int Track, Pattern;
+    public double Start, Offset;   // in 16ths
+    public double Len = -1;        // in 16ths; -1 = as long as its pattern (and it follows the pattern's length until resized)
+    public double Length(Project p) { return Len > 0 ? Len : Pattern < p.Patterns.Count ? p.Patterns[Pattern].Length : Project.Steps; }
+    public Clip Copy() { return (Clip)MemberwiseClone(); }
+}
+
+class Track { public string Name; public int Color; public bool Mute; }   // a playlist track's name, colour and mute; null name = "Track N"
+class Marker { public double At; public string Name; public int Beats; }   // at a 16th in the song; Beats > 0: the time signature becomes Beats/4 from here
+
+// The playlist seen as a [track, bar] grid of clips that start on a bar and follow their pattern's length: how the playlist
+// worked before clips could be trimmed and resized. Code and tests that place whole patterns use it.
+class PlaylistGrid
+{
+    readonly Project p;
+    public PlaylistGrid(Project p) { this.p = p; }
+    public int this[int t, int b]
+    {
+        get { foreach (var c in p.Clips) if (c.Track == t && c.Start == b * Project.Steps) return c.Pattern; return -1; }
+        set { p.Clips.RemoveAll(c => c.Track == t && c.Start == b * Project.Steps); if (value >= 0) p.Clips.Add(new Clip { Track = t, Start = b * Project.Steps, Pattern = value }); }
+    }
+}
+
 class Project
 {
-    public const int Steps = 16, Tracks = 8, Bars = 32, Inserts = 9;   // Steps = 16ths per bar; insert 0 = master
+    public const int Steps = 16, Tracks = 500, Bars = 32, Inserts = 9;   // Steps = 16ths per bar; Bars: the span of automation lanes; insert 0 = master
+    public const int MaxBars = 999;                                      // the longest song
     public const int MinBpm = 40, MaxBpm = 300;
     public int Bpm = 128;
     public float Swing;   // 0 = straight; 1 = every off-beat 16th is played half a 16th late (a 75/25 shuffle), like FL's swing knob
     public Insert[] Mixer = new Insert[Inserts];
     public List<Channel> Channels = new List<Channel>();
     public List<Pattern> Patterns = new List<Pattern>();
-    public int[,] Playlist = new int[Tracks, Bars];   // pattern index or -1
+    public List<Clip> Clips = new List<Clip>();
+    public readonly PlaylistGrid Playlist;
+    public readonly Track[] TrackInfo = new Track[Tracks];   // null = a default track
+    public List<Marker> Markers = new List<Marker>();
+    public double LoopFrom, LoopTo;                          // in 16ths; a loop region for Song mode when LoopTo > LoopFrom
     public List<Lane> Automation = new List<Lane>();
     public List<string> Warnings = new List<string>();
 
     public Project()
     {
-        for (int t = 0; t < Tracks; t++) for (int b = 0; b < Bars; b++) Playlist[t, b] = -1;
+        Playlist = new PlaylistGrid(this);
         for (int i = 0; i < Inserts; i++) Mixer[i] = new Insert { Vol = i == 0 ? 0.8f : 1f };
+    }
+
+    public Track TrackAt(int t) { return TrackInfo[t] ?? (TrackInfo[t] = new Track()); }
+    public bool TrackMuted(int t) { return t >= 0 && t < Tracks && TrackInfo[t] != null && TrackInfo[t].Mute; }
+    public string TrackName(int t) { return TrackInfo[t] != null && TrackInfo[t].Name != null ? TrackInfo[t].Name : "Track " + (t + 1); }
+
+    // Every pattern sounding at song step abs, with the step inside it, as Play hears it (muted tracks left out).
+    public List<KeyValuePair<Pattern, int>> SoundingAt(int abs)
+    {
+        var hits = new List<KeyValuePair<Pattern, int>>();
+        foreach (var c in Clips)
+        {
+            double rel = abs - c.Start;
+            if (rel < -1e-9 || rel >= c.Length(this) - 1e-9 || c.Pattern >= Patterns.Count || TrackMuted(c.Track)) continue;
+            var pat = Patterns[c.Pattern];
+            hits.Add(new KeyValuePair<Pattern, int>(pat, (int)Math.Floor((rel + c.Offset) % pat.Length + 1e-6) % pat.Length));
+        }
+        return hits;
+    }
+
+    // Time signature at a song step: bar starts follow the markers (4/4 before the first). Returns whether step starts a bar,
+    // and its bar number (from 1) and beats per bar.
+    public bool BarAt(double step, out int bar, out int beats)
+    {
+        double from = 0; bar = 1; beats = 4;
+        foreach (var m in Markers.Where(x => x.Beats > 0).OrderBy(x => x.At))
+        {
+            if (m.At > step + 1e-9) break;
+            int n = (int)Math.Ceiling((m.At - from) / (beats * 4) - 1e-9); bar += n; from = m.At; beats = m.Beats;   // a change starts a new bar
+        }
+        double into = step - from; bar += (int)Math.Floor(into / (beats * 4) + 1e-9);
+        return Math.Abs(into % (beats * 4)) < 1e-9 || Math.Abs(into % (beats * 4) - beats * 4) < 1e-9;
     }
 
     public static Project Demo()
@@ -535,8 +599,9 @@ class Project
     // which is safe because export runs on the UI thread, their only writer.
     public Project ExportCopy()
     {
-        var p = new Project { Bpm = Bpm, Swing = Swing, Channels = Channels.Select(c => c.Copy()).ToList(), Patterns = Patterns, Playlist = Playlist,
+        var p = new Project { Bpm = Bpm, Swing = Swing, Channels = Channels.Select(c => c.Copy()).ToList(), Patterns = Patterns, Clips = Clips, Markers = Markers,
                               Automation = Automation };   // lanes target by index, so they drive the copy
+        Array.Copy(TrackInfo, p.TrackInfo, Tracks);
         for (int i = 0; i < Inserts; i++)
         {
             Insert m = Mixer[i], c = p.Mixer[i];
@@ -575,44 +640,31 @@ class Project
     public void RemovePattern(int k)   // the playlist stores pattern indices: clear this one's cells, shift later ones down
     {
         Patterns.RemoveAt(k);
-        for (int t = 0; t < Tracks; t++)
-            for (int b = 0; b < Bars; b++)
-            {
-                int v = Playlist[t, b];
-                if (v == k) Playlist[t, b] = -1; else if (v > k) Playlist[t, b] = v - 1;
-            }
+        Clips.RemoveAll(c => c.Pattern == k);
+        foreach (var c in Clips) if (c.Pattern > k) c.Pattern--;
     }
 
-    public int SongBars()
+    public int SongBars()   // whole bars to the end of the last clip
     {
-        int last = 0;
-        for (int t = 0; t < Tracks; t++)
-            for (int b = 0; b < Bars; b++)
-            {
-                int p = Playlist[t, b];
-                if (p >= 0) last = Math.Max(last, b + (p < Patterns.Count ? Patterns[p].Bars : 1));
-            }
-        return Math.Max(1, Math.Min(Bars, last));   // a long pattern near the end is cut at the last bar (automation lanes stop there too)
+        double end = Steps;
+        foreach (var c in Clips) end = Math.Max(end, c.Start + c.Length(this));
+        return Math.Max(1, Math.Min(MaxBars, (int)Math.Ceiling(end / Steps - 1e-9)));
     }
 
     public void MoveClip(int t0, int b0, int t1, int b1, bool copy)   // the clip starting at track t0, bar b0 goes to t1, b1; copy keeps the original
     {
-        int p = Playlist[t0, b0];
-        if (p < 0 || (t0 == t1 && b0 == b1)) return;
-        if (!copy) Playlist[t0, b0] = -1;
-        Playlist[t1, b1] = p;   // replaces a clip that started there, like placing a pattern does
+        var c = Clips.FirstOrDefault(x => x.Track == t0 && x.Start == b0 * Steps);
+        if (c == null || (t0 == t1 && b0 == b1)) return;
+        Clips.RemoveAll(x => x != c && x.Track == t1 && x.Start == b1 * Steps);   // replaces a clip that started there, like placing a pattern does
+        if (copy) { c = c.Copy(); Clips.Add(c); }
+        c.Track = t1; c.Start = b1 * Steps;
     }
 
-    public int ClipAt(int t, int b)   // start bar of the pattern clip on track t that covers bar b, or -1
+    public int ClipAt(int t, int b)   // start bar of a clip on track t that covers bar b, or -1
     {
-        for (int k = 0; k < Pattern.MaxBars && k <= b; k++)
-        {
-            int p = Playlist[t, b - k];
-            if (p >= 0 && p < Patterns.Count && Patterns[p].Bars > k) return b - k;
-        }
+        foreach (var c in Clips) if (c.Track == t && c.Start < (b + 1) * Steps - 1e-9 && c.Start + c.Length(this) > b * Steps + 1e-9) return (int)(c.Start / Steps);
         return -1;
     }
-
     public void Save(string path) { File.WriteAllLines(path, Lines()); }
 
     public List<string> Lines()   // the whole project as text: the file format, and the undo snapshots
@@ -634,8 +686,14 @@ class Project
             for (int ch = 0; ch < pat.Notes.Count; ch++)
                 foreach (var n in pat.Notes[ch]) w.Add(string.Join("\t", "n", ch, n.Step.ToString("R"), n.Key, n.Len.ToString("R"), n.Vel, n.Pan.ToString("R"), n.Fine, n.Slide ? "1" : "0"));
         }
-        for (int t = 0; t < Tracks; t++) for (int b = 0; b < Bars; b++)
-            if (Playlist[t, b] >= 0) w.Add(string.Join("\t", "pl", t, b, Playlist[t, b]));
+        foreach (var c in Clips) w.Add(string.Join("\t", "clip", c.Track, c.Start.ToString("R"), c.Pattern, c.Len.ToString("R"), c.Offset.ToString("R")));
+        for (int t = 0; t < Tracks; t++)
+        {
+            var tr = TrackInfo[t];
+            if (tr != null && (tr.Name != null || tr.Color != 0 || tr.Mute)) w.Add(string.Join("\t", "track", t, Clean(tr.Name ?? ""), tr.Color, tr.Mute ? "1" : "0"));
+        }
+        foreach (var m in Markers) w.Add(string.Join("\t", "marker", m.At.ToString("R"), m.Beats, Clean(m.Name ?? "")));
+        if (LoopTo > LoopFrom) w.Add(string.Join("\t", "loop", LoopFrom.ToString("R"), LoopTo.ToString("R")));
         foreach (var l in Automation)   // "autotempo"; "autoch" = a channel's sound setting; "auto" = a mixer control (the older line kept as it was)
             w.Add(l.Tempo ? "autotempo\t" + string.Join("\t", l.Values.Select(v => v.ToString("R")))
                 : l.Ch >= 0 ? string.Join("\t", "autoch", l.Ch, l.Param, string.Join("\t", l.Values.Select(v => v.ToString("R"))))
@@ -743,8 +801,27 @@ class Project
             else if (f[0] == "pl")
             {
                 if (f.Length < 4) throw new InvalidDataException("Bad playlist item on line " + (li + 1));
-                p.Playlist[Int(f[1], 0, Tracks - 1), Int(f[2], 0, Bars - 1)] = Int(f[3], 0, int.MaxValue);
+                p.Playlist[Int(f[1], 0, Tracks - 1), Int(f[2], 0, MaxBars - 1)] = Int(f[3], 0, int.MaxValue);   // older files: whole patterns on bars
             }
+            else if (f[0] == "clip")
+            {
+                if (f.Length < 6) throw new InvalidDataException("Bad playlist clip on line " + (li + 1));
+                double len = double.Parse(f[4], CultureInfo.InvariantCulture);
+                p.Clips.Add(new Clip { Track = Int(f[1], 0, Tracks - 1), Start = Dbl(f[2], 0, MaxBars * Steps), Pattern = Int(f[3], 0, int.MaxValue),
+                                       Len = len < 0 ? -1 : Dbl(f[4], 1e-6, MaxBars * Steps), Offset = Dbl(f[5], 0, MaxBars * Steps) });
+            }
+            else if (f[0] == "track")
+            {
+                if (f.Length < 5) throw new InvalidDataException("Bad track on line " + (li + 1));
+                var tr = p.TrackAt(Int(f[1], 0, Tracks - 1));
+                tr.Name = f[2] == "" ? null : f[2]; tr.Color = int.Parse(f[3], CultureInfo.InvariantCulture); tr.Mute = f[4] == "1";
+            }
+            else if (f[0] == "marker")
+            {
+                if (f.Length < 4) throw new InvalidDataException("Bad marker on line " + (li + 1));
+                p.Markers.Add(new Marker { At = Dbl(f[1], 0, MaxBars * Steps), Beats = Int(f[2], 0, 16), Name = f[3] });
+            }
+            else if (f[0] == "loop" && f.Length >= 3) { p.LoopFrom = Dbl(f[1], 0, MaxBars * Steps); p.LoopTo = Dbl(f[2], 0, MaxBars * Steps); }
             else if (f[0] == "auto")
             {
                 var l = new Lane();
@@ -770,8 +847,7 @@ class Project
             }
         }
         if (p.Patterns.Count == 0) p.Patterns.Add(new Pattern { Name = "Pattern 1" });
-        for (int t = 0; t < Tracks; t++) for (int b = 0; b < Bars; b++)
-            if (p.Playlist[t, b] >= p.Patterns.Count) throw new InvalidDataException("Playlist refers to a missing pattern.");
+        if (p.Clips.Any(c => c.Pattern >= p.Patterns.Count)) throw new InvalidDataException("Playlist refers to a missing pattern.");
         return p;
     }
 }
@@ -1178,16 +1254,13 @@ static class Midi
                 var lane = p.Automation.FirstOrDefault(l => l.Tempo);
                 for (int abs = 0, last = -1; abs < len; abs++)
                 {
-                    int bar = abs / Project.Steps;
-                    for (int t = 0; t < Project.Tracks; t++)   // the same clips Engine.Trigger would play at this step
+                    foreach (var hit in p.SoundingAt(abs))   // the same clips Engine.Trigger plays at this step
                     {
-                        int b0 = p.ClipAt(t, bar);
-                        if (b0 < 0) continue;
-                        var pat = p.Patterns[p.Playlist[t, b0]]; int s = (bar - b0) * Project.Steps + abs % Project.Steps;
+                        var pat = hit.Key; int s = hit.Value;
                         for (int ch = 0; ch < Math.Min(pat.Notes.Count, p.Channels.Count); ch++)
                             if (!p.Channels[ch].Mute) foreach (var n in pat.Notes[ch]) if (!n.Slide && n.Step >= s && n.Step < s + 1) starts.Add(Tuple.Create(abs + n.Step - s, ch, n));
                     }
-                    int bpm = lane == null ? p.Bpm : (int)Math.Round(Project.MinBpm + lane.Values[abs] * (Project.MaxBpm - Project.MinBpm));
+                    int bpm = lane == null ? p.Bpm : (int)Math.Round(Project.MinBpm + lane.Values[Math.Min(abs, lane.Values.Length - 1)] * (Project.MaxBpm - Project.MinBpm));
                     if (bpm != last) { tempo.Add(Tuple.Create(abs * PerStep, 2, Tempo(bpm))); last = bpm; }   // a tempo lane: one change per 16th it moves
                 }
             }
@@ -1353,11 +1426,11 @@ static class Midi
                 list.Add(new Note { Step = at, Key = key, Len = Math.Max(1 / 24.0, Math.Min(Math.Max(drum ? 1 : 0, step(n.Off) - s), pt.Length - at)), Vel = Math.Max(1, Math.Min(127, n.Vel)) });
             }
             // place the patterns in order on the first playlist track that's empty for the whole length
-            int bars = Math.Min(Project.Bars, (int)Math.Ceiling(endStep / Project.Steps - 1e-9)), track = -1;
+            int bars = Math.Min(Project.MaxBars, (int)Math.Ceiling(endStep / Project.Steps - 1e-9)), track = -1;
             for (int t = 0; t < Project.Tracks && track < 0; t++)
-                if (Enumerable.Range(0, bars).All(b => p.ClipAt(t, b) < 0)) track = t;
+                if (!p.Clips.Any(c => c.Track == t && c.Start < bars * Project.Steps)) track = t;   // a track that's empty for the whole length
             int placed = 0;
-            if (track >= 0) for (int i = 0; i < patCount && i * Pattern.MaxBars < Project.Bars; i++, placed++) p.Playlist[track, i * Pattern.MaxBars] = firstPat + i;
+            if (track >= 0) for (int i = 0; i < patCount && i * Pattern.MaxBars < Project.MaxBars; i++, placed++) p.Playlist[track, i * Pattern.MaxBars] = firstPat + i;
             int total = p.Patterns.Skip(firstPat).Sum(x => x.Notes.Sum(l => l.Count));
             string where = track < 0 ? "No playlist track was free for it, so place the patterns yourself."
                 : placed < patCount ? "Patterns 1–" + placed + " are on playlist track " + (track + 1) + "; the rest go past the playlist's end."
@@ -1389,6 +1462,7 @@ class Engine
     class Arp { public readonly List<Held> Notes = new List<Held>(); public int Index; public double Wait; }
     readonly Dictionary<Channel, Arp> arps = new Dictionary<Channel, Arp>();
     long now;   // the sample being rendered, counted from the engine's start
+    int lastAbs; // song step last played (Song mode): automation reads its lanes there
     Arp ArpOf(Channel c) { Arp a; if (!arps.TryGetValue(c, out a)) arps[c] = a = new Arp(); return a; }
 
     public volatile Project Proj;
@@ -1544,7 +1618,7 @@ class Engine
     {
         lock (proj)
         {
-            int len = proj.SongBars() * Project.Steps, idx = step == 0 ? 0 : (step - 1) % len, next = Math.Min(idx + 1, len - 1);
+            int last = Project.Bars * Project.Steps - 1, idx = Math.Min(last, Math.Max(0, lastAbs)), next = Math.Min(idx + 1, last);   // lanes span the first Bars bars; past them they hold their last value
             float frac = step == 0 ? 0 : (float)Math.Max(0, Math.Min(1, (sps - toNext) / sps));   // how far we are into the current 16th
             foreach (var l in proj.Automation) l.Set(proj, l.Values[idx] + (l.Values[next] - l.Values[idx]) * frac);
         }
@@ -1649,13 +1723,10 @@ class Engine
             var hits = new List<KeyValuePair<Pattern, int>>();   // each pattern sounding now, and the step within it
             if (SongMode)
             {
-                int abs = st % (proj.SongBars() * Project.Steps), bar = abs / Project.Steps;
-                PlayStep = abs;
-                for (int t = 0; t < Project.Tracks; t++)
-                {
-                    int b0 = proj.ClipAt(t, bar);   // a 2-bar pattern placed at bar 3 also plays through bar 4
-                    if (b0 >= 0) hits.Add(new KeyValuePair<Pattern, int>(proj.Patterns[proj.Playlist[t, b0]], (bar - b0) * Project.Steps + abs % Project.Steps));
-                }
+                int songLen = proj.SongBars() * Project.Steps, loopLen = (int)(proj.LoopTo - proj.LoopFrom);
+                int abs = loopLen > 0 && StepLimit == int.MaxValue ? (int)proj.LoopFrom + st % loopLen : st % songLen;   // the loop region, while playing live (exports play the whole song)
+                PlayStep = lastAbs = abs;
+                hits = proj.SoundingAt(abs);
             }
             else
             {
@@ -1663,7 +1734,8 @@ class Engine
                 PlayStep = st % cur.Length;
                 hits.Add(new KeyValuePair<Pattern, int>(cur, st % cur.Length));
             }
-            if (Metronome && PlayStep % 4 == 0) Click(PlayStep % Project.Steps == 0);   // every beat; the first of each bar higher
+            int barNo, beats;
+            if (Metronome && PlayStep % 4 == 0) Click(SongMode ? proj.BarAt(PlayStep, out barNo, out beats) : PlayStep % Project.Steps == 0);   // every beat; the first of each bar higher
             foreach (var hit in hits)
                 for (int ch = 0, s = hit.Value; ch < Math.Min(hit.Key.Notes.Count, proj.Channels.Count); ch++)
                 {
@@ -2347,6 +2419,7 @@ class MainForm : Form
         roll.MouseUp += (s, e) => { dragNotes = null; dragMode = null; if (boxFrom.HasValue) FinishBox(); if (moving != null) FinishMove(); };
         roll.MouseWheel += RollWheel;
         playlist.Paint += PaintPlaylist; playlist.MouseDown += PlaylistDown; playlist.MouseMove += PlaylistMouse; playlist.MouseUp += (s, e) => FinishClipDrag();
+        playlist.MouseWheel += PlaylistWheel;
         mixer.Paint += PaintMixer; mixer.MouseDown += MixerDown; mixer.MouseMove += MixerMove;
         mixer.MouseUp += (s, e) => { dragMode = null; dragFx = null; if (slotDragIns >= 0) FinishSlotDrag(e); };
         foreach (var c in new[] { rack, roll, playlist, mixer }) c.MouseUp += (s, e) => EndEdit();
@@ -3849,144 +3922,294 @@ class MainForm : Form
         m.Show(mixer, at);
     }
 
-    // ---- playlist: tracks x bars, each cell holds a pattern
+    // ---- playlist: up to 500 tracks of clips over up to 999 bars, scrolled and zoomed; a ruler with markers, time signatures and a loop region
+    int plTop; float plRowH = 22.5f;           // first track shown; track height
+    double plFrom, plSpan = 32 * 16, plSnap = 16;   // first 16th shown; 16ths shown; the clip grid (bar, beat, 16th)
+    const int PlHead = 118, PlY0 = 38, PlSnapX = 92, PlSnapW = 92;
+    static readonly string[] PlSnapNames = { "bar", "beat", "1/16" }; static readonly double[] PlSnaps = { 16, 4, 1 };
+    Clip plClip, plOrig; string plMode; double plGrab, loopDown; bool plMoved;   // a clip being moved / resized / trimmed, as it was, and where it was grabbed
+
+    float PlCw() { return (float)((playlist.Width - PlHead) / plSpan); }
+    float PlX(double st) { return (float)(PlHead + (st - plFrom) * PlCw()); }
+    double PlStep(float x) { return plFrom + (x - PlHead) / PlCw(); }
+    int PlTrack(float y) { return plTop + (int)Math.Floor((y - PlY0) / plRowH); }
+    float PlTrackY(int t) { return PlY0 + (t - plTop) * plRowH; }
+    double PlSnapDown(double st) { return Math.Floor(st / plSnap + 1e-9) * plSnap; }
+    double PlSnapNear(double st) { return Math.Round(st / plSnap) * plSnap; }
+    Clip ClipHit(int t, double st) { return P.Clips.LastOrDefault(c => c.Track == t && st >= c.Start && st < c.Start + c.Length(P)); }
+
     void PaintPlaylist(object sender, PaintEventArgs e)
     {
-        var g = e.Graphics;
+        var g = e.Graphics; int W = playlist.Width, H = playlist.Height;
         Header(g, playlist, "PLAYLIST");
         int nl = P.Automation.Count; bool auto = selLane >= 0 && selLane < nl;
-        g.DrawString(auto ? "drag: draw the automation curve (top = max) · plays in Song mode" : "click: place pattern · drag a clip: move (Shift: copy) · click a clip: edit its pattern · right: erase · Pattern list right-click: rename / delete / length", Small, DimB, 80, 5);
-        RouteBox(g, playlist.Width - AutoBoxX, 4, AutoBoxW, nl == 0 ? "automation: right-click a mixer control, a rack bar or BPM to add a lane"
+        RouteBox(g, PlSnapX, 4, PlSnapW, "snap: " + PlSnapNames[Array.IndexOf(PlSnaps, plSnap)], plSnap != 16);
+        g.DrawString(auto ? "drag: draw the automation curve (top = max) · plays in Song mode"
+            : "click: place · drag: move (Shift: copy) · edges: resize / trim · Ctrl+click: split · right: erase · ruler: drag = loop, right-click = markers · wheel: tracks · Shift / Ctrl: across",
+            Small, DimB, new RectangleF(PlSnapX + PlSnapW + 10, 5, Math.Max(10, W - AutoBoxX - PlSnapX - PlSnapW - 20), 14), Fit);
+        RouteBox(g, W - AutoBoxX, 4, AutoBoxW, nl == 0 ? "automation: right-click a mixer control, a rack bar or BPM to add a lane"
             : auto ? "automating " + P.Automation[selLane].Name(P) + "  (" + (selLane + 1) + "/" + nl + ")" : "automation: off · click to edit (" + nl + " lanes)", auto);
-        if (auto) RouteBox(g, playlist.Width - 78, 4, 72, "delete lane", true);
-        float cw = (playlist.Width - PlLabel) / (float)Project.Bars, rh = (playlist.Height - Top0 - 14) / (float)Project.Tracks;
-        float y0 = Top0 + 12, gh = Project.Tracks * rh;
-        for (int b = 0; b < Project.Bars; b += 4) g.DrawString((b + 1).ToString(), Small, b == 0 ? TxtB : DimB, PlLabel + b * cw + 2, Top0 - 2);
-        for (int t = 0; t < Project.Tracks; t++)   // lanes, alternating shades, with a name tab
+        if (auto) RouteBox(g, W - 78, 4, 72, "delete lane", true);
+        float cw = PlCw(); double to = plFrom + plSpan;
+        // ruler: bar numbers (following time signatures), the loop region, markers
+        using (var b = new SolidBrush(Color.FromArgb(24, 27, 33))) g.FillRectangle(b, PlHead, 23, W - PlHead, PlY0 - 23);
+        if (P.LoopTo > P.LoopFrom)
+            using (var b = new SolidBrush(Color.FromArgb(90, On))) g.FillRectangle(b, PlX(P.LoopFrom), 24, (float)((P.LoopTo - P.LoopFrom) * cw), PlY0 - 26);
+        var bars = new List<double>(); int barNo, beats, lastLabel = -100;
+        for (int st = (int)Math.Floor(plFrom); st <= to; st++) if (P.BarAt(st, out barNo, out beats)) bars.Add(st);
+        float barPx = (float)(16 * cw); int every = barPx >= 30 ? 1 : barPx >= 12 ? 4 : 16;
+        foreach (var st in bars)
         {
-            float y = y0 + t * rh;
-            using (var br = new SolidBrush(t % 2 == 0 ? Color.FromArgb(31, 35, 42) : Color.FromArgb(27, 31, 37))) g.FillRectangle(br, PlLabel, y, playlist.Width - PlLabel, rh);
-            Round(g, Raised, 4, y + 1, PlLabel - 8, rh - 2, 3);
-            g.DrawString("Track " + (t + 1), Small, DimB, new RectangleF(8, y, PlLabel - 12, rh), Fit);
+            P.BarAt(st, out barNo, out beats);
+            if ((barNo - 1) % every == 0 && PlX(st) - lastLabel > 20 && !P.Markers.Any(mk => Math.Abs(PlX(mk.At) - PlX(st)) < 30)) {   // a marker's flag takes the place of its bar's number g.DrawString(barNo.ToString(), Small, barNo == 1 ? TxtB : DimB, PlX(st) + 2, 24); lastLabel = (int)PlX(st); }
         }
-        for (int b = 0; b <= Project.Bars; b++)   // bar lines, stronger every 4 bars
-            using (var pen = new Pen(b % 4 == 0 ? Color.FromArgb(60, 68, 82) : Color.FromArgb(40, 45, 54)))
-                g.DrawLine(pen, PlLabel + b * cw, y0, PlLabel + b * cw, y0 + gh);
-        for (int t = 0; t < Project.Tracks; t++)
-            for (int b = 0; b < Project.Bars; b++)   // clips on top, as wide as their pattern; a later clip covers an earlier one's tail, as in playback
+        foreach (var m in P.Markers)
+        {
+            float mx = PlX(m.At); if (mx < PlHead - 1 || mx > W) continue;
+            var mc = m.Beats > 0 ? Color.FromArgb(150, 104, 224) : Blue;
+            using (var b = new SolidBrush(mc)) g.FillPolygon(b, new[] { new PointF(mx, 23), new PointF(mx + 7, 23), new PointF(mx, 31) });
+            g.DrawString(m.Beats > 0 ? m.Beats + "/4" + (string.IsNullOrEmpty(m.Name) || m.Name == m.Beats + "/4" ? "" : " " + m.Name) : m.Name, Small, new SolidBrush(mc), mx + 8, 23);
+        }
+        // tracks: lanes, name tabs, bar and beat lines, clips with a preview of their notes
+        int shown = (int)Math.Ceiling((H - PlY0) / plRowH);
+        var clip0 = g.Clip; g.SetClip(new RectangleF(0, PlY0, W, H - PlY0));
+        for (int r = 0; r < shown && plTop + r < Project.Tracks; r++)
+        {
+            int t = plTop + r; float y = PlY0 + r * plRowH; bool muted = P.TrackMuted(t); var tr = P.TrackInfo[t];
+            using (var br = new SolidBrush(muted ? Color.FromArgb(22, 24, 29) : t % 2 == 0 ? Color.FromArgb(31, 35, 42) : Color.FromArgb(27, 31, 37))) g.FillRectangle(br, PlHead, y, W - PlHead, plRowH);
+            Round(g, Raised, 4, y + 1, PlHead - 8, plRowH - 2, 3);
+            if (tr != null && tr.Color != 0) Round(g, Color.FromArgb(tr.Color), 4, y + 1, 3, plRowH - 2, 1.5f);
+            Led(g, 10, y + plRowH / 2 - 4, 8, !muted);
+            g.DrawString(P.TrackName(t), Small, muted ? DimB : TxtB, new RectangleF(22, y, PlHead - 30, plRowH), Fit);
+        }
+        float yEnd = Math.Min(H, PlTrackY(Project.Tracks));
+        if (16 * cw >= 24) using (var pen = new Pen(Color.FromArgb(34, 38, 46))) for (int st = (int)Math.Ceiling(plFrom / 4) * 4; st <= to; st += 4) g.DrawLine(pen, PlX(st), PlY0, PlX(st), yEnd);   // beats
+        foreach (var st in bars) { P.BarAt(st, out barNo, out beats); using (var pen = new Pen((barNo - 1) % 4 == 0 ? Color.FromArgb(60, 68, 82) : Color.FromArgb(44, 50, 60))) g.DrawLine(pen, PlX(st), PlY0, PlX(st), yEnd); }
+        if (P.LoopTo > P.LoopFrom) using (var b = new SolidBrush(Color.FromArgb(14, On))) g.FillRectangle(b, PlX(P.LoopFrom), PlY0, (float)((P.LoopTo - P.LoopFrom) * cw), yEnd - PlY0);
+        g.SetClip(new RectangleF(PlHead, PlY0, W - PlHead, H - PlY0));
+        foreach (var c in P.Clips)
+        {
+            if (c.Track < plTop || c.Track >= plTop + shown || c.Pattern >= P.Patterns.Count) continue;
+            double len = c.Length(P);
+            if (c.Start > to || c.Start + len < plFrom) continue;
+            var rc = new RectangleF(PlX(c.Start) + 1, PlTrackY(c.Track) + 1, (float)(len * cw) - 2, plRowH - 2);
+            var col = PatColors[c.Pattern % PatColors.Length]; if (P.TrackMuted(c.Track)) col = Color.FromArgb(90, col);
+            Round(g, col, rc.X, rc.Y, rc.Width, rc.Height, 4);
+            RoundEdge(g, c == plClip ? Color.White : ControlPaint.Dark(col, 0.25f), c == plClip ? 1.5f : 1, rc, 4);
+            var pat = P.Patterns[c.Pattern];
+            if (rc.Width > 18) g.DrawString(rc.Width > 44 ? pat.Name : (c.Pattern + 1).ToString(), Small, Brushes.White, new RectangleF(rc.X + 4, rc.Y, rc.Width - 6, 14), Fit);
+            if (rc.Height >= 20 && rc.Width > 24) PreviewNotes(g, pat, c, new RectangleF(rc.X + 2, rc.Y + 13, rc.Width - 4, rc.Height - 15), cw);
+        }
+        g.Clip = clip0;
+        if (auto)   // the lane's curve over the visible tracks; patterns fade back while it is edited
+        {
+            var vals = P.Automation[selLane].Values; float gh = yEnd - PlY0;
+            using (var dim = new SolidBrush(Color.FromArgb(170, PanelBg))) g.FillRectangle(dim, PlHead, PlY0, W - PlHead, gh);
+            var pts = new List<PointF>();
+            for (int k = Math.Max(0, (int)plFrom - 1); k < vals.Length && k <= to + 1; k++) pts.Add(new PointF(PlX(k), PlY0 + (1 - vals[k]) * gh));   // playback interpolates between these points
+            if (pts.Count >= 2)
             {
-                int p = P.Playlist[t, b];
-                if (p < 0) continue;
-                int span = Math.Min(p < P.Patterns.Count ? P.Patterns[p].Bars : 1, Project.Bars - b);
-                var rc = new RectangleF(PlLabel + b * cw + 1, y0 + t * rh + 1, span * cw - 2, rh - 2);
-                var col = PatColors[p % PatColors.Length];
-                Round(g, col, rc.X, rc.Y, rc.Width, rc.Height, 4);
-                Round(g, Color.FromArgb(50, 255, 255, 255), rc.X + 1, rc.Y + 1, rc.Width - 2, rc.Height * 0.4f, 3);   // light top edge
-                RoundEdge(g, ControlPaint.Dark(col, 0.25f), 1, rc, 4);
-                string label = p < P.Patterns.Count ? P.Patterns[p].Name : (p + 1).ToString();
-                if (rc.Width > 18) g.DrawString(rc.Width > 44 ? label : (p + 1).ToString(), Small, Brushes.White, new RectangleF(rc.X + 4, rc.Y, rc.Width - 6, rc.Height), Fit);
+                var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+                var poly = new List<PointF>(pts) { new PointF(pts[pts.Count - 1].X, PlY0 + gh), new PointF(pts[0].X, PlY0 + gh) };
+                using (var fill = new SolidBrush(Color.FromArgb(40, On))) g.FillPolygon(fill, poly.ToArray());
+                using (var pen = new Pen(On, 2)) g.DrawLines(pen, pts.ToArray());
+                g.SmoothingMode = am;
             }
-        if (auto)   // the lane's curve over the whole grid; patterns fade back while it is edited
-        {
-            var vals = P.Automation[selLane].Values; float sw = cw / Project.Steps;
-            using (var dim = new SolidBrush(Color.FromArgb(170, PanelBg))) g.FillRectangle(dim, PlLabel, y0, playlist.Width - PlLabel, gh);
-            var pts = new PointF[vals.Length + 2];
-            for (int k = 0; k < vals.Length; k++) pts[k] = new PointF(PlLabel + k * sw, y0 + (1 - vals[k]) * gh);   // playback interpolates between these points
-            pts[vals.Length] = new PointF(pts[vals.Length - 1].X, y0 + gh); pts[vals.Length + 1] = new PointF(PlLabel, y0 + gh);
-            var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var fill = new SolidBrush(Color.FromArgb(40, On))) g.FillPolygon(fill, pts);
-            using (var pen = new Pen(On, 2)) g.DrawLines(pen, pts.Take(vals.Length).ToArray());
-            g.SmoothingMode = am;
-        }
-        if (clipT >= 0 && clipMoved)   // where the dragged clip will land
-        {
-            int p = P.Playlist[clipT, clipB], span = p >= 0 && p < P.Patterns.Count ? Math.Min(P.Patterns[p].Bars, Project.Bars - clipToB) : 1;
-            var gr = new RectangleF(PlLabel + clipToB * cw + 1, y0 + clipToT * rh + 1, span * cw - 2, rh - 2);
-            Round(g, Color.FromArgb(120, p >= 0 ? PatColors[p % PatColors.Length] : On), gr.X, gr.Y, gr.Width, gr.Height, 4);
-            RoundEdge(g, Color.White, 1.5f, gr, 4);
         }
         int ps = eng.PlayStep;
-        if (eng.SongMode && ps >= 0)   // playhead: a line with a marker in the bar-number row
+        if (eng.SongMode && ps >= 0 && ps >= plFrom && ps <= to)   // playhead: a line with a marker in the ruler
         {
-            float x = PlLabel + ps / (float)Project.Steps * cw;
-            using (var pen = new Pen(Color.FromArgb(230, 255, 255, 255), 2)) g.DrawLine(pen, x, y0, x, y0 + gh);
+            float x = PlX(ps);
+            using (var pen = new Pen(Color.FromArgb(230, 255, 255, 255), 2)) g.DrawLine(pen, x, PlY0, x, yEnd);
             var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var b = new SolidBrush(On)) g.FillPolygon(b, new[] { new PointF(x - 5, y0 - 8), new PointF(x + 5, y0 - 8), new PointF(x, y0 - 1) });
+            using (var b = new SolidBrush(On)) g.FillPolygon(b, new[] { new PointF(x - 5, PlY0 - 8), new PointF(x + 5, PlY0 - 8), new PointF(x, PlY0 - 1) });
             g.SmoothingMode = am;
         }
     }
 
-    // Grid cell under the mouse, clamped to the playlist (dragging past an edge keeps the clip at that edge).
-    void PlCell(MouseEventArgs e, out int t, out int b)
+    void PreviewNotes(Graphics g, Pattern pat, Clip c, RectangleF area, float cw)   // the clip's notes as small dashes, like FL's clip previews
     {
-        float cw = (playlist.Width - PlLabel) / (float)Project.Bars, rh = (playlist.Height - Top0 - 14) / (float)Project.Tracks;
-        b = Math.Max(0, Math.Min(Project.Bars - 1, (int)Math.Floor((e.X - PlLabel) / cw)));
-        t = Math.Max(0, Math.Min(Project.Tracks - 1, (int)Math.Floor((e.Y - Top0 - 12) / rh)));
+        var all = pat.Notes.Take(P.Channels.Count).SelectMany(l => l).ToList();
+        if (all.Count == 0) return;
+        int lo = all.Min(n => n.Key), hi = all.Max(n => n.Key); double len = c.Length(P);
+        using (var b = new SolidBrush(Color.FromArgb(150, 255, 255, 255)))
+            for (double rep = -c.Offset; rep < len; rep += pat.Length)   // a stretched clip repeats its pattern
+                foreach (var n in all)
+                {
+                    double at = rep + n.Step;
+                    if (at < 0 || at >= len) continue;
+                    float y = hi == lo ? area.Y + area.Height / 2 : area.Bottom - 2 - (n.Key - lo) / (float)(hi - lo) * (area.Height - 2);
+                    g.FillRectangle(b, area.X + (float)(at * cw), y, Math.Max(1.5f, (float)(Math.Min(n.Len, len - at) * cw) - 1), 1.5f);
+                }
     }
-
-    int clipT = -1, clipB, clipGrab, clipToT, clipToB; bool clipMoved;   // a clip being clicked or dragged: where it starts, where it'd land
 
     void PlaylistDown(object sender, MouseEventArgs e)
     {
-        autoK = -1;
+        autoK = -1; dragMode = null;
         bool automating = selLane >= 0 && selLane < P.Automation.Count;
-        if (e.Y >= 22 && e.Button == MouseButtons.Left && !automating && e.X >= PlLabel)   // pressing on a clip: a click picks its pattern, a drag moves it
+        if (e.Y < 22)   // header: snap, lane picker (click next, right-click previous, through "off") and delete
         {
-            int t, b; PlCell(e, out t, out b);
-            int at = P.ClipAt(t, b);
-            if (at >= 0) { clipT = clipToT = t; clipB = clipToB = at; clipGrab = b - at; clipMoved = false; return; }
+            int nl = P.Automation.Count;
+            if (e.X >= PlSnapX && e.X < PlSnapX + PlSnapW)
+            {
+                var m = new ContextMenuStrip();
+                for (int k = 0; k < PlSnaps.Length; k++) { double v = PlSnaps[k]; ((ToolStripMenuItem)m.Items.Add(PlSnapNames[k], null, (s, a) => { plSnap = v; playlist.Invalidate(); })).Checked = plSnap == v; }
+                m.Show(playlist, e.X, 22); return;
+            }
+            if (selLane >= 0 && selLane < nl && e.X >= playlist.Width - 78) { lock (P) P.Automation.RemoveAt(selLane); selLane = -1; dirty = true; }
+            else if (nl > 0 && e.X >= playlist.Width - AutoBoxX && e.X < playlist.Width - AutoBoxX + AutoBoxW)
+                selLane = Next(Enumerable.Range(-1, nl + 1), selLane, e.Button == MouseButtons.Right ? -1 : 1);
+            else return;
+            playlist.Invalidate(); return;
         }
-        if (e.Y >= 22) { PlaylistMouse(sender, e); return; }
-        int nl = P.Automation.Count;   // header: lane picker (click next, right-click previous, through "off") and delete
-        if (selLane >= 0 && selLane < nl && e.X >= playlist.Width - 78) { lock (P) P.Automation.RemoveAt(selLane); selLane = -1; dirty = true; }
-        else if (nl > 0 && e.X >= playlist.Width - AutoBoxX && e.X < playlist.Width - AutoBoxX + AutoBoxW)
-            selLane = Next(Enumerable.Range(-1, nl + 1), selLane, e.Button == MouseButtons.Right ? -1 : 1);
-        else return;
-        playlist.Invalidate();
-    }
-
-    void FinishClipDrag()   // mouse-up after pressing on a clip; Shift copies instead of moving
-    {
-        if (clipT < 0) return;
-        int t0 = clipT; clipT = -1;
-        if (!clipMoved) { int p = P.Playlist[t0, clipB]; if (p >= 0 && p < P.Patterns.Count) patBox.SelectedIndex = p; return; }   // a click: edit that pattern
-        lock (P) P.MoveClip(t0, clipB, clipToT, clipToB, (ModifierKeys & Keys.Shift) != 0);
-        Changed();
+        double st = PlStep(e.X);
+        if (e.Y < PlY0)   // the ruler: drag for a loop region; right-click for markers and time signatures
+        {
+            if (e.X < PlHead) return;
+            if (e.Button == MouseButtons.Right) { RulerMenu(st, e.Location); return; }
+            loopDown = PlSnapNear(st); dragMode = "loop"; return;
+        }
+        int t = PlTrack(e.Y);
+        if (t < 0 || t >= Project.Tracks) return;
+        if (e.X < PlHead)   // a track's tab: the light mutes it, right-click for name and colour
+        {
+            if (e.Button == MouseButtons.Right) TrackMenu(t, e.Location);
+            else if (e.X < 20) { lock (P) P.TrackAt(t).Mute = !P.TrackMuted(t); dirty = true; Changed(); }
+            return;
+        }
+        if (automating) { PlaylistMouse(sender, e); return; }
+        var hit = ClipHit(t, st);
+        if (e.Button == MouseButtons.Right) { dragMode = "erase"; PlaylistMouse(sender, e); return; }
+        if (e.Button != MouseButtons.Left) return;
+        if (hit != null && (ModifierKeys & Keys.Control) != 0) { SplitClip(hit, PlSnapNear(st)); return; }   // Ctrl+click: split at the nearest grid line
+        if (hit != null)   // grab a clip: its right edge resizes, its left edge trims, the rest moves it
+        {
+            float x0 = PlX(hit.Start), x1 = PlX(hit.Start + hit.Length(P)); float edge = Math.Min(6, (x1 - x0) / 4);
+            plMode = e.X >= x1 - edge ? "resize" : e.X <= x0 + edge ? "trim" : "move";
+            plClip = hit; plOrig = hit.Copy(); plGrab = st - hit.Start; plMoved = false;
+            playlist.Invalidate(); return;
+        }
+        dragMode = "paint"; PlaylistMouse(sender, e);   // an empty spot: place the selected pattern (and keep placing while dragging)
     }
 
     void PlaylistMouse(object sender, MouseEventArgs e)
     {
-        if (clipT >= 0)   // dragging a clip: follow the mouse, keeping the bar it was grabbed by under the pointer
+        double st = PlStep(e.X);
+        if (dragMode == "loop" && e.Button == MouseButtons.Left)
         {
-            if (e.Button != MouseButtons.Left) return;
-            int ct, cb; PlCell(e, out ct, out cb);
-            int nb = Math.Max(0, Math.Min(Project.Bars - 1, cb - clipGrab));
-            if (ct != clipToT || nb != clipToB) { clipToT = ct; clipToB = nb; clipMoved = true; playlist.Invalidate(); }
-            return;
+            double at = PlSnapNear(Math.Max(0, st));
+            P.LoopFrom = Math.Min(loopDown, at); P.LoopTo = Math.Max(loopDown, at); dirty = true; playlist.Invalidate(); return;
+        }
+        if (plClip != null && e.Button == MouseButtons.Left)
+        {
+            double len = plOrig.Length(P), end = plOrig.Start + len;
+            if (plMode == "move")
+            {
+                plClip.Start = Math.Max(0, PlSnapNear(st - plGrab)); plClip.Track = Math.Max(0, Math.Min(Project.Tracks - 1, PlTrack(e.Y)));
+            }
+            else if (plMode == "resize")
+                plClip.Len = Math.Max(Math.Min(plSnap, len), PlSnapNear(st) - plClip.Start);
+            else   // trim: move the front, keeping the end; never before the pattern's own start
+            {
+                double front = Math.Max(plOrig.Start - plOrig.Offset, Math.Min(end - Math.Min(plSnap, len), PlSnapNear(st)));
+                plClip.Start = front; plClip.Offset = plOrig.Offset + (front - plOrig.Start); plClip.Len = end - front;
+            }
+            if (plClip.Start != plOrig.Start || plClip.Track != plOrig.Track || plClip.Len != plOrig.Len) plMoved = true;
+            Changed(); return;
         }
         if (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right) return;
-        float cw = (playlist.Width - PlLabel) / (float)Project.Bars, rh = (playlist.Height - Top0 - 14) / (float)Project.Tracks;
         if (selLane >= 0 && selLane < P.Automation.Count)   // automation mode: drag paints the lane; patterns are locked
         {
-            if (e.Button != MouseButtons.Left || e.Y < 22) return;
+            if (e.Button != MouseButtons.Left || e.Y < PlY0) return;
             var vals = P.Automation[selLane].Values;
-            int k = Math.Max(0, Math.Min(vals.Length - 1, (int)Math.Floor((e.X - PlLabel) / (cw / Project.Steps))));
-            float val = Clamp01(1 - (e.Y - Top0 - 12) / (Project.Tracks * rh));
+            int k = Math.Max(0, Math.Min(vals.Length - 1, (int)Math.Floor(st)));
+            float val = Clamp01(1 - (e.Y - PlY0) / (Math.Min(playlist.Height, PlTrackY(Project.Tracks)) - PlY0));
             int from = autoK < 0 ? k : autoK;   // fill every step since the last mouse event, so a fast drag leaves no gaps
             for (int s = Math.Min(from, k); s <= Math.Max(from, k); s++) vals[s] = from == k ? val : autoV + (val - autoV) * (s - from) / (k - from);
             autoK = k; autoV = val; dirty = true;
             playlist.Invalidate(); return;
         }
-        int b = (int)Math.Floor((e.X - PlLabel) / cw), t = (int)Math.Floor((e.Y - Top0 - 12) / rh);
-        if (b < 0 || b >= Project.Bars || t < 0 || t >= Project.Tracks) return;
-        int v = e.Button == MouseButtons.Left ? patBox.SelectedIndex : -1, at = P.ClipAt(t, b);
-        if (v < 0) { if (at < 0) return; b = at; }   // right-click anywhere on a clip erases the whole clip
-        else if (at >= 0 && at != b) return;         // inside a longer clip: leave it (so a drag tiles a 2-bar pattern every 2 bars)
-        if (P.Playlist[t, b] == v) return;
-        lock (P) P.Playlist[t, b] = v;
-        Changed();
+        int t = PlTrack(e.Y);
+        if (t < 0 || t >= Project.Tracks || e.X < PlHead || st < 0) return;
+        if (dragMode == "erase" && e.Button == MouseButtons.Right)
+        {
+            var hit = ClipHit(t, st);
+            if (hit != null) { lock (P) P.Clips.Remove(hit); dirty = true; Changed(); }
+            return;
+        }
+        if (dragMode == "paint" && e.Button == MouseButtons.Left && patBox.SelectedIndex >= 0 && ClipHit(t, st) == null)
+        {
+            double at = PlSnapDown(st);
+            if (at >= Project.MaxBars * Project.Steps) return;
+            lock (P) P.Clips.Add(new Clip { Track = t, Start = at, Pattern = patBox.SelectedIndex });
+            dirty = true; Changed();
+        }
     }
 
+    void SplitClip(Clip c, double cut)   // two clips that play exactly what the one did
+    {
+        double end = c.Start + c.Length(P);
+        if (cut <= c.Start + 1e-9 || cut >= end - 1e-9) return;
+        lock (P)
+        {
+            var right = c.Copy(); right.Start = cut; right.Offset = c.Offset + (cut - c.Start); right.Len = end - cut;
+            c.Len = cut - c.Start; P.Clips.Add(right);
+        }
+        dirty = true; Changed();
+    }
+    void FinishClipDrag()   // mouse-up: a click on a clip picks its pattern; a moved clip with Shift held leaves a copy behind
+    {
+        if (dragMode == "loop") { if (P.LoopTo - P.LoopFrom < 1e-9) P.LoopFrom = P.LoopTo = 0; dragMode = null; playlist.Invalidate(); return; }   // a click without a drag clears the loop
+        dragMode = null;
+        if (plClip == null) return;
+        var c = plClip; plClip = null;
+        if (!plMoved) { if (plMode == "move" && c.Pattern < P.Patterns.Count) patBox.SelectedIndex = c.Pattern; playlist.Invalidate(); return; }   // a click: edit that pattern
+        if (plMode == "move" && (ModifierKeys & Keys.Shift) != 0)
+            lock (P) { var copy = c.Copy(); c.Start = plOrig.Start; c.Track = plOrig.Track; P.Clips.Add(copy); }
+        dirty = true; Changed();
+    }
+
+    void PlaylistWheel(object sender, MouseEventArgs e)   // wheel: tracks; Shift: across; Ctrl: zoom across; Ctrl+Shift: track height
+    {
+        int notches = e.Delta / 120; if (notches == 0) notches = Math.Sign(e.Delta);
+        var mods = ModifierKeys; bool ctrl = (mods & Keys.Control) != 0, shift = (mods & Keys.Shift) != 0;
+        double max = Project.MaxBars * Project.Steps;
+        if (ctrl && shift) plRowH = Math.Max(12, Math.Min(64, plRowH * (float)Math.Pow(1.15, notches)));
+        else if (ctrl)
+        {
+            double at = PlStep(e.X); plSpan = Math.Max(16, Math.Min(max, plSpan * Math.Pow(0.8, notches)));
+            plFrom = Math.Max(0, at - (e.X - PlHead) / (double)(playlist.Width - PlHead) * plSpan);   // the bar under the mouse stays put
+        }
+        else if (shift) plFrom = Math.Max(0, Math.Min(max - plSpan, plFrom - notches * plSpan / 8));
+        else plTop = Math.Max(0, Math.Min(Project.Tracks - 1, plTop - 3 * notches));
+        playlist.Invalidate();
+    }
+
+    void TrackMenu(int t, Point at)   // right-click a track's tab: rename, colour, mute
+    {
+        var m = new ContextMenuStrip();
+        m.Items.Add("Rename…", null, (s, e) => { string n = Prompt("Rename track", P.TrackName(t)); if (n != null) Edit(() => { P.TrackAt(t).Name = n; dirty = true; Changed(); }); });
+        var colour = new ToolStripMenuItem("Colour");
+        Action<int> paint = argb => Edit(() => { P.TrackAt(t).Color = argb; dirty = true; Changed(); });
+        ((ToolStripMenuItem)colour.DropDownItems.Add("None", null, (s, e) => paint(0))).Checked = P.TrackInfo[t] == null || P.TrackInfo[t].Color == 0;
+        foreach (var sw in Swatches) { int argb = sw.ToArgb(); ((ToolStripMenuItem)colour.DropDownItems.Add("", Swatch(sw), (s, e) => paint(argb))).Checked = P.TrackInfo[t] != null && P.TrackInfo[t].Color == argb; }
+        m.Items.Add(colour);
+        ((ToolStripMenuItem)m.Items.Add("Mute", null, (s, e) => Edit(() => { P.TrackAt(t).Mute = !P.TrackMuted(t); dirty = true; Changed(); }))).Checked = P.TrackMuted(t);
+        m.Show(playlist, at);
+    }
+
+    void RulerMenu(double st, Point at)   // right-click the ruler: markers, time signatures, the loop region
+    {
+        var m = new ContextMenuStrip(); double here = PlSnapNear(Math.Max(0, st));
+        m.Items.Add("Add a marker here…", null, (s, e) => { string n = Prompt("Marker", "Chorus"); if (n != null) Edit(() => { P.Markers.Add(new Marker { At = here, Name = n }); dirty = true; Changed(); }); });
+        var sig = new ToolStripMenuItem("Time signature from here");
+        for (int b = 2; b <= 7; b++) { int beats = b; sig.DropDownItems.Add(b + "/4", null, (s, e) => Edit(() => { P.Markers.RemoveAll(x => x.Beats > 0 && Math.Abs(x.At - here) < 1e-9); P.Markers.Add(new Marker { At = here, Beats = beats, Name = beats + "/4" }); dirty = true; Changed(); })); }
+        m.Items.Add(sig);
+        var near = P.Markers.OrderBy(x => Math.Abs(PlX(x.At) - at.X)).FirstOrDefault(x => Math.Abs(PlX(x.At) - at.X) < 40);
+        if (near != null) m.Items.Add("Remove \"" + (near.Name ?? near.Beats + "/4") + "\"", null, (s, e) => Edit(() => { P.Markers.Remove(near); dirty = true; Changed(); }));
+        if (P.LoopTo > P.LoopFrom) m.Items.Add("Clear the loop region", null, (s, e) => Edit(() => { P.LoopFrom = P.LoopTo = 0; dirty = true; Changed(); }));
+        m.Show(playlist, at);
+    }
     // ---------------------------------------------------------------- entry + self-test
     [STAThread]
     static int Main(string[] args)
@@ -4279,8 +4502,31 @@ class MainForm : Form
                 "a 2-bar pattern exports as 2 bars and plays its bar-2 kick on step 25");
             check(sb.SequenceEqual(pb), "placed at bar 1 of the song, the 2-bar pattern plays through bar 2 (same audio as the pattern)");
             var cap = twoBar(); cap.Patterns[0].SetBars(4); cap.Playlist[0, 30] = 0;
-            check(cap.ClipAt(0, 1) == 0 && cap.ClipAt(0, 4) == -1 && cap.ClipAt(0, 31) == 30 && cap.SongBars() == 32,
-                "a clip covers as many bars as its pattern; a 4-bar clip at bar 31 is cut at the song's 32-bar end");
+            check(cap.ClipAt(0, 1) == 0 && cap.ClipAt(0, 4) == -1 && cap.ClipAt(0, 31) == 30 && cap.SongBars() == 34,
+                "a clip covers as many bars as its pattern; a 4-bar clip at bar 31 makes the song 34 bars long");
+            {   // playlist clips: stretched clips repeat their pattern, trimmed ones skip their front, muted tracks are silent, the loop region repeats
+                Func<Project, double, double, int, float[]> clipSong = (pj, start, clen, bars) => { pj.Clips.Clear(); pj.Clips.Add(new Clip { Track = 0, Start = 0, Pattern = 0, Len = clen, Offset = start }); return Engine.Bounce(pj.ExportCopy(), true, 0); };
+                Func<Project> kickOnly = () => { var pj = Project.Demo(); foreach (var pt in pj.Patterns) for (int c = 1; c < 4; c++) pt.For(c).Clear(); pj.Patterns[0].For(0).RemoveAll(n => n.Step != 0); return pj; };   // one kick, on step 1
+                double s16b = 60.0 / 128 / 4 * Engine.SR;
+                Func<float[], int, double> loudAt = (a, st) => a.Skip((int)(st * s16b) * 2).Take((int)(2 * s16b) * 2).DefaultIfEmpty(0).Max(x => Math.Abs(x));
+                var stretched = clipSong(kickOnly(), 0, 48, 3); var trimmed = clipSong(kickOnly(), 8, 8, 1);
+                var muted = kickOnly(); muted.Clips.Clear(); muted.Playlist[0, 0] = 0; muted.TrackAt(0).Mute = true; var mutedOut = Engine.Bounce(muted.ExportCopy(), true, 0);
+                check(loudAt(stretched, 0) > 0.1 && loudAt(stretched, 16) > 0.1 && loudAt(stretched, 32) > 0.1 && loudAt(trimmed, 0) < 1e-4 && mutedOut.All(x => x == 0),
+                    "playlist clips: one stretched to 3 bars repeats its 1-bar pattern (a kick in each bar); one trimmed to the pattern's 2nd half skips its kick; a muted track is silent");
+                var loopProj = Project.Demo(); loopProj.LoopFrom = 16; loopProj.LoopTo = 32;
+                var le2 = new Engine { Proj = loopProj, Playing = true, SongMode = true }; var lbk = new float[2048]; var seen = new List<int>();
+                for (int k = 0; k < 120; k++) { le2.Render(lbk, 1024); if (seen.Count == 0 || seen[seen.Count - 1] != le2.PlayStep) seen.Add(le2.PlayStep); }
+                int bar7, beats7, barB, beatsB; var ts = Project.Demo(); ts.Markers.Add(new Marker { At = 32, Beats = 3, Name = "3/4" });
+                bool startA = ts.BarAt(32, out bar7, out beats7), startB = ts.BarAt(44, out barB, out beatsB), midBar = ts.BarAt(40, out barB, out beatsB);
+                check(seen.First() == 16 && seen.Max() == 31 && seen.Min() == 16 && seen.Count(x => x == 16) >= 2 && startA && bar7 == 3 && beats7 == 3 && startB && !midBar,
+                    "loop region bars 2-3: playback starts at its start and wraps back to it; a 3/4 marker at bar 3 makes bars 12 16ths long from there");
+                var keep2 = Project.Demo(); keep2.Clips[1].Len = 40; keep2.Clips[1].Offset = 4; keep2.TrackAt(3).Name = "Bass"; keep2.TrackAt(3).Color = -16711936; keep2.TrackAt(1).Mute = true;
+                keep2.Markers.Add(new Marker { At = 64, Name = "Chorus" }); keep2.Markers.Add(new Marker { At = 96, Beats = 7, Name = "7/4" }); keep2.LoopFrom = 32; keep2.LoopTo = 96;
+                var back2 = Project.Parse(keep2.Lines().ToArray(), null);
+                check(back2.Clips.Count == keep2.Clips.Count && back2.Clips[1].Len == 40 && back2.Clips[1].Offset == 4 && back2.Clips[0].Len == -1 && back2.TrackName(3) == "Bass" && back2.TrackAt(3).Color == -16711936
+                      && back2.TrackMuted(1) && !back2.TrackMuted(0) && back2.Markers.Count == 2 && back2.Markers[1].Beats == 7 && back2.Markers[0].Name == "Chorus" && back2.LoopFrom == 32 && back2.LoopTo == 96,
+                    "saved and opened again: clip lengths and trims, track names, colours and mutes, markers, time signatures and the loop region");
+            }
             var sh = twoBar(); sh.Patterns[0].For(1).Add(new Note { Step = 12, Key = 60, Len = 8 }); sh.Patterns[0].SetBars(1);
             check(sh.Patterns[0].For(0).Count == 0 && sh.Patterns[0].For(1)[0].Len == 4, "shortening a pattern drops notes past its end and trims notes that run over");
             twoBar().Save(f);

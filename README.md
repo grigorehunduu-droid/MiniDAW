@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 122 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 125 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -42,7 +42,7 @@ Needs Windows 10 or 11.
 | **Channel rack** | One row per sound | The dot mutes. Click a name to edit it in the piano roll; double-click it for **sound settings**; right-click it for **sound settings, a different sound, rename or delete**. Drag the volume and pan bars; right-click them to automate them. The number box picks the mixer insert (click = +1, right-click = −1). Click the 16 steps to add drum hits. |
 | **Piano roll** | Notes of the selected channel in the current pattern | Click an empty cell to add a note (drag right while adding to make it longer). Click a note to remove it. **Drag a note** to move it in time and pitch: if it's part of the selection, all selected notes move together, and you hear the new pitch while dragging. Moves stop at the pattern's edges, and a note dropped on another one replaces it. **Drag a note's right edge** to change its length. Drag in the **VEL** lane at the bottom to set **velocity** (how hard each note is played): 100 is the channel's normal level, 50 is half as loud, 127 is the loudest. A drag across several notes sets each one. |
 | **Mixer** (F9 swaps it with the piano roll) | Master + 8 inserts | See below. |
-| **Playlist** | 8 tracks × 32 bars | Click an empty cell to place the selected pattern; right-click anywhere on a clip to erase it. **Drag a clip** to move it to another bar or track (hold **Shift** to copy it instead); **click a clip** to open its pattern for editing. A longer pattern makes a wider clip, and dragging across bars places it end to end. Plays in **Song** mode. |
+| **Playlist** | 500 tracks, songs up to 999 bars | Click an empty spot to place the selected pattern (drag to keep placing); right-click a clip to erase it. **Drag a clip** to move it (**Shift**: copy); **click** it to edit its pattern. More under **Playlist** below. Plays in **Song** mode. |
 
 **Graph editor:** click **graph** in the channel rack's header to open a strip under the rack for the selected channel. Click it again to cycle through **velocity → pan → pitch → off**; right-click goes backwards.
 - Drag up and down across the steps to set each note's value. Right-click a step to put it back: velocity 100, centre, no detune.
@@ -76,6 +76,20 @@ Needs Windows 10 or 11.
 - The rack shows every step, with a gap between bars, and the piano roll widens to match.
 - Shortening a pattern drops notes past the new end, and you can undo that.
 
+## Playlist
+
+- **Getting around:** the mouse wheel scrolls through the 500 tracks, **Ctrl+wheel** zooms across, **Shift+wheel** scrolls across and **Ctrl+Shift+wheel** makes tracks taller or shorter.
+- **Clips:**
+  - Drag a clip's **right edge** to resize it. A clip longer than its pattern repeats the pattern.
+  - Drag its **left edge** to trim off the front.
+  - **Ctrl+click** splits a clip at the nearest grid line, and both halves play exactly what the whole did.
+  - Clips show a small preview of their notes. A clip that hasn't been resized follows its pattern's length.
+  - Clips on the same track may overlap; both play.
+- **snap:** the grid for placing, moving and resizing clips: bar, beat or 1/16.
+- **Tracks:** each track's tab has a light that mutes it. Right-click the tab to rename the track, colour it or mute it.
+- **The ruler** (the bar numbers):
+  - Drag along it to set a **loop region**; Song mode then plays just that part over and over. A click without a drag clears it.
+  - Right-click it to add a **marker** with a name, or a **time signature** (2/4 to 7/4) from that point. The bar numbers, bar lines and the metronome's accents follow it.
 ## Sounds
 
 **Built-in sounds:** add one with **+ Sound**, or change a channel's sound with right-click its name → **Sound**. They are all made by code, with no sample files. [sounds_demo.wav](sounds_demo.wav) plays each one for a bar.
@@ -240,8 +254,9 @@ MiniDAW is open source under the [MIT License](LICENSE): use it, change it, shar
 
 ## Limits
 
-- Patterns are 1 to 4 bars of 16th notes; a clip near bar 32 is cut at the song's end.
-- If clips overlap on one track, the later clip cuts off the earlier one's tail.
+- Patterns are 1 to 4 bars long (stretch a clip to repeat one). Songs can be up to 999 bars.
+- Automation lanes still cover the first 32 bars; past that they hold their last value.
+- Time signatures change bar numbering, bar lines and metronome accents; patterns still count in 16ths.
 - Velocity only changes loudness, not tone. The computer keyboard always plays at velocity 100.
 - Swing is one setting for the whole project, not per channel. Recording doesn't take swing into account when snapping notes.
 - The pitch wheel (±2 semitones) and the vibrato (5.5 Hz, ±½ semitone) can't be adjusted, and they don't affect Pluck or the drums. The computer keyboard has no sustain, pitch or mod controls.
