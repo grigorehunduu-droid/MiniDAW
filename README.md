@@ -10,7 +10,7 @@ All of it is one C# file, [MiniDAW.cs](MiniDAW.cs), with no dependencies. It use
 
 1. Open the [latest release](https://github.com/grigorehunduu-droid/MiniDAW/releases/latest) and download **MiniDAW-Setup.exe**.
 2. Run it and click **Install**. It installs for your Windows user only (no admin rights), into `%LOCALAPPDATA%\Programs\MiniDAW`, with a Start-menu shortcut and, if you leave the box ticked, a desktop one.
-3. The installer isn't code-signed, so Windows may say "Windows protected your PC". Click **More info → Run anyway**.
+3. Windows may say **"Windows protected your PC"**. Click **More info → Run anyway**. This happens because the installer isn't signed with a paid code-signing certificate yet, not because anything is wrong with it; the whole source is here to check. You only see it once: updates through the app's **Update** button don't trigger it.
 
 Needs Windows 10 or 11.
 
@@ -174,6 +174,10 @@ From looking at FL Studio's shipped files only, without decompiling anything:
 - **.flp project files** are an "FLhd" header followed by an "FLdt" chunk of small tagged events: tempo, channels, patterns, notes and playlist.
 
 MiniDAW copies the *workflow* (rack → patterns → playlist → mixer inserts → automation), not FL's code or file format.
+
+## License
+
+MiniDAW is open source under the [MIT License](LICENSE): use it, change it, share it, sell it, as long as the license text stays with it. Contributions are welcome as pull requests.
 
 ## Limits
 
