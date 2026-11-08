@@ -691,14 +691,337 @@ static class Wav
         c.Sample = left; c.SampleR = right; c.SampleRate = rate; c.SamplePath = path;
     }
 
-    public static byte[] Make16(float[] data, int rate, int chans)   // 16-bit PCM; data is interleaved when chans > 1
+    public static byte[] Make16(float[] data, int rate, int chans) { return Make(data, rate, chans, 16); }
+
+    public static byte[] Make(float[] data, int rate, int chans, int bits)   // 16 or 24-bit PCM, or 32-bit float; data is interleaved when chans > 1
     {
+        int bps = bits / 8;
         var m = new MemoryStream(); var w = new BinaryWriter(m);
-        w.Write(Encoding.ASCII.GetBytes("RIFF")); w.Write(36 + data.Length * 2); w.Write(Encoding.ASCII.GetBytes("WAVEfmt "));
-        w.Write(16); w.Write((short)1); w.Write((short)chans); w.Write(rate); w.Write(rate * 2 * chans); w.Write((short)(2 * chans)); w.Write((short)16);
-        w.Write(Encoding.ASCII.GetBytes("data")); w.Write(data.Length * 2);
-        foreach (var x in data) w.Write((short)(Math.Max(-1f, Math.Min(1f, x)) * 32767));   // clamp: an overflowing short would wrap into a click
+        w.Write(Encoding.ASCII.GetBytes("RIFF")); w.Write(36 + data.Length * bps); w.Write(Encoding.ASCII.GetBytes("WAVEfmt "));
+        w.Write(16); w.Write((short)(bits == 32 ? 3 : 1)); w.Write((short)chans); w.Write(rate); w.Write(rate * bps * chans); w.Write((short)(bps * chans)); w.Write((short)bits);
+        w.Write(Encoding.ASCII.GetBytes("data")); w.Write(data.Length * bps);
+        foreach (var x in data)
+        {
+            if (bits == 32) { w.Write(x); continue; }   // float keeps peaks above full scale
+            int v = Sample(x, bits);                     // clamped: an overflowing integer would wrap into a click
+            if (bits == 16) w.Write((short)v); else { w.Write((byte)v); w.Write((byte)(v >> 8)); w.Write((byte)(v >> 16)); }
+        }
         return m.ToArray();
+    }
+
+    public static int Sample(float x, int bits) { int max = (1 << (bits - 1)) - 1; return (int)Math.Round(Math.Max(-1f, Math.Min(1f, x)) * max); }
+}
+
+// FLAC encoder (lossless): fixed-predictor subframes (orders 0-4) with Rice-coded residuals, the cheapest stereo decorrelation
+// per frame, and the STREAMINFO MD5 so players and `flac -t` can verify it. Plain C#, no dependency.
+static class Flac
+{
+    const int Block = 4096;
+
+    class Bits   // MSB-first bit writer
+    {
+        public readonly List<byte> Out = new List<byte>(); ulong acc; int n;
+        public void Put(long v, int bits)   // bits <= 32
+        {
+            if (bits == 0) return;
+            acc = acc << bits | ((ulong)v & ((1UL << bits) - 1)); n += bits;
+            while (n >= 8) { n -= 8; Out.Add((byte)(acc >> n)); }
+        }
+        public void Zeros(long count) { while (count > 0) { int k = (int)Math.Min(32, count); Put(0, k); count -= k; } }
+        public void Align() { if (n > 0) Put(0, 8 - n); }
+    }
+
+    public static byte[] Encode(float[] lr, int rate, int bits)   // interleaved stereo; bits 16 or 24
+    {
+        int frames = lr.Length / 2;
+        var L = new int[frames]; var R = new int[frames];
+        for (int i = 0; i < frames; i++) { L[i] = Wav.Sample(lr[2 * i], bits); R[i] = Wav.Sample(lr[2 * i + 1], bits); }
+        var file = new Bits();
+        foreach (var c in "fLaC") file.Put(c, 8);
+        file.Put(1, 1); file.Put(0, 7); file.Put(34, 24);   // last metadata block: STREAMINFO, 34 bytes
+        file.Put(Block, 16); file.Put(Block, 16); file.Put(0, 24); file.Put(0, 24);
+        file.Put(rate, 20); file.Put(1, 3); file.Put(bits - 1, 5); file.Put(frames >> 4, 32); file.Put(frames & 15, 4);
+        using (var md5 = System.Security.Cryptography.MD5.Create())
+        {
+            var raw = new byte[frames * 2 * bits / 8]; int o = 0;
+            for (int i = 0; i < frames; i++) foreach (int v in new[] { L[i], R[i] }) for (int b = 0; b < bits / 8; b++) raw[o++] = (byte)(v >> 8 * b);
+            foreach (var b in md5.ComputeHash(raw)) file.Put(b, 8);
+        }
+        for (int start = 0, no = 0; start < frames; start += Block, no++) Frame(file, L, R, start, Math.Min(Block, frames - start), no, rate, bits);
+        return file.Out.ToArray();
+    }
+
+    static void Frame(Bits file, int[] L, int[] R, int start, int n, int no, int rate, int bits)
+    {
+        var l = new int[n]; var r = new int[n]; var mid = new int[n]; var side = new int[n];
+        for (int i = 0; i < n; i++) { l[i] = L[start + i]; r[i] = R[start + i]; mid[i] = (l[i] + r[i]) >> 1; side[i] = l[i] - r[i]; }
+        long cl = Cost(l), cr = Cost(r), cm = Cost(mid), cs = Cost(side);
+        long[] costs = { cl + cr, cl + cs, cr + cs, cm + cs };   // independent, left/side, side/right, mid/side
+        int mode = Array.IndexOf(costs, costs.Min());
+        var h = new Bits();
+        h.Put(0x3FFE, 14); h.Put(0, 1); h.Put(0, 1);              // sync, reserved, fixed block size
+        h.Put(n == Block ? 12 : 7, 4);                             // 4096, or "16-bit size at the end of the header"
+        int rc = Array.IndexOf(new[] { 0, 88200, 176400, 192000, 8000, 16000, 22050, 24000, 32000, 44100, 48000, 96000 }, rate);
+        h.Put(Math.Max(0, rc), 4);                                 // 0 = read it from STREAMINFO
+        h.Put(new[] { 1, 8, 9, 10 }[mode], 4);
+        h.Put(bits == 16 ? 4 : 6, 3); h.Put(0, 1);
+        Utf8(h, no);
+        if (n != Block) h.Put(n - 1, 16);
+        h.Put(Crc8(h.Out), 8);
+        int[] a = mode == 2 ? side : mode == 3 ? mid : l, b = mode == 0 ? r : mode == 2 ? r : side;
+        Subframe(h, a, bits + (mode == 2 ? 1 : 0));
+        Subframe(h, b, bits + (mode == 1 || mode == 3 ? 1 : 0));   // the side channel needs one more bit
+        h.Align();
+        h.Put(Crc16(h.Out), 16);
+        file.Out.AddRange(h.Out);
+    }
+
+    static int[] Residual(int[] x, int order)
+    {
+        var e = new int[x.Length - order];
+        for (int i = order; i < x.Length; i++)
+            e[i - order] = order == 0 ? x[i] : order == 1 ? x[i] - x[i - 1] : order == 2 ? x[i] - 2 * x[i - 1] + x[i - 2]
+                : order == 3 ? x[i] - 3 * x[i - 1] + 3 * x[i - 2] - x[i - 3] : x[i] - 4 * x[i - 1] + 6 * x[i - 2] - 4 * x[i - 3] + x[i - 4];
+        return e;
+    }
+
+    static int BestOrder(int[] x, out long cost)
+    {
+        int best = 0; cost = long.MaxValue;
+        for (int k = 0; k <= Math.Min(4, x.Length - 1); k++)
+        {
+            long s = 0; foreach (var v in Residual(x, k)) s += Math.Abs((long)v);
+            if (s < cost) { cost = s; best = k; }
+        }
+        return best;
+    }
+
+    static long Cost(int[] x) { long c; BestOrder(x, out c); return c; }
+
+    static void Subframe(Bits o, int[] x, int bps)
+    {
+        if (x.All(v => v == x[0])) { o.Put(0, 1); o.Put(0, 6); o.Put(0, 1); o.Put(x[0], bps); return; }   // CONSTANT (silence)
+        long ignore; int order = BestOrder(x, out ignore);
+        var res = Residual(x, order);
+        var body = new Bits();
+        Rice(body, res, x.Length, order);
+        if (body.Out.Count * 8L > (long)(x.Length - order) * bps)   // noise: verbatim is smaller
+        {
+            o.Put(0, 1); o.Put(1, 6); o.Put(0, 1);
+            foreach (var v in x) o.Put(v, bps);
+            return;
+        }
+        o.Put(0, 1); o.Put(8 | order, 6); o.Put(0, 1);   // FIXED predictor
+        for (int i = 0; i < order; i++) o.Put(x[i], bps);   // warm-up samples
+        Rice(o, res, x.Length, order);
+    }
+
+    // Partitioned Rice coding: the partition order and each partition's parameter are chosen from the residuals' sums
+    // (bits ≈ count·(k+1) + sum >> k), as the reference encoder estimates.
+    static void Rice(Bits o, int[] res, int n, int order)
+    {
+        var u = res.Select(v => (long)v << 1 ^ (long)v >> 63).ToArray();   // zigzag: 0, -1, 1, -2… → 0, 1, 2, 3…
+        int bestP = 0; long bestBits = long.MaxValue; int[] bestK = null;
+        for (int p = 0; p <= 8; p++)
+        {
+            if (n % (1 << p) != 0 || (n >> p) <= order) break;
+            int parts = 1 << p, size = n >> p; var ks = new int[parts]; long total = 0;
+            for (int q = 0, at = 0; q < parts; q++)
+            {
+                int cnt = q == 0 ? size - order : size; long sum = 0;
+                for (int i = 0; i < cnt; i++) sum += u[at + i];
+                at += cnt;
+                long bestHere = long.MaxValue;
+                for (int k = 0; k <= 30; k++) { long b = cnt * (k + 1L) + (sum >> k); if (b < bestHere) { bestHere = b; ks[q] = k; } }
+                total += bestHere + 5;
+            }
+            if (total < bestBits) { bestBits = total; bestP = p; bestK = ks; }
+        }
+        bool wide = bestK.Max() > 14;   // RICE2 (5-bit parameters) when a parameter won't fit in 4 bits
+        o.Put(wide ? 1 : 0, 2); o.Put(bestP, 4);
+        for (int q = 0, at = 0; q < bestK.Length; q++)
+        {
+            int k = bestK[q], cnt = q == 0 ? (n >> bestP) - order : n >> bestP;
+            o.Put(k, wide ? 5 : 4);
+            for (int i = 0; i < cnt; i++) { long v = u[at + i]; o.Zeros(v >> k); o.Put(1, 1); o.Put(v, k); }
+            at += cnt;
+        }
+    }
+
+    static void Utf8(Bits b, long v)   // frame number, UTF-8 style
+    {
+        if (v < 0x80) { b.Put(v, 8); return; }
+        int extra = v < 0x800 ? 1 : v < 0x10000 ? 2 : v < 0x200000 ? 3 : v < 0x4000000 ? 4 : 5;
+        b.Put((0xFF << (7 - extra) & 0xFF) | (int)(v >> 6 * extra), 8);
+        for (int i = extra - 1; i >= 0; i--) b.Put(0x80 | (v >> 6 * i & 0x3F), 8);
+    }
+
+    static int Crc8(List<byte> d) { int c = 0; foreach (var x in d) { c ^= x; for (int k = 0; k < 8; k++) c = (c & 0x80) != 0 ? (c << 1 ^ 0x07) & 0xFF : c << 1 & 0xFF; } return c; }
+    static int Crc16(List<byte> d) { int c = 0; foreach (var x in d) { c ^= x << 8; for (int k = 0; k < 8; k++) c = (c & 0x8000) != 0 ? (c << 1 ^ 0x8005) & 0xFFFF : c << 1 & 0xFFFF; } return c; }
+}
+
+// Windows' own Media Foundation: its MP3 encoder (Windows 8 and later) for export, and its decoders, which the self-test uses
+// to check exported WAV, FLAC and MP3 files with a reader that isn't MiniDAW's own.
+static class MediaFoundation
+{
+    [DllImport("mfplat.dll", ExactSpelling = true)] static extern int MFStartup(int version, int flags);
+    [DllImport("mfplat.dll", ExactSpelling = true)] static extern int MFShutdown();
+    [DllImport("mfplat.dll", ExactSpelling = true)] static extern int MFCreateMediaType(out IMFMediaType t);
+    [DllImport("mfplat.dll", ExactSpelling = true)] static extern int MFCreateSample(out IMFSample s);
+    [DllImport("mfplat.dll", ExactSpelling = true)] static extern int MFCreateMemoryBuffer(int max, out IMFMediaBuffer b);
+    [DllImport("mfreadwrite.dll", ExactSpelling = true)] static extern int MFCreateSinkWriterFromURL([MarshalAs(UnmanagedType.LPWStr)] string url, IntPtr stream, IntPtr attrs, out IMFSinkWriter w);
+    [DllImport("mfreadwrite.dll", ExactSpelling = true)] static extern int MFCreateSourceReaderFromURL([MarshalAs(UnmanagedType.LPWStr)] string url, IntPtr attrs, out IMFSourceReader r);
+
+    static readonly Guid MajorType = new Guid("48eba18e-f8c9-4687-bf11-0a74c9f96a8f"), SubType = new Guid("f7e34c9a-42e8-4714-b74b-cb29d72c35e5"),
+        Audio = new Guid("73647561-0000-0010-8000-00aa00389b71"), Pcm = new Guid("00000001-0000-0010-8000-00aa00389b71"), Mp3Type = new Guid("00000055-0000-0010-8000-00aa00389b71"),
+        Channels = new Guid("37e48bf5-645e-4c5b-89de-ada9e29b696a"), Rate = new Guid("5faeeae7-0290-4c31-9e8a-c534f68d9dba"), BitsPer = new Guid("f2deb57f-40fa-4764-aa33-ed4f2d1ff669"),
+        BlockAlign = new Guid("322de230-9eeb-43bd-ab7a-ff412251541d"), AvgBytes = new Guid("1aab75c8-cfef-451c-ab95-ac034b8e1731");
+
+    // Only the vtable slots up to the last method used are declared; the placeholders keep later methods in their places.
+    [ComImport, Guid("44ae0fa8-ea31-4109-8d2e-4cae4997c555"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFMediaType
+    {
+        void A01(); void A02(); void A03(); void A04();
+        [PreserveSig] int GetUINT32([In, MarshalAs(UnmanagedType.LPStruct)] Guid key, out int v);
+        void A06(); void A07(); void A08(); void A09(); void A10(); void A11(); void A12(); void A13(); void A14(); void A15(); void A16(); void A17(); void A18();
+        [PreserveSig] int SetUINT32([In, MarshalAs(UnmanagedType.LPStruct)] Guid key, int v);
+        void A20(); void A21();
+        [PreserveSig] int SetGUID([In, MarshalAs(UnmanagedType.LPStruct)] Guid key, [In, MarshalAs(UnmanagedType.LPStruct)] Guid v);
+    }
+
+    [ComImport, Guid("c40a00f2-b93a-4d80-ae8c-5a1c634f58e4"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFSample
+    {
+        void A01(); void A02(); void A03(); void A04(); void A05(); void A06(); void A07(); void A08(); void A09(); void A10();
+        void A11(); void A12(); void A13(); void A14(); void A15(); void A16(); void A17(); void A18(); void A19(); void A20();
+        void A21(); void A22(); void A23(); void A24(); void A25(); void A26(); void A27(); void A28(); void A29(); void A30();   // IMFAttributes
+        void S01(); void S02(); void S03();
+        [PreserveSig] int SetSampleTime(long t);
+        void S05();
+        [PreserveSig] int SetSampleDuration(long d);
+        void S07(); void S08();
+        [PreserveSig] int ConvertToContiguousBuffer(out IMFMediaBuffer b);
+        [PreserveSig] int AddBuffer(IMFMediaBuffer b);
+    }
+
+    [ComImport, Guid("045fa593-8799-42b8-bc8d-8968c6453507"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFMediaBuffer
+    {
+        [PreserveSig] int Lock(out IntPtr buf, out int max, out int cur);
+        [PreserveSig] int Unlock();
+        [PreserveSig] int GetCurrentLength(out int len);
+        [PreserveSig] int SetCurrentLength(int len);
+    }
+
+    [ComImport, Guid("3137f1cd-fe5e-4805-a5d8-fb477448cb3d"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFSinkWriter
+    {
+        [PreserveSig] int AddStream(IMFMediaType t, out int index);
+        [PreserveSig] int SetInputMediaType(int index, IMFMediaType t, IntPtr encodingParams);
+        [PreserveSig] int BeginWriting();
+        [PreserveSig] int WriteSample(int index, IMFSample s);
+        void W05(); void W06(); void W07(); void W08();
+        [PreserveSig] int Finish();   // IMFSinkWriter::Finalize: writes the file's end and closes it
+    }
+
+    [ComImport, Guid("70ae66f2-c809-4e4f-8915-bdcb406b7993"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMFSourceReader
+    {
+        void R01();
+        [PreserveSig] int SetStreamSelection(int index, [MarshalAs(UnmanagedType.Bool)] bool selected);
+        void R03();
+        [PreserveSig] int GetCurrentMediaType(int index, out IMFMediaType t);
+        [PreserveSig] int SetCurrentMediaType(int index, IntPtr reserved, IMFMediaType t);
+        void R06();
+        [PreserveSig] int ReadSample(int index, int flags, out int actual, out int streamFlags, out long time, out IMFSample s);
+    }
+
+    static void Check(int hr, string what) { if (hr < 0) throw new InvalidOperationException(what + " failed (Media Foundation error 0x" + hr.ToString("X8") + ")."); }
+
+    static void Start()
+    {
+        int hr;
+        try { hr = MFStartup(0x00020070, 0); }
+        catch (DllNotFoundException) { throw new InvalidOperationException("This Windows has no Media Foundation (on Windows \"N\" editions, install the Media Feature Pack)."); }
+        Check(hr, "Starting Media Foundation");
+    }
+
+    static IMFMediaType PcmType(int rate, int chans, int bits)
+    {
+        IMFMediaType t; Check(MFCreateMediaType(out t), "MFCreateMediaType");
+        t.SetGUID(MajorType, Audio); t.SetGUID(SubType, Pcm); t.SetUINT32(Channels, chans); t.SetUINT32(Rate, rate);
+        t.SetUINT32(BitsPer, bits); t.SetUINT32(BlockAlign, chans * bits / 8); t.SetUINT32(AvgBytes, rate * chans * bits / 8);
+        return t;
+    }
+
+    public static void Mp3(string path, float[] lr, int rate, int kbps)   // interleaved stereo
+    {
+        Start();
+        IMFSinkWriter w = null;
+        try
+        {
+            if (File.Exists(path)) File.Delete(path);   // the sink writer won't overwrite
+            Check(MFCreateSinkWriterFromURL(path, IntPtr.Zero, IntPtr.Zero, out w), "Creating the MP3 file");
+            IMFMediaType outType; Check(MFCreateMediaType(out outType), "MFCreateMediaType");
+            outType.SetGUID(MajorType, Audio); outType.SetGUID(SubType, Mp3Type); outType.SetUINT32(Channels, 2); outType.SetUINT32(Rate, rate);
+            outType.SetUINT32(AvgBytes, kbps * 1000 / 8); outType.SetUINT32(BlockAlign, 1);
+            int idx; Check(w.AddStream(outType, out idx), "Windows' MP3 encoder");
+            Check(w.SetInputMediaType(idx, PcmType(rate, 2, 16), IntPtr.Zero), "Feeding the MP3 encoder");
+            Check(w.BeginWriting(), "Starting the MP3 file");
+            const int Chunk = 4096;
+            for (int at = 0; at < lr.Length / 2; at += Chunk)
+            {
+                int n = Math.Min(Chunk, lr.Length / 2 - at);
+                IMFMediaBuffer buf; Check(MFCreateMemoryBuffer(n * 4, out buf), "MFCreateMemoryBuffer");
+                IntPtr p; int max, cur; Check(buf.Lock(out p, out max, out cur), "Lock");
+                var pcm = new short[n * 2];
+                for (int i = 0; i < pcm.Length; i++) pcm[i] = (short)Wav.Sample(lr[2 * at + i], 16);
+                Marshal.Copy(pcm, 0, p, pcm.Length);
+                buf.Unlock(); buf.SetCurrentLength(n * 4);
+                IMFSample s; Check(MFCreateSample(out s), "MFCreateSample");
+                s.AddBuffer(buf); s.SetSampleTime(at * 10000000L / rate); s.SetSampleDuration(n * 10000000L / rate);
+                Check(w.WriteSample(idx, s), "Encoding MP3");
+                Marshal.ReleaseComObject(s); Marshal.ReleaseComObject(buf);
+            }
+            Check(w.Finish(), "Finishing the MP3 file");
+        }
+        finally { if (w != null) Marshal.ReleaseComObject(w); MFShutdown(); }
+    }
+
+    public static float[] Decode(string path, out int rate, out int chans)   // any file Windows can play, as interleaved floats
+    {
+        Start();
+        IMFSourceReader r = null;
+        try
+        {
+            Check(MFCreateSourceReaderFromURL(path, IntPtr.Zero, out r), "Opening " + Path.GetFileName(path));
+            const int FirstAudio = -3, All = -2;
+            r.SetStreamSelection(All, false); r.SetStreamSelection(FirstAudio, true);
+            IMFMediaType want; Check(MFCreateMediaType(out want), "MFCreateMediaType");
+            want.SetGUID(MajorType, Audio); want.SetGUID(SubType, Pcm);
+            Check(r.SetCurrentMediaType(FirstAudio, IntPtr.Zero, want), "Choosing PCM output");
+            IMFMediaType got; Check(r.GetCurrentMediaType(FirstAudio, out got), "Reading the format");
+            int bits; got.GetUINT32(Channels, out chans); got.GetUINT32(Rate, out rate); got.GetUINT32(BitsPer, out bits);
+            var bytes = new List<byte>();
+            while (true)
+            {
+                int actual, flags; long t; IMFSample s;
+                Check(r.ReadSample(FirstAudio, 0, out actual, out flags, out t, out s), "Decoding");
+                if (s != null)
+                {
+                    IMFMediaBuffer buf; s.ConvertToContiguousBuffer(out buf);
+                    IntPtr p; int max, cur; buf.Lock(out p, out max, out cur);
+                    var chunk = new byte[cur]; Marshal.Copy(p, chunk, 0, cur); bytes.AddRange(chunk);
+                    buf.Unlock(); Marshal.ReleaseComObject(buf); Marshal.ReleaseComObject(s);
+                }
+                if ((flags & 2) != 0) break;   // end of stream
+            }
+            int bps = bits / 8; var outp = new float[bytes.Count / bps]; var b = bytes.ToArray();
+            for (int i = 0; i < outp.Length; i++)
+                outp[i] = bits == 16 ? BitConverter.ToInt16(b, i * 2) / 32768f : bits == 24 ? (b[i * 3] | b[i * 3 + 1] << 8 | (sbyte)b[i * 3 + 2] << 16) / 8388608f : BitConverter.ToInt32(b, i * 4) / 2147483648f;
+            return outp;
+        }
+        finally { if (r != null) Marshal.ReleaseComObject(r); MFShutdown(); }
     }
 }
 
@@ -943,6 +1266,8 @@ class Engine
     public int StepLimit = int.MaxValue;   // offline export: no notes start at or after this step, so the song doesn't loop
     long rendered, songEnd = -1;           // frames rendered so far; the frame where step StepLimit would have started (-1 = not yet)
     public readonly float[] Peaks = new float[Project.Inserts];   // per-insert meter levels for the mixer view
+    public readonly float[] EverPeak = new float[Project.Inserts]; // loudest each insert has been: export skips stems that stayed silent
+    public int Tap;                                                // export of one stem: Render outputs this insert (post-fader) instead of the master
     readonly float[][] ib = new float[Project.Inserts][];          // per-insert stereo bus buffers
     float[] dryBuf;                                                 // scratch for effects' wet/dry mix
     public readonly ConcurrentQueue<Voice> Preview = new ConcurrentQueue<Voice>();
@@ -1019,16 +1344,20 @@ class Engine
             if (Project.RouteOk(i, to)) { float lvl = ins.SendLevel; for (int k = 0; k < n2; k++) ib[to][k] += ib[i][k] * lvl; }
         }
         Strip(proj.Mixer[0], master, n2, 0, null);
-        for (int k = 0; k < n2; k++) lr[k] = (float)Math.Tanh(master[k] + clickBuf[k]);   // soft clip instead of hard wrap-around; the click skips the master fader
+        if (Tap > 0) Array.Copy(ib[Tap], lr, n2);   // a stem: the insert as it leaves for the master, unclipped
+        else for (int k = 0; k < n2; k++) lr[k] = (float)Math.Tanh(master[k] + clickBuf[k]);   // soft clip instead of hard wrap-around; the click skips the master fader
         rendered += frames;
     }
 
     // Offline bounce, like FL's File > Export: the whole song (or one pattern), then the reverb/delay tail until it goes quiet.
     // Pass a Project.ExportCopy() so the live engine's effect state isn't shared.
-    public static float[] Bounce(Project proj, bool song, int pattern)
+    public static float[] Bounce(Project proj, bool song, int pattern) { float[] ever; return Bounce(proj, song, pattern, out ever); }
+
+    public static float[] Bounce(Project proj, bool song, int pattern, out float[] everPeak)   // everPeak: how loud each insert got
     {
         int steps = song ? proj.SongBars() * Project.Steps : proj.Patterns[Math.Min(pattern, proj.Patterns.Count - 1)].Length;
         var e = new Engine { Proj = proj, Playing = true, SongMode = song, CurPattern = pattern, StepLimit = steps };
+        everPeak = e.EverPeak;
         int maxTail = 10 * SR, maxSong = 10 * 60 * SR;   // the slowest possible song (32 bars at 40 BPM) takes 3.2 minutes
         int quietNeeded = (int)(1.2 * SR);   // longer than the 1 s max delay time, so a gap before an echo isn't taken for the end
         const float Silent = 1e-4f;          // -80 dBFS, below 16-bit's last few bits
@@ -1046,6 +1375,17 @@ class Engine
         return outp.Take(2 * Math.Max(body, last)).ToArray();
     }
 
+    // One insert's output (post-fader, as it goes to the master) over exactly `frames` frames: a stem lined up with the master export.
+    // Rendered on its own pass so only one stem is ever in memory. Pass a fresh Project.ExportCopy().
+    public static float[] BounceStem(Project proj, bool song, int pattern, int insert, int frames)
+    {
+        int steps = song ? proj.SongBars() * Project.Steps : proj.Patterns[Math.Min(pattern, proj.Patterns.Count - 1)].Length;
+        var e = new Engine { Proj = proj, Playing = true, SongMode = song, CurPattern = pattern, StepLimit = steps, Tap = insert };
+        var outp = new float[frames * 2]; var buf = new float[Frames * 2];
+        for (int at = 0; at < frames; at += Frames) { e.Render(buf, Frames); Array.Copy(buf, 0, outp, at * 2, Math.Min(Frames, frames - at) * 2); }
+        return outp;
+    }
+
     void Strip(Insert ins, float[] b, int n2, int idx, float[] key)
     {
         foreach (var fx in ins.Slots) if (fx != null && !fx.Bypass) fx.Run(b, n2, key, ref dryBuf);
@@ -1056,6 +1396,7 @@ class Engine
             pk = Math.Max(pk, Math.Max(Math.Abs(b[k]), Math.Abs(b[k + 1])));
         }
         Peaks[idx] = Math.Max(pk, Peaks[idx] * 0.85f);   // meter falls back gradually
+        EverPeak[idx] = Math.Max(EverPeak[idx], pk);
     }
 
     // Set automated controls from their lanes at the current song position, once per block (~23 ms),
@@ -1758,7 +2099,7 @@ class MainForm : Form
         exportBtn = Btn(bar, "Export…", (s, e) =>
         {
             var m = new ContextMenuStrip();
-            m.Items.Add("Audio (WAV)…", null, (s2, e2) => ExportWav());
+            m.Items.Add("Audio (WAV, FLAC, MP3)…", null, (s2, e2) => ExportAudio());
             m.Items.Add("MIDI file (.mid)…", null, (s2, e2) => ExportMidi());
             m.Show(exportBtn, 0, exportBtn.Height);
         });
@@ -2246,24 +2587,78 @@ class MainForm : Form
         }
     }
 
-    void ExportWav()   // exports what Play would play: the whole song in Song mode, the current pattern in Pattern mode
+    // ---- audio export, like FL's render window: format and quality, plus optional stems (each mixer insert as its own file)
+    static readonly string[] Formats = { "WAV", "FLAC (lossless, about half the size)", "MP3" }, Exts = { ".wav", ".flac", ".mp3" };
+    static string[] Qualities(int f) { return f == 0 ? new[] { "16-bit", "24-bit", "32-bit float" } : f == 1 ? new[] { "16-bit", "24-bit" } : new[] { "128 kbps", "192 kbps", "256 kbps", "320 kbps" }; }
+    static int exportFormat, exportQuality; static bool exportStems;   // remembered while MiniDAW runs
+
+    bool AskExport()
     {
-        string name = Path.GetFileNameWithoutExtension(filePath ?? "song") + ".wav";
-        using (var d = new SaveFileDialog { Filter = "WAV audio (*.wav)|*.wav", FileName = name })
+        using (var f = new Form { Text = "Export audio", FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false, ShowInTaskbar = false,
+                                  StartPosition = FormStartPosition.CenterParent, ClientSize = new Size(380, 178), BackColor = PanelBg, ForeColor = Txt, Font = Font })
+        {
+            f.HandleCreated += (s, e) => DarkTitle(f.Handle);
+            var fmt = new DarkCombo { Left = 92, Top = 14, Width = 272 }; var q = new DarkCombo { Left = 92, Top = 46, Width = 272 };
+            fmt.Items.AddRange(Formats);
+            fmt.SelectedIndexChanged += (s, e) => { q.Items.Clear(); q.Items.AddRange(Qualities(fmt.SelectedIndex)); q.SelectedIndex = fmt.SelectedIndex == 2 ? 3 : 0; };
+            fmt.SelectedIndex = exportFormat; q.SelectedIndex = Math.Min(exportQuality, q.Items.Count - 1);
+            var stems = new CheckBox { Text = "Also save each mixer insert as its own file (stems)", Left = 14, Top = 82, AutoSize = true, Checked = exportStems };
+            var what = new Label { Text = eng.SongMode ? "Exports the whole song (Song mode), 44.1 kHz stereo." : "Exports the current pattern (Pattern mode), 44.1 kHz stereo.", Left = 14, Top = 108, AutoSize = true, ForeColor = Dim };
+            f.Controls.AddRange(new Control[] { new Label { Text = "Format", Left = 14, Top = 18, AutoSize = true }, fmt, new Label { Text = "Quality", Left = 14, Top = 50, AutoSize = true }, q, stems, what });
+            var ok = Btn(f, "Export…", null); ok.DialogResult = DialogResult.OK; ok.AutoSize = false; ok.SetBounds(196, 138, 84, 28);
+            var cancel = Btn(f, "Cancel", null); cancel.DialogResult = DialogResult.Cancel; cancel.AutoSize = false; cancel.SetBounds(286, 138, 78, 28);
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            if (f.ShowDialog(this) != DialogResult.OK) return false;
+            exportFormat = fmt.SelectedIndex; exportQuality = q.SelectedIndex; exportStems = stems.Checked;
+            return true;
+        }
+    }
+
+    void ExportAudio()   // exports what Play would play: the whole song in Song mode, the current pattern in Pattern mode
+    {
+        if (!AskExport()) return;
+        string ext = Exts[exportFormat];
+        using (var d = new SaveFileDialog { Filter = Formats[exportFormat] + "|*" + ext, FileName = Path.GetFileNameWithoutExtension(filePath ?? "song") + ext })
         {
             if (d.ShowDialog(this) != DialogResult.OK) return;
             Cursor = Cursors.WaitCursor;
             try
             {
-                var lr = Engine.Bounce(P.ExportCopy(), eng.SongMode, eng.CurPattern);
-                File.WriteAllBytes(d.FileName, Wav.Make16(lr, Engine.SR, 2));
-                MessageBox.Show(this, "Exported " + (eng.SongMode ? "the song" : "the pattern") + " (" + (lr.Length / 2.0 / Engine.SR).ToString("0.0")
-                    + " s, 44.1 kHz 16-bit stereo) to\n" + d.FileName, "MiniDAW");
+                bool song = eng.SongMode; int pat = eng.CurPattern; float[] ever;
+                var lr = Engine.Bounce(P.ExportCopy(), song, pat, out ever);
+                WriteAudio(d.FileName, lr, exportFormat, exportQuality);
+                var stems = new List<string>();
+                if (exportStems)
+                    for (int i = 1; i < Project.Inserts; i++)
+                    {
+                        if (ever[i] < 1e-4f) continue;   // nothing came through this insert
+                        string stem = Path.Combine(Path.GetDirectoryName(d.FileName), Path.GetFileNameWithoutExtension(d.FileName) + " - " + SafeName(InsertName(i)) + ext);
+                        WriteAudio(stem, Engine.BounceStem(P.ExportCopy(), song, pat, i, lr.Length / 2), exportFormat, exportQuality);
+                        stems.Add(Path.GetFileName(stem));
+                    }
+                MessageBox.Show(this, "Exported " + (song ? "the song" : "the pattern") + " (" + (lr.Length / 2.0 / Engine.SR).ToString("0.0") + " s, " + Exts[exportFormat].Substring(1).ToUpper()
+                    + " " + Qualities(exportFormat)[exportQuality] + ") to\n" + d.FileName + (stems.Count > 0 ? "\n\nplus " + stems.Count + " stems next to it:\n" + string.Join("\n", stems) : ""), "MiniDAW");
             }
             catch (Exception ex) { MessageBox.Show(this, "Export failed:\n" + ex.Message, "MiniDAW"); }
             finally { Cursor = Cursors.Default; }
         }
     }
+
+    internal static void WriteAudio(string path, float[] lr, int format, int quality)
+    {
+        if (format == 0) File.WriteAllBytes(path, Wav.Make(lr, Engine.SR, 2, new[] { 16, 24, 32 }[quality]));
+        else if (format == 1) File.WriteAllBytes(path, Flac.Encode(lr, Engine.SR, new[] { 16, 24 }[quality]));
+        else MediaFoundation.Mp3(path, lr, Engine.SR, new[] { 128, 192, 256, 320 }[quality]);
+    }
+
+    string InsertName(int i)   // "Insert 3 (Snare)", from the channels that feed it
+    {
+        string from = string.Join(", ", P.Channels.Where(c => c.Insert == i).Select(c => c.Name));
+        if (from.Length > 40) from = from.Substring(0, 40) + "…";
+        return "Insert " + i + (from == "" ? "" : " (" + from + ")");
+    }
+
+    static string SafeName(string s) { foreach (var c in Path.GetInvalidFileNameChars()) s = s.Replace(c, '_'); return s; }
 
     // A MIDI file's notes join this project as new channels and patterns (one undo step); the summary says where they went.
     void ImportMidi(string path)
@@ -3799,6 +4194,58 @@ class MainForm : Form
                 try { Midi.Import(new Project(), mbytes.Take(mbytes.Length / 2).ToArray(), "cut"); } catch (InvalidDataException) { refusedCut = true; }
                 try { Midi.Import(new Project(), Encoding.ASCII.GetBytes("RIFF this is a wav, not midi"), "junk"); } catch (InvalidDataException) { refusedJunk = true; }
                 check(refusedCut && refusedJunk, "MIDI: a cut-off file and a non-MIDI file are refused with a message, not a crash");
+            }
+
+            {   // export formats: WAV read back by MiniDAW, FLAC and MP3 decoded by Windows' own decoders (a reader that isn't ours)
+                var pat = Engine.Bounce(Project.Demo().ExportCopy(), false, 0);   // the demo pattern, ~1.9 s
+                var mix = new float[pat.Length + 2 * 9000]; Array.Copy(pat, mix, pat.Length);
+                var rnd = new Random(7); for (int k = pat.Length; k < pat.Length + 9000; k++) mix[k] = (float)(rnd.NextDouble() * 2 - 1);   // full-scale noise, then silence
+                string tmp = Path.Combine(Path.GetTempPath(), "minidaw-selftest-" + Guid.NewGuid().ToString("N")); Directory.CreateDirectory(tmp);
+                try
+                {
+                    var probe = new Channel { Kind = "sample" }; bool wavOk = true;
+                    foreach (int bits in new[] { 24, 32 })
+                    {
+                        string wp = Path.Combine(tmp, "t" + bits + ".wav"); File.WriteAllBytes(wp, Wav.Make(mix, Engine.SR, 2, bits)); Wav.Load(wp, probe);
+                        double err = 0; for (int k = 0; k < probe.Sample.Length; k++) err = Math.Max(err, Math.Abs(probe.Sample[k] - Math.Max(-1, Math.Min(1, mix[2 * k]))));
+                        wavOk &= probe.Sample.Length == mix.Length / 2 && err < (bits == 32 ? 1e-7 : 2.5e-7);
+                    }
+                    check(wavOk, "WAV export: 24-bit and 32-bit float files read back within one step of 24-bit precision");
+                    bool mf = true; int rate, chans;
+                    try { File.WriteAllBytes(Path.Combine(tmp, "probe.wav"), Wav.Make(pat, Engine.SR, 2, 16)); MediaFoundation.Decode(Path.Combine(tmp, "probe.wav"), out rate, out chans); }
+                    catch (InvalidOperationException) { mf = false; }
+                    if (!mf) log.Add("skip FLAC/MP3 checks: this Windows has no Media Foundation");
+                    else
+                    {
+                        string flacInfo = ""; bool flacOk = true;
+                        foreach (int bits in new[] { 16, 24 })
+                        {
+                            string fp = Path.Combine(tmp, "t" + bits + ".flac"); var enc = Flac.Encode(mix, Engine.SR, bits); File.WriteAllBytes(fp, enc);
+                            var dec = MediaFoundation.Decode(fp, out rate, out chans); double scale = 1 << (bits - 1);
+                            int bad = dec.Length != mix.Length ? -1 : Enumerable.Range(0, mix.Length).Count(k => (int)Math.Round(dec[k] * scale) != Wav.Sample(mix[k], bits));
+                            flacOk &= bad == 0 && rate == Engine.SR && chans == 2;
+                            flacInfo += bits + "-bit " + (100 * enc.Length / (mix.Length * bits / 8)) + "% of WAV size" + (bad == 0 ? "" : ", " + bad + " samples differ") + "; ";
+                        }
+                        check(flacOk, "FLAC export: Windows decodes it bit-for-bit identical to the input, 16 and 24-bit, through music, noise and silence (" + flacInfo.TrimEnd(' ', ';') + ")");
+                        string mp3Path = Path.Combine(tmp, "t.mp3"); MediaFoundation.Mp3(mp3Path, pat, Engine.SR, 192);
+                        var md = MediaFoundation.Decode(mp3Path, out rate, out chans);
+                        double bestCorr = 0; int bestLag = 0;
+                        for (int lag = 0; lag < 3000 && chans == 2; lag += 1)
+                        {
+                            double sxy = 0, sxx = 0, syy = 0;
+                            for (int k = 0; k < 40000 && 2 * (k + lag) < md.Length; k += 4) { double x = pat[2 * k], y = md[2 * (k + lag)]; sxy += x * y; sxx += x * x; syy += y * y; }
+                            double c = sxy / Math.Sqrt(sxx * syy + 1e-12); if (c > bestCorr) { bestCorr = c; bestLag = lag; }
+                        }
+                        check(bestCorr > 0.95 && rate == Engine.SR, "MP3 export (192 kbps, Windows' encoder): decodes to the same sound (correlation " + bestCorr.ToString("0.000") + " after the encoder's " + bestLag + "-sample delay)");
+                    }
+                    float[] ever; var demoSong = Project.Demo(); var master = Engine.Bounce(demoSong.ExportCopy(), true, 0, out ever);
+                    var active = Enumerable.Range(1, Project.Inserts - 1).Where(k => ever[k] >= 1e-4f).ToList();
+                    var sum = new double[master.Length];
+                    foreach (var k in active) { var st = Engine.BounceStem(demoSong.ExportCopy(), true, 0, k, master.Length / 2); for (int j = 0; j < st.Length; j++) sum[j] += st[j]; }
+                    double a = 0, bb = 0, crossSum = 0; for (int j = 0; j < master.Length; j++) { a += sum[j] * sum[j]; bb += master[j] * master[j]; crossSum += sum[j] * master[j]; }
+                    check(string.Join(",", active) == "1,2,3,4" && crossSum / Math.Sqrt(a * bb) > 0.99, "stems: one file per insert that carries sound (" + string.Join(", ", active) + "), and together they add up to the master mix");
+                }
+                finally { Directory.Delete(tmp, true); }
             }
 
             check(Updates.Newer("v1.2", "1.1") && Updates.Newer("1.10", "1.9") && Updates.Newer("v2.0.1", "2.0") && !Updates.Newer("v1.1.0", "1.1") && !Updates.Newer("v1.0", "1.1")

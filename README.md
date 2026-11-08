@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 100 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 104 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -138,10 +138,17 @@ Each insert has:
 
 ## Export
 
-**Export…** saves what Play would play, as a 44.1 kHz 16-bit stereo WAV:
-- **Song mode:** the whole arrangement, plus the reverb/delay tail.
-- **Pattern mode:** the current pattern, once.
+**Export… → Audio (WAV, FLAC, MP3)…** saves what Play would play: the whole arrangement plus its reverb/delay tail in **Song** mode, or the current pattern once in **Pattern** mode. A small window asks for:
 
+| Format | Quality | Notes |
+|---|---|---|
+| WAV | 16-bit, 24-bit, 32-bit float | 32-bit float keeps peaks above full scale |
+| FLAC | 16-bit, 24-bit | Lossless: sounds exactly like the WAV at roughly half the size. MiniDAW encodes it itself |
+| MP3 | 128, 192, 256, 320 kbps | Uses the MP3 encoder built into Windows (on Windows "N" editions, install the Media Feature Pack) |
+
+Everything is 44.1 kHz stereo. Tick **stems** to also save every mixer insert that carries sound as its own file next to the main one, named like `song - Insert 2 (Snare).flac`. Each stem is that insert's output after its effects and fader, and all of them line up with the main file, so you can mix them elsewhere.
+
+The export window remembers your choices until MiniDAW closes.
 ## MIDI files
 
 - **Export:** **Export… → MIDI file (.mid)…** saves the song (Song mode) or the current pattern (Pattern mode) as a standard MIDI file that other music programs open.
@@ -206,7 +213,7 @@ MiniDAW is open source under the [MIT License](LICENSE): use it, change it, shar
 - The pitch wheel (±2 semitones) and the vibrato (5.5 Hz, ±½ semitone) can't be adjusted, and they don't affect Pluck or the drums. The computer keyboard has no sustain, pitch or mod controls.
 - One send per insert. Sidechain drives only the Compressor.
 - Mixer controls, rack volume/pan, sound settings and tempo can be automated. Lanes span the whole song and are drawn freehand.
-- No VST plugins. Export is 16-bit WAV only.
+- No VST plugins. Export is 44.1 kHz only.
 - Audio uses the classic Windows `waveOut` output with about 0.1 s of delay. No ASIO.
 - Recording works only in Pattern mode and only adds notes (overdub).
 - MIDI import snaps notes to 16ths; a song longer than the playlist only gets its first 32 bars placed (the rest of its patterns are still created).
