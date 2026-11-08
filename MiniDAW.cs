@@ -709,6 +709,216 @@ struct WAVEFORMATEX { public short wFormatTag, nChannels; public int nSamplesPer
 [StructLayout(LayoutKind.Sequential)]
 struct WAVEHDR { public IntPtr lpData; public int dwBufferLength, dwBytesRecorded; public IntPtr dwUser; public int dwFlags, dwLoops; public IntPtr lpNext, reserved; }
 
+// Standard MIDI files (.mid). Export writes what Play would start, one track per channel (drums on MIDI channel 10 as General
+// MIDI drum notes). Import turns each MIDI track/channel into a new rack channel (drums by GM note, others by GM program) and
+// the notes into new patterns of up to Pattern.MaxBars bars, placed one after another on a free playlist track.
+static class Midi
+{
+    const int Ppq = 96, PerStep = Ppq / 4;   // ticks per quarter note, and per 16th
+    static readonly Dictionary<string, int> DrumNote = new Dictionary<string, int> { { "kick", 36 }, { "snare", 38 }, { "hat", 42 }, { "clap", 39 } };
+    static readonly Dictionary<string, int> Program = new Dictionary<string, int> { { "synth", 81 }, { "square", 80 }, { "pluck", 24 }, { "pad", 89 }, { "bass", 38 }, { "keys", 4 }, { "sample", 0 } };   // GM, 0-based
+
+    public static byte[] Export(Project p, bool song, int pattern)
+    {
+        var starts = new List<Tuple<int, int, Note>>();   // (song step, channel, note)
+        var tempo = new List<Tuple<int, int, byte[]>>();
+        lock (p)
+        {
+            if (song)
+            {
+                int len = p.SongBars() * Project.Steps;
+                var lane = p.Automation.FirstOrDefault(l => l.Tempo);
+                for (int abs = 0, last = -1; abs < len; abs++)
+                {
+                    int bar = abs / Project.Steps;
+                    for (int t = 0; t < Project.Tracks; t++)   // the same clips Engine.Trigger would play at this step
+                    {
+                        int b0 = p.ClipAt(t, bar);
+                        if (b0 < 0) continue;
+                        var pat = p.Patterns[p.Playlist[t, b0]]; int s = (bar - b0) * Project.Steps + abs % Project.Steps;
+                        for (int ch = 0; ch < Math.Min(pat.Notes.Count, p.Channels.Count); ch++)
+                            if (!p.Channels[ch].Mute) foreach (var n in pat.Notes[ch]) if (n.Step == s) starts.Add(Tuple.Create(abs, ch, n));
+                    }
+                    int bpm = lane == null ? p.Bpm : (int)Math.Round(Project.MinBpm + lane.Values[abs] * (Project.MaxBpm - Project.MinBpm));
+                    if (bpm != last) { tempo.Add(Tuple.Create(abs * PerStep, 2, Tempo(bpm))); last = bpm; }   // a tempo lane: one change per 16th it moves
+                }
+            }
+            else
+            {
+                var pat = p.Patterns[Math.Min(pattern, p.Patterns.Count - 1)];
+                for (int ch = 0; ch < Math.Min(pat.Notes.Count, p.Channels.Count); ch++)
+                    if (!p.Channels[ch].Mute) foreach (var n in pat.Notes[ch]) starts.Add(Tuple.Create(n.Step, ch, n));
+                tempo.Add(Tuple.Create(0, 2, Tempo(p.Bpm)));
+            }
+        }
+        tempo.Add(Tuple.Create(0, 0, Meta(0x03, Encoding.UTF8.GetBytes("MiniDAW"))));
+        tempo.Add(Tuple.Create(0, 1, Meta(0x58, new byte[] { 4, 2, 24, 8 })));   // 4/4
+        var tracks = new List<byte[]> { Chunk(tempo) };
+        int nextChan = 0;
+        foreach (var group in starts.GroupBy(x => x.Item2).OrderBy(gr => gr.Key))
+        {
+            var c = p.Channels[group.Key]; bool drum = c.IsDrum;
+            int mc = drum ? 9 : nextChan++ % 15; if (mc >= 9 && !drum) mc++;   // channel 10 is kept for drums
+            var ev = new List<Tuple<int, int, byte[]>> { Tuple.Create(0, 0, Meta(0x03, Encoding.UTF8.GetBytes(c.Name ?? ""))) };
+            if (!drum) ev.Add(Tuple.Create(0, 1, new byte[] { (byte)(0xC0 | mc), (byte)Program[c.Kind] }));
+            foreach (var x in group)
+            {
+                int key = drum ? DrumNote[c.Kind] : Math.Max(0, Math.Min(127, x.Item3.Key)), vel = Math.Max(1, Math.Min(127, x.Item3.Vel));
+                ev.Add(Tuple.Create(x.Item1 * PerStep, 3, new byte[] { (byte)(0x90 | mc), (byte)key, (byte)vel }));
+                ev.Add(Tuple.Create((x.Item1 + Math.Max(1, x.Item3.Len)) * PerStep, 2, new byte[] { (byte)(0x80 | mc), (byte)key, 0 }));   // offs sort before ons at the same tick
+            }
+            tracks.Add(Chunk(ev));
+        }
+        var file = new List<byte>(Encoding.ASCII.GetBytes("MThd"));
+        BE(file, 6, 4); BE(file, 1, 2); BE(file, tracks.Count, 2); BE(file, Ppq, 2);
+        foreach (var t in tracks) file.AddRange(t);
+        return file.ToArray();
+    }
+
+    static byte[] Tempo(int bpm) { int us = 60000000 / Math.Max(1, bpm); return Meta(0x51, new[] { (byte)(us >> 16), (byte)(us >> 8), (byte)us }); }
+    static byte[] Meta(int type, byte[] data) { var m = new List<byte> { 0xFF, (byte)type }; Var(m, data.Length); m.AddRange(data); return m.ToArray(); }
+    static void BE(List<byte> o, int v, int n) { for (int i = n - 1; i >= 0; i--) o.Add((byte)(v >> 8 * i)); }
+    static void Var(List<byte> o, int v) { var b = new List<byte> { (byte)(v & 0x7F) }; while ((v >>= 7) > 0) b.Insert(0, (byte)(0x80 | v & 0x7F)); o.AddRange(b); }
+
+    static byte[] Chunk(List<Tuple<int, int, byte[]>> ev)   // (tick, order within the tick, event) → an MTrk chunk with delta times
+    {
+        var body = new List<byte>(); int at = 0;
+        foreach (var e in ev.OrderBy(x => x.Item1).ThenBy(x => x.Item2)) { Var(body, e.Item1 - at); at = e.Item1; body.AddRange(e.Item3); }
+        body.AddRange(new byte[] { 0, 0xFF, 0x2F, 0 });   // end of track
+        var c = new List<byte>(Encoding.ASCII.GetBytes("MTrk")); BE(c, body.Count, 4); c.AddRange(body);
+        return c.ToArray();
+    }
+
+    // ---- import
+    class Reader   // bounds-checked: a damaged file stops with InvalidDataException, never an index error
+    {
+        readonly byte[] d; readonly int end; public int Pos;
+        public Reader(byte[] d, int pos, int end) { this.d = d; Pos = pos; this.end = end; }
+        public bool More { get { return Pos < end; } }
+        public int U8() { if (Pos >= end) throw Bad(); return d[Pos++]; }
+        public int BE(int n) { int v = 0; for (int i = 0; i < n; i++) v = v << 8 | U8(); return v; }
+        public int Var() { int v = 0; for (int i = 0; i < 4; i++) { int b = U8(); v = v << 7 | b & 0x7F; if (b < 0x80) return v; } throw Bad(); }
+        public int Skip(int n) { if (n < 0 || n > end - Pos) throw Bad(); int at = Pos; Pos += n; return at; }
+    }
+    static Exception Bad() { return new InvalidDataException("This MIDI file is damaged: it ends early or has an event that doesn't make sense."); }
+
+    class N { public int Track, Chan, Key, On, Off, Vel; }
+
+    static string KindFor(int program)   // General MIDI program → the closest built-in sound (no program change = piano, the GM default)
+    {
+        if (program < 8) return "keys";
+        if (program >= 24 && program < 32) return "pluck";
+        if (program >= 32 && program < 40) return "bass";
+        if (program == 80) return "square";
+        if (program >= 48 && program < 56 || program >= 88 && program < 96) return "pad";
+        return "synth";
+    }
+
+    static string DrumKind(int n)   // GM drum note → the closest built-in drum: toms and low notes → kick, cymbals and percussion → hat
+    {
+        if (n == 39) return "clap";
+        if (n == 37 || n == 38 || n == 40) return "snare";
+        if (n == 42 || n == 44 || n == 46 || n >= 49) return "hat";
+        return "kick";
+    }
+
+    // Adds the file's notes to p as new channels and patterns; returns a summary for the user.
+    public static string Import(Project p, byte[] data, string title)
+    {
+        var r = new Reader(data, 0, data.Length);
+        if (data.Length < 14 || r.BE(4) != 0x4D546864) throw new InvalidDataException("This isn't a MIDI file.");   // "MThd"
+        int hl = r.BE(4); if (hl < 6) throw Bad();
+        r.BE(2); int ntr = r.BE(2), div = r.BE(2); r.Skip(hl - 6);
+        if (div == 0 || (div & 0x8000) != 0) throw new InvalidDataException("MIDI files timed in SMPTE frames aren't supported.");
+        var notes = new List<N>(); var names = new Dictionary<int, string>(); var programs = new Dictionary<int, int>(); double fileBpm = 0;
+        for (int t = 0; r.More && t < ntr; )
+        {
+            int id = r.BE(4), len = r.BE(4), start = r.Skip(len);
+            if (id != 0x4D54726B) continue;   // not "MTrk": skip unknown chunks
+            var tr = new Reader(data, start, start + len);
+            int tick = 0, status = 0; var open = new Dictionary<int, Queue<int[]>>();
+            while (tr.More)
+            {
+                tick += tr.Var();
+                int b = tr.U8();
+                if (b == 0xFF)   // meta: name, tempo, end
+                {
+                    int type = tr.U8(), n = tr.Var(), at = tr.Skip(n);
+                    if (type == 0x03 && n > 0 && !names.ContainsKey(t)) names[t] = Encoding.GetEncoding(28591).GetString(data, at, n).Trim();
+                    if (type == 0x51 && n == 3 && fileBpm == 0) fileBpm = 60e6 / Math.Max(1, data[at] << 16 | data[at + 1] << 8 | data[at + 2]);
+                    if (type == 0x2F) break;
+                    continue;
+                }
+                if (b == 0xF0 || b == 0xF7) { tr.Skip(tr.Var()); continue; }   // system exclusive
+                if (b > 0xF0) throw Bad();
+                int d1;
+                if (b >= 0x80) { status = b; d1 = tr.U8(); } else if (status != 0) d1 = b; else throw Bad();   // running status
+                int hi = status & 0xF0, ch = status & 0x0F, d2 = hi == 0xC0 || hi == 0xD0 ? 0 : tr.U8();
+                if ((d1 | d2) >= 0x80) throw Bad();
+                int k = ch << 7 | d1;
+                if (hi == 0xC0 && !programs.ContainsKey(t << 4 | ch)) programs[t << 4 | ch] = d1;
+                else if (hi == 0x90 && d2 > 0) { if (!open.ContainsKey(k)) open[k] = new Queue<int[]>(); open[k].Enqueue(new[] { tick, d2 }); }
+                else if ((hi == 0x80 || hi == 0x90) && open.ContainsKey(k) && open[k].Count > 0)
+                {
+                    var on = open[k].Dequeue();
+                    notes.Add(new N { Track = t, Chan = ch, Key = d1, On = on[0], Off = tick, Vel = on[1] });
+                }
+            }
+            foreach (var kv in open) foreach (var on in kv.Value)   // never released: ends with the track
+                notes.Add(new N { Track = t, Chan = kv.Key >> 7, Key = kv.Key & 0x7F, On = on[0], Off = tick, Vel = on[1] });
+            t++;
+        }
+        if (notes.Count == 0) throw new InvalidDataException("This MIDI file has no notes.");
+
+        Func<int, int> step = tk => (int)Math.Round(tk * 4.0 / div);   // shortcut: snaps to 16ths, the pattern grid
+        int span = Pattern.MaxBars * Project.Steps, endStep = notes.Max(n => Math.Max(step(n.On) + 1, step(n.Off)));
+        int patCount = (endStep + span - 1) / span, firstPat;
+        var made = new Dictionary<string, int>();   // group → new channel index
+        lock (p)
+        {
+            firstPat = p.Patterns.Count;
+            for (int i = 0; i < patCount; i++)
+            {
+                var pat = new Pattern { Name = patCount == 1 ? title : title + " " + (i + 1) };
+                pat.SetBars(Math.Max(1, Math.Min(Pattern.MaxBars, (endStep - i * span + Project.Steps - 1) / Project.Steps)));
+                p.Patterns.Add(pat);
+            }
+            foreach (var n in notes.OrderBy(x => x.On))
+            {
+                bool drum = n.Chan == 9;
+                string kind = drum ? DrumKind(n.Key) : KindFor(programs.ContainsKey(n.Track << 4 | n.Chan) ? programs[n.Track << 4 | n.Chan] : 0);
+                string group = drum ? kind : n.Track + "/" + n.Chan;
+                if (!made.ContainsKey(group))
+                {
+                    string name = !drum && names.ContainsKey(n.Track) && names[n.Track] != "" ? names[n.Track] : Channel.Title(kind);
+                    if (name.Length > 40) name = name.Substring(0, 40);
+                    string free = name;
+                    for (int k = 2; p.Channels.Any(c => c.Name == free); k++) free = name + " " + k;
+                    p.Channels.Add(new Channel { Kind = kind, Name = free, Insert = Math.Min(p.Channels.Count + 1, Project.Inserts - 1) });
+                    made[group] = p.Channels.Count - 1;
+                }
+                int s = step(n.On), pi = s / span; var pt = p.Patterns[firstPat + pi]; int at = s - pi * span;
+                if (at >= pt.Length) continue;
+                var list = pt.For(made[group]); int key = drum ? 60 : n.Key;
+                list.RemoveAll(x => x.Step == at && x.Key == key);   // two notes on one 16th: the later one wins, as in the piano roll
+                list.Add(new Note { Step = at, Key = key, Len = Math.Max(1, Math.Min(step(n.Off) - s, pt.Length - at)), Vel = Math.Max(1, Math.Min(127, n.Vel)) });
+            }
+            // place the patterns in order on the first playlist track that's empty for the whole length
+            int bars = Math.Min(Project.Bars, (endStep + Project.Steps - 1) / Project.Steps), track = -1;
+            for (int t = 0; t < Project.Tracks && track < 0; t++)
+                if (Enumerable.Range(0, bars).All(b => p.ClipAt(t, b) < 0)) track = t;
+            int placed = 0;
+            if (track >= 0) for (int i = 0; i < patCount && i * Pattern.MaxBars < Project.Bars; i++, placed++) p.Playlist[track, i * Pattern.MaxBars] = firstPat + i;
+            int total = p.Patterns.Skip(firstPat).Sum(x => x.Notes.Sum(l => l.Count));
+            string where = track < 0 ? "No playlist track was free for it, so place the patterns yourself."
+                : placed < patCount ? "Patterns 1–" + placed + " are on playlist track " + (track + 1) + "; the rest go past the playlist's end."
+                : "They're on playlist track " + (track + 1) + (bars == 1 ? ", bar 1." : ", bars 1–" + bars + ".");
+            return "Imported " + total + " notes into " + made.Count + " new channel" + (made.Count == 1 ? "" : "s") + " and " + patCount + " pattern" + (patCount == 1 ? "" : "s") + ". " + where
+                + (fileBpm > 0 && Math.Abs(fileBpm - p.Bpm) > 0.5 ? "\nThe file's tempo is " + Math.Round(fileBpm) + " BPM; the project stays at " + p.Bpm + " BPM." : "");
+        }
+    }
+}
+
 class Engine
 {
     [DllImport("winmm.dll")] static extern int waveOutOpen(out IntPtr h, int dev, ref WAVEFORMATEX fmt, IntPtr cb, IntPtr inst, int flags);
@@ -1544,7 +1754,14 @@ class MainForm : Form
         Button openBtn = null;
         openBtn = Btn(bar, "Open…", (s, e) => OpenProject(openBtn));
         Btn(bar, "Save…", (s, e) => SaveProject());
-        Btn(bar, "Export…", (s, e) => ExportWav());
+        Button exportBtn = null;
+        exportBtn = Btn(bar, "Export…", (s, e) =>
+        {
+            var m = new ContextMenuStrip();
+            m.Items.Add("Audio (WAV)…", null, (s2, e2) => ExportWav());
+            m.Items.Add("MIDI file (.mid)…", null, (s2, e2) => ExportMidi());
+            m.Show(exportBtn, 0, exportBtn.Height);
+        });
         mixBtn = Gap(Btn(bar, "Mixer (F9)", (s, e) => ToggleMixer()));
         mixBtn.MinimumSize = new Size(108, 28);   // fits "Piano roll (F9)" too, so the toolbar doesn't shift
         midi = new MidiInput(eng.MidiIn);
@@ -1972,7 +2189,8 @@ class MainForm : Form
     static IEnumerable<Control> Descendants(Control root) { yield return root; foreach (Control c in root.Controls) foreach (var d in Descendants(c)) yield return d; }
 
     static bool IsExt(string path, string ext) { return path.EndsWith(ext, StringComparison.OrdinalIgnoreCase); }
-    static bool Droppable(string[] files) { return files != null && files.Any(f => IsExt(f, ".wav") || IsExt(f, ".mdaw")); }
+    static bool IsMidi(string path) { return IsExt(path, ".mid") || IsExt(path, ".midi"); }
+    static bool Droppable(string[] files) { return files != null && files.Any(f => IsExt(f, ".wav") || IsExt(f, ".mdaw") || IsMidi(f)); }
 
     // Files dropped on the window or handed to MiniDAW.exe: a project opens (the first one, if several); otherwise each WAV
     // becomes a sample channel, all in one undo step. Other files are ignored.
@@ -1980,6 +2198,7 @@ class MainForm : Form
     {
         var project = files.FirstOrDefault(f => IsExt(f, ".mdaw"));
         if (project != null) { if (ConfirmDiscard()) OpenPath(project); return; }
+        foreach (var mid in files.Where(IsMidi)) ImportMidi(mid);
         var failed = new List<string>();
         Edit(() =>
         {
@@ -2046,10 +2265,35 @@ class MainForm : Form
         }
     }
 
-    void OpenProject(Control anchor)   // the Open… button: recent projects first (if any), then Browse…
+    // A MIDI file's notes join this project as new channels and patterns (one undo step); the summary says where they went.
+    void ImportMidi(string path)
+    {
+        string summary = null, error = null; int firstNew = P.Patterns.Count, chans = P.Channels.Count;
+        try
+        {
+            var data = File.ReadAllBytes(path);
+            Edit(() => { summary = Midi.Import(P, data, Path.GetFileNameWithoutExtension(path)); selCh = Math.Min(chans, P.Channels.Count - 1); RefreshAll(firstNew); dirty = true; });
+        }
+        catch (InvalidDataException e) { error = e.Message; }
+        catch (IOException e) { error = e.Message; }
+        catch (UnauthorizedAccessException e) { error = e.Message; }
+        MessageBox.Show(this, error == null ? summary : "Could not import " + Path.GetFileName(path) + ":\n" + error, "MiniDAW");
+    }
+
+    void ExportMidi()   // like Export WAV: the song in Song mode, the current pattern in Pattern mode
+    {
+        using (var d = new SaveFileDialog { Filter = "MIDI file (*.mid)|*.mid", FileName = Path.GetFileNameWithoutExtension(filePath ?? "song") + ".mid" })
+        {
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            try { File.WriteAllBytes(d.FileName, Midi.Export(P, eng.SongMode, eng.CurPattern)); }
+            catch (Exception ex) { MessageBox.Show(this, "Export failed:\n" + ex.Message, "MiniDAW"); return; }
+            MessageBox.Show(this, "Exported " + (eng.SongMode ? "the song" : "the pattern") + " as MIDI to\n" + d.FileName, "MiniDAW");
+        }
+    }
+
+    void OpenProject(Control anchor)   // the Open… button: recent projects first (if any), then Browse… and Import MIDI…
     {
         var recent = Recent.Load().Where(File.Exists).ToList();   // files moved or deleted since are left out
-        if (recent.Count == 0) { BrowseProject(); return; }
         var m = new ContextMenuStrip { ShowItemToolTips = true };
         foreach (var path in recent)
         {
@@ -2057,8 +2301,13 @@ class MainForm : Form
             var item = m.Items.Add(Path.GetFileNameWithoutExtension(pth) + "   —   " + Path.GetFileName(Path.GetDirectoryName(pth)), null, (s, e) => { if (ConfirmDiscard()) OpenPath(pth); });
             item.ToolTipText = pth;
         }
-        m.Items.Add(new ToolStripSeparator());
+        if (recent.Count > 0) m.Items.Add(new ToolStripSeparator());
         m.Items.Add("Browse…", null, (s, e) => BrowseProject());
+        m.Items.Add("Import MIDI file…", null, (s, e) =>
+        {
+            using (var d = new OpenFileDialog { Filter = "MIDI file (*.mid, *.midi)|*.mid;*.midi" })
+                if (d.ShowDialog(this) == DialogResult.OK) ImportMidi(d.FileName);
+        });
         m.Show(anchor, 0, anchor.Height);
     }
 
@@ -3534,6 +3783,22 @@ class MainForm : Form
                 }
                 check(stepDuringCount == -1 && !recDuring && heardAt >= 4 * beat - 1024 && heardAt <= 4 * beat + 1024,
                     "count-in: one bar (" + 4 * beat + " samples) of clicks, then the kick at sample ~" + heardAt + "; keys pressed meanwhile aren't recorded");
+            }
+
+            {   // MIDI: the demo song out and midiBack in
+                var mbytes = Midi.Export(Project.Demo(), true, 0);
+                var midiBack = new Project();
+                string msum = Midi.Import(midiBack, mbytes, "demo");
+                Func<string, List<Note>> notesOf = kind => { int ci2 = midiBack.Channels.FindIndex(c => c.Kind == kind); return ci2 < 0 ? new List<Note>() : midiBack.Patterns.SelectMany(pt => pt.For(ci2)).ToList(); };
+                var kicks = notesOf("kick"); var leads = notesOf("synth");
+                check(string.Join(",", midiBack.Channels.Select(c => c.Kind).OrderBy(k => k)) == "hat,kick,snare,synth" && midiBack.Patterns.Count == 2 && midiBack.Patterns[0].Bars == 4 && midiBack.Patterns[1].Bars == 2
+                    && kicks.Count == 16 && kicks.All(n => n.Step % 4 == 0 && n.Vel == 100) && leads.Count == 16 && leads.All(n => n.Len == 3 && new[] { 57, 60, 64, 67 }.Contains(n.Key))
+                    && midiBack.Playlist[0, 0] == 0 && midiBack.Playlist[0, 4] == 1,
+                    "MIDI: the demo song exported and imported again: 4 channels (drums by GM note, the lead by its program), 16 kicks on the beat, 16 lead notes keeping key and length, 2 patterns placed in order");
+                bool refusedCut = false, refusedJunk = false;
+                try { Midi.Import(new Project(), mbytes.Take(mbytes.Length / 2).ToArray(), "cut"); } catch (InvalidDataException) { refusedCut = true; }
+                try { Midi.Import(new Project(), Encoding.ASCII.GetBytes("RIFF this is a wav, not midi"), "junk"); } catch (InvalidDataException) { refusedJunk = true; }
+                check(refusedCut && refusedJunk, "MIDI: a cut-off file and a non-MIDI file are refused with a message, not a crash");
             }
 
             check(Updates.Newer("v1.2", "1.1") && Updates.Newer("1.10", "1.9") && Updates.Newer("v2.0.1", "2.0") && !Updates.Newer("v1.1.0", "1.1") && !Updates.Newer("v1.0", "1.1")

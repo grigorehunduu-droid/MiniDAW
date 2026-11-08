@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 98 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 100 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -142,6 +142,20 @@ Each insert has:
 - **Song mode:** the whole arrangement, plus the reverb/delay tail.
 - **Pattern mode:** the current pattern, once.
 
+## MIDI files
+
+- **Export:** **Export… → MIDI file (.mid)…** saves the song (Song mode) or the current pattern (Pattern mode) as a standard MIDI file that other music programs open.
+  - Each channel becomes its own track, named after it, with a matching General MIDI instrument.
+  - Drums go on MIDI channel 10 as General MIDI drum notes.
+  - A tempo lane becomes tempo changes.
+  - Notes are written as you placed them, without swing. Muted channels are left out.
+- **Import:** **Open… → Import MIDI file…**, or drop a `.mid` file on the window. The notes are added to the current project:
+  - Every instrument in the file gets a new channel, with the closest built-in sound: drums by General MIDI drum note, everything else by its General MIDI instrument.
+  - The notes go into new patterns of up to 4 bars, placed one after another on the first free playlist track.
+  - A summary says what was added, and one Ctrl+Z takes it all back.
+  - Notes snap to 16ths, and a note that crosses a 4-bar boundary is cut there.
+  - The project keeps its own tempo; the summary tells you the file's.
+
 ## Shortcuts
 
 | Key | Action |
@@ -195,3 +209,4 @@ MiniDAW is open source under the [MIT License](LICENSE): use it, change it, shar
 - No VST plugins. Export is 16-bit WAV only.
 - Audio uses the classic Windows `waveOut` output with about 0.1 s of delay. No ASIO.
 - Recording works only in Pattern mode and only adds notes (overdub).
+- MIDI import snaps notes to 16ths; a song longer than the playlist only gets its first 32 bars placed (the rest of its patterns are still created).
