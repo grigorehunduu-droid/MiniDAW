@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 114 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 118 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -44,6 +44,15 @@ Needs Windows 10 or 11.
 | **Mixer** (F9 swaps it with the piano roll) | Master + 8 inserts | See below. |
 | **Playlist** | 8 tracks × 32 bars | Click an empty cell to place the selected pattern; right-click anywhere on a clip to erase it. **Drag a clip** to move it to another bar or track (hold **Shift** to copy it instead); **click a clip** to open its pattern for editing. A longer pattern makes a wider clip, and dragging across bars places it end to end. Plays in **Song** mode. |
 
+**Graph editor:** click **graph** in the channel rack's header to open a strip under the rack for the selected channel. Click it again to cycle through **velocity → pan → pitch → off**; right-click goes backwards.
+- Drag up and down across the steps to set each note's value. Right-click a step to put it back: velocity 100, centre, no detune.
+- **Pan** is added to the channel's own pan.
+- **Pitch** is fine tuning of up to ±100 cents (one semitone).
+- The piano roll's notes keep these values. Copy, paste and saving keep them too.
+
+**Colours and groups:** right-click a channel name.
+- **Colour** tints its name tag, its lit steps and its notes in the piano roll.
+- **Group** puts it in a group such as "Drums". Once any channel has a group, a **group** switch appears in the rack's header: click it to show only one group's channels, or all of them.
 **Swing:** drag the **Swing** bar at the top right of the channel rack.
 - It delays every off-beat 16th, meaning steps 2, 4, 6… counted from 1, for a shuffled groove. 0% is straight, 100% plays them half a 16th late (a 75/25 shuffle).
 - It applies to the whole project, including exports, and is saved with it.
@@ -85,6 +94,11 @@ Needs Windows 10 or 11.
 | Decay | 25%–400% of the drum's length | Kick, Snare, Hat, Clap |
 | Pitch | ±24 semitones | everything except Hat and Clap, including samples |
 
+**Arpeggiator:** the bottom half of the sound settings window (not for drums). With **Arpeggio** set to up, down, up & down or random, notes held together on that channel play one at a time instead of as a chord. This works both for chords in patterns and for keys held on a MIDI or computer keyboard, even while the song is stopped.
+- **Range:** 1–4 octaves; each extra octave repeats the chord 12 semitones higher.
+- **Time:** 1/32, 1/16, 1/8 or 1/4 notes.
+- **Gate:** how much of each step a note lasts.
+- Recording captures the keys you held, not the arpeggio. MIDI export writes the chord too.
 - Every sound starts at its built-in setting, so 100% means unchanged.
 - Switching a channel to another sound resets its settings.
 - Settings are saved with the project.

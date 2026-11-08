@@ -22,7 +22,13 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyFileVersion(AboutForm.Version)]
 
 // ---------------------------------------------------------------- model
-class Note { public int Step, Key, Len, Vel = 100; }   // Step/Len in 16th notes, Key = MIDI note (60 = C5 in FL naming), Vel 1..127 (100 = the channel's normal level)
+class Note   // Step/Len in 16th notes, Key = MIDI note (60 = C5 in FL naming), Vel 1..127 (100 = the channel's normal level)
+{
+    public int Step, Key, Len, Vel = 100;
+    public float Pan;   // -1..1, added to the channel's pan (the rack's graph editor)
+    public int Fine;    // -100..100 cents of fine pitch
+    public Note Clone() { return (Note)MemberwiseClone(); }
+}
 
 class Channel
 {
@@ -30,6 +36,11 @@ class Channel
     public float Vol = 0.8f, Pan = 0f;
     public bool Mute;
     public int Insert;                        // mixer insert this channel feeds (0 = master)
+    public int Color;                         // ARGB of its colour in the rack and piano roll; 0 = the default orange
+    public string Group;                      // rack filter group, like FL's channel groups; null = none
+    public int ArpDir, ArpRange = 1, ArpTime = 1; public float ArpGate = 0.5f;   // arpeggiator: 0 off, 1 up, 2 down, 3 up & down, 4 random; octaves; ArpTimes index; note length
+    public static readonly double[] ArpTimes = { 0.5, 1, 2, 4 };                  // in 16ths: 1/32, 1/16, 1/8, 1/4
+    public static readonly string[] ArpDirs = { "off", "up", "down", "up & down", "random" }, ArpTimeNames = { "1/32", "1/16", "1/8", "1/4" };
     public float[] Sample, SampleR; public int SampleRate = 44100;   // SampleR: the right side of a stereo sample (null = mono)
     public static readonly string[] Kinds = { "kick", "snare", "hat", "synth", "sample", "square", "pluck", "pad", "bass", "keys", "clap" };
     public static readonly string[] Sounds = { "synth", "square", "pluck", "pad", "bass", "keys", "kick", "snare", "hat", "clap" };   // built-in sounds, in menu order
@@ -97,7 +108,7 @@ class Pattern
             int s = n.Step + offset;
             if (s < 0 || s >= Length) continue;
             list.RemoveAll(x => x.Step == s && x.Key == n.Key);
-            var c = new Note { Step = s, Key = n.Key, Len = Math.Min(n.Len, Length - s), Vel = n.Vel };
+            var c = n.Clone(); c.Step = s; c.Len = Math.Min(n.Len, Length - s);
             list.Add(c); added.Add(c);
         }
         return added;
@@ -606,7 +617,7 @@ class Project
         var w = new List<string> { "MINIDAW\t1", "bpm\t" + Bpm, "swing\t" + Swing.ToString("R") };
         foreach (var c in Channels)
             w.Add(string.Join("\t", "ch", c.Kind, c.Vol.ToString("R"), c.Pan.ToString("R"), c.Mute ? "1" : "0", Clean(c.Name), c.SamplePath ?? "", c.Insert,
-                              string.Join("\t", Enumerable.Range(0, 4).Select(i => c.K(i).ToString("R")))));
+                              string.Join("\t", Enumerable.Range(0, 4).Select(i => c.K(i).ToString("R"))), c.Color, Clean(c.Group ?? ""), c.ArpDir, c.ArpRange, c.ArpTime, c.ArpGate.ToString("R")));
         for (int i = 0; i < Inserts; i++)
         {
             var m = Mixer[i];
@@ -618,7 +629,7 @@ class Project
         {
             w.Add("pat\t" + Clean(pat.Name) + "\t" + pat.Bars);
             for (int ch = 0; ch < pat.Notes.Count; ch++)
-                foreach (var n in pat.Notes[ch]) w.Add(string.Join("\t", "n", ch, n.Step, n.Key, n.Len, n.Vel));
+                foreach (var n in pat.Notes[ch]) w.Add(string.Join("\t", "n", ch, n.Step, n.Key, n.Len, n.Vel, n.Pan.ToString("R"), n.Fine));
         }
         for (int t = 0; t < Tracks; t++) for (int b = 0; b < Bars; b++)
             if (Playlist[t, b] >= 0) w.Add(string.Join("\t", "pl", t, b, Playlist[t, b]));
@@ -669,6 +680,11 @@ class Project
                     Insert = f.Length > 7 ? Int(f[7], 0, Inserts - 1) : 0,
                     Knob = f.Length > 11 ? new[] { Num(f[8], 0, 1), Num(f[9], 0, 1), Num(f[10], 0, 1), Num(f[11], 0, 1) } : null   // older files: built-in settings
                 };
+                if (f.Length > 17)   // older files: no colour, group or arpeggiator
+                {
+                    c.Color = int.Parse(f[12], CultureInfo.InvariantCulture); c.Group = f[13] == "" ? null : f[13];
+                    c.ArpDir = Int(f[14], 0, Channel.ArpDirs.Length - 1); c.ArpRange = Int(f[15], 1, 4); c.ArpTime = Int(f[16], 0, Channel.ArpTimes.Length - 1); c.ArpGate = Num(f[17], 0.05f, 1);
+                }
                 var mem = c.Kind == "sample" && c.SamplePath != null && samplesFrom != null ? samplesFrom.Channels.Find(x => x.SamplePath == c.SamplePath && x.Sample != null) : null;
                 if (mem != null) { c.Sample = mem.Sample; c.SampleR = mem.SampleR; c.SampleRate = mem.SampleRate; }   // arrays are never modified, so sharing is safe
                 else if (c.Kind == "sample" && c.SamplePath != null)
@@ -709,7 +725,8 @@ class Project
                 if (cur == null || f.Length < 5) throw new InvalidDataException("Note outside a pattern on line " + (li + 1));
                 int step = Int(f[2], 0, cur.Length - 1);
                 cur.For(Int(f[1], 0, p.Channels.Count - 1)).Add(new Note { Step = step, Key = Int(f[3], 0, 127), Len = Int(f[4], 1, cur.Length - step),
-                                                                          Vel = f.Length > 5 ? Int(f[5], 1, 127) : 100 });   // older files have no velocity
+                                                                          Vel = f.Length > 5 ? Int(f[5], 1, 127) : 100,   // older files have no velocity,
+                                                                          Pan = f.Length > 7 ? Num(f[6], -1, 1) : 0, Fine = f.Length > 7 ? Int(f[7], -100, 100) : 0 });   // pan or fine pitch
             }
             else if (f[0] == "pl")
             {
@@ -1352,7 +1369,14 @@ class Engine
     public const int SR = 44100;
     const int Frames = 1024, NBuf = 4, MaxVoices = 64;   // ~93 ms of buffered output
 
-    public class Voice { public Channel Ch; public int Key, Age, Len, Wait; public float Gain = 1; public double Phase, Pos, Rate, Z1, Z2; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)
+    public class Voice { public Channel Ch; public int Key, Age, Len, Wait; public float Gain = 1, NotePan; public double Phase, Pos, Rate, Z1, Z2, Detune = 1; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; NotePan/Detune: the note's own pan and fine pitch; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)
+
+    // Arpeggiator: a channel's held notes (from patterns, or keys held on a keyboard) play one at a time on a clock instead of together.
+    class Held { public int Key, Vel, Fine; public float Pan; public long End; public bool Live; }
+    class Arp { public readonly List<Held> Notes = new List<Held>(); public int Index; public double Wait; }
+    readonly Dictionary<Channel, Arp> arps = new Dictionary<Channel, Arp>();
+    long now;   // the sample being rendered, counted from the engine's start
+    Arp ArpOf(Channel c) { Arp a; if (!arps.TryGetValue(c, out a)) arps[c] = a = new Arp(); return a; }
 
     public volatile Project Proj;
     public volatile bool Playing, SongMode;
@@ -1387,6 +1411,9 @@ class Engine
     public void Render(float[] lr, int frames)
     {
         var proj = Proj;
+        now = rendered;
+        if (arps.Count > 0 && arps.Keys.Any(c => !proj.Channels.Contains(c)))   // the project was replaced (open, undo): forget its arpeggiators
+            foreach (var gone in arps.Keys.Where(c => !proj.Channels.Contains(c)).ToList()) arps.Remove(gone);
         Voice pv; while (Preview.TryDequeue(out pv)) AddVoice(pv);
         bool playing = Playing;
         if (playing && !wasPlaying) { step = 0; toNext = 0; countLeft = CountIn ? Project.Steps : 0; }
@@ -1408,10 +1435,13 @@ class Engine
             }
             else if (playing)
             {
+                now = rendered + f;
                 if (toNext <= 0 && step < StepLimit) { Trigger(proj, step++, sps); toNext += sps; }
                 else if (toNext <= 0 && songEnd < 0) songEnd = rendered + f;   // export: the moment the step after the last would have started
                 toNext--;
             }
+            now = rendered + f;
+            if (arps.Count > 0) RunArps(sps);
             if (clickAge >= 0)   // a short sine blip: 1.6 kHz on the bar, 1 kHz on other beats
             {
                 double ct = clickAge++ / (double)SR;
@@ -1426,7 +1456,7 @@ class Engine
                 float s = Voice1(v);
                 if (v.Done) { voices.RemoveAt(i); continue; }
                 if (v.Ch.Mute) continue;
-                float g = v.Ch.Vol * v.Gain, pan = v.Ch.Pan;
+                float g = v.Ch.Vol * v.Gain, pan = Math.Max(-1, Math.Min(1, v.Ch.Pan + v.NotePan));
                 var bus = ib[(uint)v.Ch.Insert < (uint)ib.Length ? v.Ch.Insert : 0];
                 bus[2 * f] += s * g * Math.Min(1, 1 - pan); bus[2 * f + 1] += (v.Stereo ? v.Right : s) * g * Math.Min(1, 1 + pan);   // pan acts as balance on stereo
             }
@@ -1530,8 +1560,10 @@ class Engine
         if (!on && pedal) { sustained[key] = true; return; }   // pedal down: keep sounding
         sustained[key] = false;
         if (held[key] != null) { held[key].Len = held[key].Age; held[key] = null; }   // release: the synth fades out from here
+        foreach (var a in arps.Values) foreach (var h in a.Notes) if (h.Live && h.Key == key && h.End == long.MaxValue) h.End = now;   // ... or leaves the arpeggio
         var ch = MidiTarget;
-        if (on && ch != null) { held[key] = new Voice { Ch = ch, Key = key, Len = int.MaxValue / 2, Gain = vel / 100f, Live = true }; AddVoice(held[key]); }
+        if (on && ch != null && ch.ArpDir != 0) ArpOf(ch).Notes.Add(new Held { Key = key, Vel = vel, End = long.MaxValue, Live = true });
+        else if (on && ch != null) { held[key] = new Voice { Ch = ch, Key = key, Len = int.MaxValue / 2, Gain = vel / 100f, Live = true }; AddVoice(held[key]); }
         if (playing && !SongMode && countLeft == 0)   // tell the UI where in the pattern the player heard this, for recording (not during the count-in)
         {
             double pos = step == 0 ? 0 : step - 1 + Math.Max(0, Math.Min(1, (sps - toNext) / sps));
@@ -1544,6 +1576,30 @@ class Engine
     void AddVoice(Voice v) { if (voices.Count >= MaxVoices) voices.RemoveAt(0); voices.Add(v); }
 
     void Click(bool bar) { clickAge = 0; clickHz = bar ? 1600 : 1000; }
+
+    void RunArps(double sps)   // once per sample: drop notes that ended, and start the next arpeggio note when its time comes
+    {
+        foreach (var kv in arps)
+        {
+            Channel c = kv.Key; var a = kv.Value; var held = a.Notes;
+            for (int i = held.Count - 1; i >= 0; i--) if (held[i].End <= now) held.RemoveAt(i);
+            if (held.Count == 0 || c.ArpDir == 0) { a.Index = 0; a.Wait = 0; continue; }   // the next chord starts its arpeggio at once
+            if (a.Wait <= 0)
+            {
+                var order = held.OrderBy(x => x.Key).ToList(); int n = order.Count * Math.Max(1, c.ArpRange), k;   // the chord's notes, repeated an octave higher per extra octave of range
+                if (c.ArpDir == 1) k = a.Index % n;
+                else if (c.ArpDir == 2) k = n - 1 - a.Index % n;
+                else if (c.ArpDir == 3) { int period = Math.Max(1, 2 * n - 2); k = a.Index % period; if (k >= n) k = period - k; }
+                else k = (int)((Noise() * 0.5 + 0.5) * n) % n;
+                a.Index++;
+                var h = order[k % order.Count]; double len = Channel.ArpTimes[Math.Max(0, Math.Min(Channel.ArpTimes.Length - 1, c.ArpTime))] * sps;
+                if (!c.Mute) AddVoice(new Voice { Ch = c, Key = Math.Min(127, h.Key + 12 * (k / order.Count)), Len = Math.Max(1, (int)(len * c.ArpGate)), Gain = h.Vel / 100f,
+                                                  NotePan = h.Pan, Detune = Math.Pow(2, h.Fine / 1200.0), Live = h.Live });
+                a.Wait += len;
+            }
+            a.Wait--;
+        }
+    }
 
     void Trigger(Project proj, int st, double sps)
     {
@@ -1573,7 +1629,8 @@ class Engine
                     var c = proj.Channels[ch];
                     if (c.Mute) continue;
                     foreach (var n in hit.Key.Notes[ch])
-                        if (n.Step == s) AddVoice(new Voice { Ch = c, Key = n.Key, Len = (int)(n.Len * sps), Gain = n.Vel / 100f,
+                        if (n.Step == s && c.ArpDir != 0) ArpOf(c).Notes.Add(new Held { Key = n.Key, Vel = n.Vel, Pan = n.Pan, Fine = n.Fine, End = now + (long)(n.Len * sps) });   // the arpeggiator plays it
+                        else if (n.Step == s) AddVoice(new Voice { Ch = c, Key = n.Key, Len = (int)(n.Len * sps), Gain = n.Vel / 100f, NotePan = n.Pan, Detune = Math.Pow(2, n.Fine / 1200.0),
                                                               Wait = s % 2 == 1 ? (int)Math.Round(proj.Swing * 0.5 * sps) : 0 });   // swing delays off-beat 16ths
                 }
         }
@@ -1601,14 +1658,14 @@ class Engine
         {
             case "kick":
             {
-                if (v.Rate == 0) v.Rate = Math.Pow(2, c.Semitones() / 12.0);   // pitch knob as a frequency factor
+                if (v.Rate == 0) v.Rate = Math.Pow(2, c.Semitones() / 12.0) * v.Detune;   // pitch knob as a frequency factor
                 v.Phase += 2 * Math.PI * (45 + 110 * Math.Exp(-t * 28)) * v.Rate / SR;   // pitch sweep 155 -> 45 Hz
                 if (t > 0.5 * b) v.Done = true;
                 return (float)(Math.Sin(v.Phase) * Math.Exp(-t * 8 / b));
             }
             case "snare":
             {
-                if (v.Rate == 0) v.Rate = Math.Pow(2, c.Semitones() / 12.0);
+                if (v.Rate == 0) v.Rate = Math.Pow(2, c.Semitones() / 12.0) * v.Detune;
                 double n = Noise(), hp = n - v.Z1; v.Z1 = n;   // first difference = crude high-pass
                 if (t > 0.3 * b) v.Done = true;
                 return (float)(hp * 0.35 * Math.Exp(-t * 18 / b) + Math.Sin(2 * Math.PI * 190 * v.Rate * t) * 0.5 * Math.Exp(-t * 30 / b));
@@ -1627,35 +1684,35 @@ class Engine
             }
             case "synth":   // saw through a one-pole low-pass
             {
-                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) * v.Detune / SR;
                 v.Phase = Wrap(v.Phase + v.Rate * br);
                 v.Z1 += Math.Min(1, 0.15 * b) * ((2 * v.Phase - 1) - v.Z1);
                 return (float)(v.Z1 * 0.35 * Env(v, c.AttackSamples(), c.ReleaseSamples()));
             }
             case "square":   // hollow square lead
             {
-                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) * v.Detune / SR;
                 v.Phase = Wrap(v.Phase + v.Rate * br);
                 v.Z1 += Math.Min(1, 0.25 * b) * ((v.Phase < 0.5 ? 1 : -1) - v.Z1);
                 return (float)(v.Z1 * 0.25 * Env(v, c.AttackSamples(), c.ReleaseSamples()));
             }
             case "pad":   // three saws detuned ±0.7%, slow to swell and to fade
             {
-                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) * v.Detune / SR;
                 v.Phase = Wrap(v.Phase + v.Rate * br); v.Pos = Wrap(v.Pos + v.Rate * br * 1.007); v.Z2 = Wrap(v.Z2 + v.Rate * br * 0.993);
                 v.Z1 += Math.Min(1, 0.06 * b) * ((v.Phase + v.Pos + v.Z2) * 2 / 3 - 1 - v.Z1);
                 return (float)(v.Z1 * 0.45 * Env(v, c.AttackSamples(), c.ReleaseSamples()));
             }
             case "bass":   // filtered square plus a sine an octave below
             {
-                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) * v.Detune / SR;
                 v.Phase = Wrap(v.Phase + v.Rate * br); v.Pos = Wrap(v.Pos + v.Rate * br / 2);
                 v.Z1 += Math.Min(1, 0.12 * b) * ((v.Phase < 0.5 ? 1 : -1) - v.Z1);
                 return (float)((v.Z1 * 0.2 + Math.Sin(2 * Math.PI * v.Pos) * 0.3) * Env(v, c.AttackSamples(), c.ReleaseSamples()));
             }
             case "keys":   // two-operator FM: a sine bent by itself, the bend fading fast, like an electric piano
             {
-                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) * v.Detune / SR;
                 v.Phase = Wrap(v.Phase + v.Rate * br);
                 double bend = 2.2 * b * Math.Exp(-t * 4);
                 return (float)(Math.Sin(2 * Math.PI * v.Phase + bend * Math.Sin(2 * Math.PI * v.Phase)) * 0.3 * Math.Exp(-t * 1.5) * Env(v, c.AttackSamples(), c.ReleaseSamples()));
@@ -1664,7 +1721,7 @@ class Engine
             {
                 if (v.Buf == null)
                 {
-                    v.Buf = new float[Math.Max(2, (int)Math.Round(SR / Hz(v.Key + c.Semitones())))];
+                    v.Buf = new float[Math.Max(2, (int)Math.Round(SR / (Hz(v.Key + c.Semitones()) * v.Detune)))];
                     for (int i = 0; i < v.Buf.Length; i++) v.Buf[i] = (float)Noise();
                 }
                 int p = (int)v.Pos, q = (p + 1) % v.Buf.Length;
@@ -1679,7 +1736,7 @@ class Engine
                 var smp = c.Sample;
                 int i = (int)v.Pos;
                 if (smp == null || i + 1 >= smp.Length) { v.Done = true; return 0; }
-                if (v.Rate == 0) v.Rate = c.SampleRate / (double)SR * Math.Pow(2, (v.Key - 60 + c.Semitones()) / 12.0);   // key 60 = original pitch
+                if (v.Rate == 0) v.Rate = c.SampleRate / (double)SR * Math.Pow(2, (v.Key - 60 + c.Semitones()) / 12.0) * v.Detune;   // key 60 = original pitch
                 float s = (float)(smp[i] + (smp[i + 1] - smp[i]) * (v.Pos - i));
                 var right = c.SampleR;   // stereo: the right side goes out through v.Right
                 v.Stereo = right != null && i + 1 < right.Length;
@@ -2234,7 +2291,7 @@ class MainForm : Form
         // every click or drag is one undo step: the snapshot is taken before the panel's own MouseDown and closed after its own MouseUp
         foreach (var c in new[] { rack, roll, playlist, mixer }) c.MouseDown += (s, e) => BeginEdit();
         rack.Paint += PaintRack; rack.MouseDown += RackDown; rack.MouseMove += RackMove; rack.MouseUp += (s, e) => dragMode = null;
-        rack.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left && e.X >= 20 && e.X < 134 && e.Y >= Top0 && (e.Y - Top0) / Row < P.Channels.Count) ShowSoundSettings(); };
+        rack.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left && e.X >= 20 && e.X < 134 && RackRow(e.Y) >= 0) ShowSoundSettings(); };
         roll.Paint += PaintRoll; roll.MouseDown += RollDown; roll.MouseMove += RollMove;
         roll.MouseUp += (s, e) => { dragNote = null; dragMode = null; if (boxFrom.HasValue) FinishBox(); if (moving != null) FinishMove(); };
         playlist.Paint += PaintPlaylist; playlist.MouseDown += PlaylistDown; playlist.MouseMove += PlaylistMouse; playlist.MouseUp += (s, e) => FinishClipDrag();
@@ -2541,29 +2598,35 @@ class MainForm : Form
 
     class SoundWindow : Form
     {
-        const int BarsTop = 30, RowH = 30, BarX = 12, BarW = 296;
+        const int BarsTop = 30, RowH = 30, BarX = 12, BarW = 296, ArpTop = BarsTop + 4 * RowH + 26;
         readonly MainForm m;
         public readonly Canvas view = new Canvas();
-        int drag = -1;
+        int drag = -1, arpDrag = -1;   // the sound setting or arpeggiator row being dragged
 
         public SoundWindow(MainForm main)
         {
             m = main;
             FormBorderStyle = FormBorderStyle.FixedToolWindow; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(BarX * 2 + BarW, BarsTop + 4 * RowH + 6); Font = main.Font;
+            ClientSize = new Size(BarX * 2 + BarW, ArpTop + 4 * RowH + 4); Font = main.Font;
             view.Dock = DockStyle.Fill; Controls.Add(view);
             view.Paint += PaintView;
             view.MouseDown += (s, e) =>
             {
                 var c = Ch(); if (c == null || e.Y < BarsTop) return;
+                if (e.Y >= ArpTop)   // arpeggiator rows (not for drums)
+                {
+                    int ar = (e.Y - ArpTop) / RowH;
+                    if (c.IsDrum || ar > 3 || e.Button != MouseButtons.Left) return;
+                    m.BeginEdit(); arpDrag = ar; SetArp(e); return;
+                }
                 var shown = c.KnobsShown(); int r = (e.Y - BarsTop) / RowH;
                 if (r >= shown.Length) return;
                 if (e.Button == MouseButtons.Right) { int k = shown[r]; m.Edit(() => m.AutomateKnob(m.P.Channels.IndexOf(c), k)); return; }   // a lane for it, over the playlist
                 if (e.Button != MouseButtons.Left) return;
                 m.BeginEdit(); drag = shown[r]; Set(e);   // one drag = one undo step
             };
-            view.MouseMove += (s, e) => { if (drag >= 0 && e.Button == MouseButtons.Left) Set(e); };
-            view.MouseUp += (s, e) => { if (drag >= 0) { drag = -1; m.EndEdit(); } };
+            view.MouseMove += (s, e) => { if (drag >= 0 && e.Button == MouseButtons.Left) Set(e); if (arpDrag >= 0 && e.Button == MouseButtons.Left) SetArp(e); };
+            view.MouseUp += (s, e) => { if (drag >= 0 || arpDrag >= 0) { drag = arpDrag = -1; m.EndEdit(); } };
             HandleCreated += (s, e) => DarkTitle(Handle);
             KeyPreview = true;   // keep the computer-keyboard piano playing while this window has focus
             KeyDown += (s, e) => m.PianoKey(e, true);
@@ -2582,6 +2645,17 @@ class MainForm : Form
             m.dirty = true; view.Invalidate();
         }
 
+        void SetArp(MouseEventArgs e)   // the arpeggiator's rows are bars with steps: direction, range, time, gate
+        {
+            var c = Ch(); if (c == null) return;
+            float v = Clamp01((e.X - BarX) / (float)BarW);
+            if (arpDrag == 0) c.ArpDir = (int)Math.Round(v * (Channel.ArpDirs.Length - 1));
+            else if (arpDrag == 1) c.ArpRange = 1 + (int)Math.Round(v * 3);
+            else if (arpDrag == 2) c.ArpTime = (int)Math.Round(v * (Channel.ArpTimes.Length - 1));
+            else c.ArpGate = Math.Max(0.05f, v);
+            m.dirty = true; view.Invalidate();
+        }
+
         void PaintView(object sender, PaintEventArgs e)
         {
             var g = e.Graphics; var c = Ch();
@@ -2595,6 +2669,17 @@ class MainForm : Form
                 ValueBar(g, BarX, y, BarW, RowH - 8, 0, c.K(shown[r]), DeepBlue);
                 g.DrawString(c.KnobLabel(shown[r]), Font, TxtB, new RectangleF(BarX + 8, y, BarW - 12, RowH - 8), Fit);
             }
+            g.DrawString("ARPEGGIATOR  ·  plays held notes one at a time", Small, DimB, BarX, ArpTop - 19);
+            if (c.IsDrum) { g.DrawString("Not for drums.", Font, DimB, BarX, ArpTop + 4); return; }
+            float[] vals = { c.ArpDir / (float)(Channel.ArpDirs.Length - 1), (c.ArpRange - 1) / 3f, c.ArpTime / (float)(Channel.ArpTimes.Length - 1), c.ArpGate };
+            string[] labels = { "Arpeggio  " + Channel.ArpDirs[c.ArpDir], "Range  " + c.ArpRange + (c.ArpRange == 1 ? " octave" : " octaves"),
+                                "Time  " + Channel.ArpTimeNames[c.ArpTime] + " notes", "Gate  " + (int)Math.Round(c.ArpGate * 100) + "% of each note" };
+            for (int r = 0; r < 4; r++)
+            {
+                float y = ArpTop + r * RowH; bool live = c.ArpDir != 0 || r == 0;   // the other rows matter only once it's on
+                ValueBar(g, BarX, y, BarW, RowH - 8, 0, vals[r], live ? Color.FromArgb(150, 104, 224) : Raised);
+                g.DrawString(labels[r], Font, live ? TxtB : DimB, new RectangleF(BarX + 8, y, BarW - 12, RowH - 8), Fit);
+            }
         }
     }
 
@@ -2606,7 +2691,8 @@ class MainForm : Form
         bpm.Value = Math.Max(bpm.Minimum, Math.Min(bpm.Maximum, P.Bpm));
         selCh = Math.Max(0, Math.Min(selCh, P.Channels.Count - 1));
         if (selLane >= P.Automation.Count) selLane = -1;   // New/Open may bring fewer lanes
-        rack.Height = Top0 + Math.Max(1, P.Channels.Count) * Row + 6;
+        if (groupFilter != null && !P.Channels.Any(c => c.Group == groupFilter)) groupFilter = null;   // that group is gone (deleted, undone, another project)
+        RackHeight();
         Changed(false);
     }
 
@@ -2826,21 +2912,40 @@ class MainForm : Form
     }
 
     // ---- channel rack: [mute] [name] [vol] [pan] [16 steps]
+    // Rack extras: a graph editor for the selected channel's per-step velocity / pan / pitch (under the rows), and a group
+    // filter that shows only one group's channels, like FL's channel groups.
+    int graphMode; string groupFilter;
+    const int GraphH = 74, GraphBoxW = 128, GroupBoxW = 140;
+    static readonly string[] GraphNames = { "off", "velocity", "pan", "pitch" };
+    static readonly Color[] Swatches = { Color.FromArgb(232, 84, 96), Color.FromArgb(242, 170, 60), Color.FromArgb(226, 212, 86), Color.FromArgb(140, 212, 92), Color.FromArgb(72, 192, 124),
+        Color.FromArgb(62, 182, 194), Color.FromArgb(84, 142, 232), Color.FromArgb(152, 112, 232), Color.FromArgb(222, 104, 182), Color.FromArgb(152, 158, 168) };
+
+    List<int> RackRows() { var l = new List<int>(); for (int i = 0; i < P.Channels.Count; i++) if (groupFilter == null || P.Channels[i].Group == groupFilter) l.Add(i); return l; }
+    int RackRow(int y) { var sh = RackRows(); int r = (y - Top0) / Row; return y >= Top0 && r < sh.Count ? sh[r] : -1; }   // the channel on the rack row at height y, or -1
+    float GraphTop() { return Top0 + Math.Max(1, RackRows().Count) * Row + 4; }
+    void RackHeight() { rack.Height = Top0 + Math.Max(1, RackRows().Count) * Row + 6 + (graphMode > 0 ? GraphH : 0); }
+    static Color ChColor(Channel c) { return c.Color != 0 ? Color.FromArgb(c.Color) : On; }
+    List<string> Groups() { return P.Channels.Where(c => c.Group != null).Select(c => c.Group).Distinct().OrderBy(x => x).ToList(); }
+    float GraphBoxX() { return rack.Width - SwingW - 18 - GraphBoxW; }
+    float GroupBoxX() { return GraphBoxX() - 8 - GroupBoxW; }
+
     void PaintRack(object sender, PaintEventArgs e)
     {
         var g = e.Graphics;
         Header(g, rack, "CHANNEL RACK");
-        g.DrawString("dot = mute · name: click = piano roll, double-click = sound settings, right-click = menu · vol / pan: drag, right-click = automate · box = mixer insert (click +1, right-click −1) · click steps", Small, DimB, 120, 5);
+        g.DrawString("dot: mute · name: click = edit, double-click = settings, right-click = menu · bars: volume / pan · box: mixer insert · click steps", Small, DimB, 120, 5);
         float swx = rack.Width - SwingW - 10;   // swing bar, top right, like FL's swing knob on the channel rack
         ValueBar(g, swx, 4, SwingW, 15, 0, P.Swing, DeepBlue);
         g.DrawString("Swing  " + (int)Math.Round(P.Swing * 100) + "%", Small, TxtB, swx + 6, 5);
-        var pat = CurPat; int ps = eng.PlayStep;
-        for (int i = 0; i < P.Channels.Count; i++)
+        RouteBox(g, GraphBoxX(), 4, GraphBoxW, "graph: " + GraphNames[graphMode], graphMode > 0);
+        if (groupFilter != null || Groups().Count > 0) RouteBox(g, GroupBoxX(), 4, GroupBoxW, "group: " + (groupFilter ?? "all"), groupFilter != null);
+        var pat = CurPat; int ps = eng.PlayStep; var shown = RackRows();
+        for (int r = 0; r < shown.Count; r++)
         {
-            var c = P.Channels[i]; int y = Top0 + i * Row;
+            int i = shown[r]; var c = P.Channels[i]; int y = Top0 + r * Row;
             Led(g, 6, y + 8, 10, !c.Mute);
             Round(g, i == selCh ? Sel : Raised, 22, y + 2, 110, Row - 4, 4);
-            if (i == selCh) Round(g, On, 22, y + 2, 3, Row - 4, 1.5f);   // the channel the piano roll shows
+            if (i == selCh || c.Color != 0) Round(g, ChColor(c), 22, y + 2, 3, Row - 4, 1.5f);   // its colour; the default shows only on the channel the piano roll edits
             g.DrawString(c.Name, Font, TxtB, new RectangleF(30, y + 2, 100, Row - 4), Fit);
             ValueBar(g, 136, y + 10, 60, 6, 0, c.Vol, On);
             float pan = 0.5f + c.Pan / 2;
@@ -2853,13 +2958,49 @@ class MainForm : Form
             for (int s = 0; s < pat.Length; s++)
             {
                 bool on = notes.Any(n => n.Step == s), now = ps >= 0 && ps % pat.Length == s;
-                var col = on ? (now ? Color.FromArgb(255, 205, 150) : On) : now ? Color.FromArgb(84, 94, 112) : s / 4 % 2 == 0 ? Cell2 : Cell1;
+                var col = on ? (now ? ControlPaint.Light(ChColor(c), 0.6f) : ChColor(c)) : now ? Color.FromArgb(84, 94, 112) : s / 4 % 2 == 0 ? Cell2 : Cell1;
                 float gap = s % Project.Steps == Project.Steps - 1 && s < pat.Length - 1 ? sw * 0.4f : Math.Max(2, sw * 0.15f);   // wider gap between bars
                 float px = RackX + s * sw, pw = sw - gap;
                 Round(g, col, px, y + 2, pw, Row - 4, 3);
                 if (on) Round(g, Color.FromArgb(70, 255, 255, 255), px + 2, y + 3, pw - 4, 5, 2);   // a little shine on lit pads
             }
         }
+        if (graphMode > 0 && selCh < P.Channels.Count) PaintGraph(g);
+    }
+
+    void PaintGraph(Graphics g)
+    {
+        var c = P.Channels[selCh]; float gy = GraphTop(), gh = GraphH - 16, top = gy + 4;
+        Round(g, Color.FromArgb(23, 26, 32), 4, gy, rack.Width - 8, GraphH - 6, 5);
+        g.DrawString(GraphNames[graphMode].ToUpper() + " — " + c.Name, Bold, TxtB, new RectangleF(12, gy + 6, 262, 16), Fit);
+        g.DrawString(graphMode == 1 ? "drag across the steps · right-click: back to 100" : graphMode == 2 ? "up = right, down = left · right-click: centre" : "up to ±100 cents (a semitone) · right-click: none",
+            Small, DimB, new RectangleF(12, gy + 26, 262, 32));
+        var notes = CurPat.For(selCh); float sw = StepW(); var col = ChColor(c);
+        for (int s = 0; s < CurPat.Length; s++)
+        {
+            float gap = s % Project.Steps == Project.Steps - 1 && s < CurPat.Length - 1 ? sw * 0.4f : Math.Max(2, sw * 0.15f), x = RackX + s * sw, pw = sw - gap;
+            Round(g, Well, x, top, pw, gh, 2);
+            var n = notes.FirstOrDefault(nn => nn.Step == s);
+            if (n == null) continue;   // only steps with a note have a value
+            if (graphMode == 1) { float v = n.Vel / 127f; Round(g, col, x, top + gh * (1 - v), pw, gh * v, 2); continue; }
+            float u = graphMode == 2 ? n.Pan : n.Fine / 100f, mid = top + gh / 2;
+            Round(g, col, x, u >= 0 ? mid - gh / 2 * u : mid, pw, Math.Max(2, Math.Abs(u) * gh / 2), 1);
+            using (var pen = new Pen(Dim)) g.DrawLine(pen, x, mid, x + pw, mid);   // the centre: no change
+        }
+    }
+
+    void GraphSet(MouseEventArgs e)   // drag in the graph: set the value of the selected channel's note on the step under the mouse
+    {
+        int s = (int)Math.Floor((e.X - RackX) / StepW());
+        if (s < 0 || s >= CurPat.Length || selCh >= P.Channels.Count) return;
+        float v = Clamp01(1 - (e.Y - GraphTop() - 4) / (GraphH - 16)); bool reset = e.Button == MouseButtons.Right;
+        foreach (var n in CurPat.For(selCh).Where(nn => nn.Step == s))
+        {
+            if (graphMode == 1) n.Vel = reset ? 100 : Math.Max(1, (int)Math.Round(v * 127));
+            else if (graphMode == 2) n.Pan = reset || Math.Abs(v - 0.5f) < 0.03f ? 0 : v * 2 - 1;   // a small dead zone snaps to the centre
+            else n.Fine = reset || Math.Abs(v - 0.5f) < 0.03f ? 0 : (int)Math.Round((v * 2 - 1) * 100);
+        }
+        dirty = true; Changed();
     }
 
     float StepW() { return Math.Min(Cell, (rack.Width - RackX - 6) / (float)CurPat.Length); }   // 1-bar patterns keep full-size steps; longer ones shrink to fit
@@ -2867,6 +3008,7 @@ class MainForm : Form
     void RackMove(object sender, MouseEventArgs e)
     {
         if (dragMode == "swing" && e.Button == MouseButtons.Left) { P.Swing = Clamp01((e.X - (rack.Width - SwingW - 10)) / (float)SwingW); Changed(); return; }
+        if (dragMode == "graph" && e.Button != MouseButtons.None) { GraphSet(e); return; }
         if (dragMode == null || e.Button != MouseButtons.Left || dragCh >= P.Channels.Count) return;
         var c = P.Channels[dragCh];
         if (dragMode == "vol") c.Vol = Math.Max(0, Math.Min(1, (e.X - 136) / 60f));
@@ -2876,13 +3018,26 @@ class MainForm : Form
 
     void RackDown(object sender, MouseEventArgs e)
     {
-        if (e.Y < Top0)   // header: only the swing bar is clickable
+        int dir = e.Button == MouseButtons.Right ? -1 : 1;
+        if (e.Y < Top0)   // header: swing bar, graph switch, group filter
         {
             if (e.Button == MouseButtons.Left && e.X >= rack.Width - SwingW - 10) { dragMode = "swing"; RackMove(sender, e); }
+            else if (e.X >= GraphBoxX() && e.X < GraphBoxX() + GraphBoxW) { graphMode = (graphMode + dir + GraphNames.Length) % GraphNames.Length; RackHeight(); rack.Invalidate(); }
+            else if (e.X >= GroupBoxX() && e.X < GroupBoxX() + GroupBoxW && (groupFilter != null || Groups().Count > 0))
+            {
+                var options = new List<string> { null }; options.AddRange(Groups());
+                groupFilter = options[(Math.Max(0, options.IndexOf(groupFilter)) + dir + options.Count) % options.Count];
+                RackHeight(); rack.Invalidate();
+            }
             return;
         }
-        int i = (e.Y - Top0) / Row;
-        if (i >= P.Channels.Count) return;
+        if (graphMode > 0 && e.Y >= GraphTop())   // the graph editor
+        {
+            if (e.X >= RackX) { dragMode = "graph"; GraphSet(e); }
+            return;
+        }
+        int i = RackRow(e.Y);
+        if (i < 0) return;
         var c = P.Channels[i];
         if (e.X >= 246 && e.X < RackX)   // insert box: left click +1, right click -1
         {
@@ -2921,6 +3076,13 @@ class MainForm : Form
         return m;
     }
 
+    static Bitmap Swatch(Color c)   // a colour chip for the Colour menu
+    {
+        var b = new Bitmap(16, 16);
+        using (var g = Graphics.FromImage(b)) Round(g, c, 1, 1, 14, 14, 3);
+        return b;
+    }
+
     string FreeName(string title)   // "Pluck", then "Pluck 2", "Pluck 3"...
     {
         string n = title;
@@ -2951,6 +3113,18 @@ class MainForm : Form
         }
         m.Items.Add(sound);
         m.Items.Add("Sound settings…", null, (s, e) => { int i = P.Channels.IndexOf(c); if (i >= 0) { selCh = i; Changed(false); ShowSoundSettings(); } });
+        var colour = new ToolStripMenuItem("Colour");
+        Action<int> paint = argb => { if (P.Channels.Contains(c)) Edit(() => { c.Color = argb; dirty = true; Changed(); }); };
+        ((ToolStripMenuItem)colour.DropDownItems.Add("Default (orange)", Swatch(On), (s, e) => paint(0))).Checked = c.Color == 0;
+        foreach (var sw in Swatches) { int argb = sw.ToArgb(); ((ToolStripMenuItem)colour.DropDownItems.Add("", Swatch(sw), (s, e) => paint(argb))).Checked = c.Color == argb; }
+        m.Items.Add(colour);
+        var group = new ToolStripMenuItem("Group");
+        Action<string> join = name => { if (P.Channels.Contains(c)) Edit(() => { c.Group = name; dirty = true; RefreshAll(patBox.SelectedIndex); }); };
+        ((ToolStripMenuItem)group.DropDownItems.Add("None", null, (s, e) => join(null))).Checked = c.Group == null;
+        foreach (var gname in Groups()) { string gn = gname; ((ToolStripMenuItem)group.DropDownItems.Add(gn, null, (s, e) => join(gn))).Checked = c.Group == gn; }
+        group.DropDownItems.Add(new ToolStripSeparator());
+        group.DropDownItems.Add("New group…", null, (s, e) => { string n = Prompt("New group", c.IsDrum ? "Drums" : "Synths"); if (n != null) join(n); });
+        m.Items.Add(group);
         m.Items.Add("Rename…", null, (s, e) =>
         {
             string n = Prompt("Rename channel", c.Name);
@@ -3046,7 +3220,7 @@ class MainForm : Form
         var keepAa = g.SmoothingMode;
         foreach (var n in CurPat.For(selCh))
         {
-            var col = Color.FromArgb(70 + 185 * n.Vel / 127, On);   // softer notes are drawn fainter
+            var col = Color.FromArgb(70 + 185 * n.Vel / 127, ChColor(P.Channels[selCh]));   // softer notes are drawn fainter
             float bh = n.Vel / 127f * (VelH - 8), vx = KeyW + n.Step * cw + Math.Min(6, cw / 2);   // velocity: a stem with a knob on top
             g.SmoothingMode = SmoothingMode.AntiAlias;
             using (var pen = new Pen(col, 2)) g.DrawLine(pen, vx, roll.Height - 4, vx, roll.Height - 4 - bh);
@@ -3082,7 +3256,7 @@ class MainForm : Form
         var src = Selected();
         if (src.Count == 0) src = CurPat.For(selCh).ToList();
         if (src.Count == 0) return;
-        clip = src.Select(n => new Note { Step = n.Step, Key = n.Key, Len = n.Len, Vel = n.Vel }).ToList();
+        clip = src.Select(n => n.Clone()).ToList();
         if (cut) Edit(() => { lock (P) CurPat.For(selCh).RemoveAll(src.Contains); sel.Clear(); Changed(); });
     }
 
@@ -4290,6 +4464,41 @@ class MainForm : Form
                 try { Midi.Import(new Project(), mbytes.Take(mbytes.Length / 2).ToArray(), "cut"); } catch (InvalidDataException) { refusedCut = true; }
                 try { Midi.Import(new Project(), Encoding.ASCII.GetBytes("RIFF this is a wav, not midi"), "junk"); } catch (InvalidDataException) { refusedJunk = true; }
                 check(refusedCut && refusedJunk, "MIDI: a cut-off file and a non-MIDI file are refused with a message, not a crash");
+            }
+
+            {   // channel rack extras: per-note pan and fine pitch, the arpeggiator, and the new fields saved
+                Func<Project> lead = () => { var pj = new Project(); pj.Channels.Add(new Channel { Kind = "synth", Name = "Lead", Insert = 1, Knob = new[] { 0f, 0.2f, 0f, 0.5f } }); pj.Patterns.Add(new Pattern { Name = "P" }); return pj; };
+                Func<Project, int, float[]> play = (pj, frames) => { var en = new Engine { Proj = pj, Playing = true }; var o = new float[frames * 2]; var bk = new float[2048];
+                    for (int at = 0; at < frames; at += 1024) { en.Render(bk, 1024); Array.Copy(bk, 0, o, at * 2, Math.Min(2048, (frames - at) * 2)); } return o; };
+                var panned = lead(); panned.Patterns[0].For(0).Add(new Note { Step = 0, Key = 60, Len = 4, Pan = 1 });
+                var po = play(panned, 8000); double lsum = 0, rsum = 0; for (int k = 0; k < 8000; k++) { lsum += Math.Abs(po[2 * k]); rsum += Math.Abs(po[2 * k + 1]); }
+                var up = lead(); up.Patterns[0].For(0).Add(new Note { Step = 0, Key = 69, Len = 4, Fine = 100 });
+                var semi = lead(); semi.Patterns[0].For(0).Add(new Note { Step = 0, Key = 70, Len = 4 });
+                var uo = play(up, 8000); var so = play(semi, 8000); double fineErr = uo.Zip(so, (u, w) => Math.Abs(u - w)).Max();
+                check(lsum < 1e-3 * rsum && rsum > 1 && fineErr < 1e-3, "a note panned hard right is heard only on the right; +100 cents of fine pitch is exactly one semitone up (difference " + fineErr.ToString("0.0000") + ")");
+
+                Func<float[], int, int, double> hz = (o, a0, n) => { int cross = 0, first = -1, last = -1; for (int k = a0 + 1; k < a0 + n; k++) if (o[2 * (k - 1)] < 0 && o[2 * k] >= 0) { cross++; if (first < 0) first = k; last = k; } return cross < 2 ? 0 : (cross - 1) * (double)Engine.SR / (last - first); };
+                var arp = lead(); arp.Channels[0].ArpDir = 1; arp.Channels[0].ArpRange = 2; arp.Channels[0].ArpGate = 0.6f;
+                foreach (int key in new[] { 60, 64, 67 }) arp.Patterns[0].For(0).Add(new Note { Step = 0, Key = key, Len = 16 });
+                int st16 = (int)(60.0 / arp.Bpm / 4 * Engine.SR); var ao = play(arp, st16 * 7);
+                var arpHeard = Enumerable.Range(0, 6).Select(k => hz(ao, k * st16 + 600, st16 / 2)).ToList();
+                double[] want = { 60, 64, 67, 72, 76, 79 }; bool arpOk = true;
+                for (int k = 0; k < 6; k++) arpOk &= Math.Abs(arpHeard[k] / (440 * Math.Pow(2, (want[k] - 69) / 12)) - 1) < 0.04;
+                check(arpOk, "arpeggiator (up, 2 octaves, 1/16): a held C-E-G chord plays C E G C' E' G' one 16th apart (" + string.Join(", ", arpHeard.Select(fq => fq.ToString("0"))) + " Hz)");
+                var live = lead(); live.Channels[0].ArpDir = 3; var liveEng = new Engine { Proj = live, MidiTarget = live.Channels[0] }; var liveBuf = new float[2048];
+                liveEng.MidiIn.Enqueue(0x90 | 60 << 8 | 100 << 16); liveEng.MidiIn.Enqueue(0x90 | 67 << 8 | 100 << 16);
+                double during = 0, after = 0;
+                for (int k = 0; k < 20; k++) { liveEng.Render(liveBuf, 1024); during = Math.Max(during, liveBuf.Max(v => Math.Abs(v))); }
+                liveEng.MidiIn.Enqueue(0x80 | 60 << 8); liveEng.MidiIn.Enqueue(0x80 | 67 << 8);
+                for (int k = 0; k < 40; k++) { liveEng.Render(liveBuf, 1024); if (k >= 30) after = Math.Max(after, liveBuf.Max(v => Math.Abs(v))); }
+                check(during > 0.05 && after < 1e-4, "arpeggiator on keys held live: it plays while they're held (even when stopped) and goes quiet once they're let go");
+
+                var keep = Project.Demo(); var kc = keep.Channels[3]; kc.Color = Swatches[2].ToArgb(); kc.Group = "Synths"; kc.ArpDir = 4; kc.ArpRange = 3; kc.ArpTime = 2; kc.ArpGate = 0.3f;
+                keep.Patterns[1].For(3)[0].Pan = -0.5f; keep.Patterns[1].For(3)[0].Fine = -37;
+                var kb = Project.Parse(keep.Lines().ToArray(), null); var kc2 = kb.Channels[3]; var kn = kb.Patterns[1].For(3)[0];
+                check(kc2.Color == kc.Color && kc2.Group == "Synths" && kc2.ArpDir == 4 && kc2.ArpRange == 3 && kc2.ArpTime == 2 && Math.Abs(kc2.ArpGate - 0.3f) < 1e-6 && kn.Pan == -0.5f && kn.Fine == -37
+                      && kb.Channels[0].Group == null && kb.Channels[0].ArpDir == 0,
+                      "saved and opened again: channel colour, group and arpeggiator, and each note's pan and fine pitch");
             }
 
             {   // limiter: nothing past the ceiling, quiet sound untouched (just 5 ms late); chorus, flanger, phaser change the sound, not its level
