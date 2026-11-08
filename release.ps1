@@ -4,7 +4,7 @@
 # Before running: bump AboutForm.Version in MiniDAW.cs and commit everything. Needs the GitHub CLI, signed in (gh auth login).
 #   powershell -ExecutionPolicy Bypass -File release.ps1 -Notes "What changed"
 param([string]$Notes = "")
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Continue'   # gh and git print progress on stderr, which 'Stop' turns into failures in Windows PowerShell; each step checks its exit code instead
 Set-Location $PSScriptRoot
 $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 $src = Get-Content MiniDAW.cs -Raw
