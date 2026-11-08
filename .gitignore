@@ -1,0 +1,6 @@
+# built by release.ps1; the installer is attached to each GitHub release instead
+*.exe
+*.new
+# local files that aren't part of the project
+demo_song.wav
+minidaw.html

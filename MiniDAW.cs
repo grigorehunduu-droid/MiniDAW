@@ -1,0 +1,3476 @@
+﻿// MiniDAW - a small standalone pattern-based DAW modelled on FL Studio's workflow:
+// channel rack -> patterns (notes per channel) -> playlist (patterns placed on bars).
+// Build: C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
+//        (banana.ico comes from MiniDAW.exe --logo banana.ico; to make the very first build, leave /win32icon out)
+// Test:  MiniDAW.exe --selftest result.txt   (exit code 0 = pass)
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Windows.Forms;
+
+[assembly: System.Reflection.AssemblyTitle("MiniDAW")]
+[assembly: System.Reflection.AssemblyProduct("MiniDAW")]
+[assembly: System.Reflection.AssemblyVersion(AboutForm.Version)]       // the installer reads it; Explorer shows the file version
+[assembly: System.Reflection.AssemblyFileVersion(AboutForm.Version)]
+
+// ---------------------------------------------------------------- model
+class Note { public int Step, Key, Len, Vel = 100; }   // Step/Len in 16th notes, Key = MIDI note (60 = C5 in FL naming), Vel 1..127 (100 = the channel's normal level)
+
+class Channel
+{
+    public string Name, Kind, SamplePath;     // Kind: kick | snare | hat | synth | sample
+    public float Vol = 0.8f, Pan = 0f;
+    public bool Mute;
+    public int Insert;                        // mixer insert this channel feeds (0 = master)
+    public float[] Sample, SampleR; public int SampleRate = 44100;   // SampleR: the right side of a stereo sample (null = mono)
+    public static readonly string[] Kinds = { "kick", "snare", "hat", "synth", "sample", "square", "pluck", "pad", "bass", "keys", "clap" };
+    public static readonly string[] Sounds = { "synth", "square", "pluck", "pad", "bass", "keys", "kick", "snare", "hat", "clap" };   // built-in sounds, in menu order
+    static readonly string[] Titles = { "Saw lead", "Square lead", "Pluck", "Pad", "Bass", "Electric piano", "Kick", "Snare", "Hat", "Clap" };
+    public static string Title(string kind) { int i = Array.IndexOf(Sounds, kind); return i < 0 ? "Sample" : Titles[i]; }
+
+    // Sound settings, all 0..1: attack, release, tone (decay for drums), pitch. null = the sound's built-in settings.
+    public float[] Knob;
+    public const int KAttack = 0, KRelease = 1, KTone = 2, KPitch = 3, LaneVol = 4, LanePan = 5;   // LaneVol/LanePan: automation targets only
+    static readonly Dictionary<string, float[]> builtIn = Kinds.ToDictionary(k => k, k => BuiltIn(k));   // made once; the audio thread only reads it
+
+    public static float[] BuiltIn(string kind)   // knob positions that reproduce each sound's original shape
+    {
+        double a = 220.0 / Engine.SR, r = 3500.0 / Engine.SR;   // saw and square leads
+        if (kind == "pad") { a = 0.3; r = 0.6; }
+        else if (kind == "bass") { a = 60.0 / Engine.SR; r = 1500.0 / Engine.SR; }
+        else if (kind == "keys") { a = 30.0 / Engine.SR; r = 2500.0 / Engine.SR; }
+        else if (kind == "pluck") { a = 1.0 / Engine.SR; r = 2500.0 / Engine.SR; }
+        return new[] { (float)Math.Pow(a / 2, 1 / 3.0), (float)Math.Pow((r - 0.005) / 3, 1 / 3.0), 0.5f, 0.5f };
+    }
+
+    public float K(int i) { return (Knob ?? builtIn[Kind])[i]; }
+    public Channel Copy() { var c = (Channel)MemberwiseClone(); if (Knob != null) c.Knob = (float[])Knob.Clone(); return c; }   // sample data stays shared
+    public int AttackSamples() { double k = K(KAttack); return Math.Max(1, (int)Math.Round(2 * k * k * k * Engine.SR)); }                 // 0 .. 2 s
+    public int ReleaseSamples() { double k = K(KRelease); return Math.Max(1, (int)Math.Round((0.005 + 3 * k * k * k) * Engine.SR)); }   // 5 ms .. 3 s
+    public double Bright() { double k = K(KTone); return k < 0.5 ? 0.25 + 1.5 * k : 1 + 6 * (k - 0.5); }   // tone or decay: 0.25x .. 4x, 1x in the middle
+    public int Semitones() { return (int)Math.Round((K(KPitch) - 0.5) * 48); }                              // -24 .. +24
+    public bool IsDrum { get { return Kind == "kick" || Kind == "snare" || Kind == "hat" || Kind == "clap"; } }
+
+    public int[] KnobsShown()   // the settings that mean something for this sound
+    {
+        if (Kind == "sample") return new[] { KPitch };
+        if (Kind == "hat" || Kind == "clap") return new[] { KTone };
+        if (IsDrum) return new[] { KTone, KPitch };
+        return new[] { KAttack, KRelease, KTone, KPitch };
+    }
+
+    public string KnobLabel(int i)
+    {
+        if (i == KAttack) return "Attack  " + Secs(AttackSamples());
+        if (i == KRelease) return "Release  " + Secs(ReleaseSamples());
+        if (i == KTone) return (IsDrum ? "Decay  " : "Tone  ") + (int)Math.Round(Bright() * 100) + "%";
+        int st = Semitones();
+        return "Pitch  " + (st > 0 ? "+" : "") + st + " semitones";
+    }
+
+    static string Secs(int samples) { double s = samples / (double)Engine.SR; return s < 1 ? (int)Math.Round(s * 1000) + " ms" : s.ToString("0.00", CultureInfo.InvariantCulture) + " s"; }
+}
+
+class Pattern
+{
+    public const int MaxBars = 4;
+    public string Name;
+    public int Length = Project.Steps;                         // in 16ths: 1 to MaxBars bars
+    public int Bars { get { return Length / Project.Steps; } }
+    public List<List<Note>> Notes = new List<List<Note>>();   // indexed by channel
+    public List<Note> For(int ch) { while (Notes.Count <= ch) Notes.Add(new List<Note>()); return Notes[ch]; }
+
+    // Copies of notes land at step + offset on channel ch: ones past the end are dropped, ones on an existing note (same step and key) replace it.
+    public List<Note> Paste(int ch, IEnumerable<Note> notes, int offset)
+    {
+        var list = For(ch); var added = new List<Note>();
+        foreach (var n in notes.ToList())   // snapshot: the source may be this very list
+        {
+            int s = n.Step + offset;
+            if (s < 0 || s >= Length) continue;
+            list.RemoveAll(x => x.Step == s && x.Key == n.Key);
+            var c = new Note { Step = s, Key = n.Key, Len = Math.Min(n.Len, Length - s), Vel = n.Vel };
+            list.Add(c); added.Add(c);
+        }
+        return added;
+    }
+
+    // How far a group of notes may move (dx steps, dy keys) and all still fit in a pattern this long; from = each note's start step/key
+    public static Point ClampMove(Dictionary<Note, Point> from, int length, int ds, int dk)
+    {
+        foreach (var kv in from)   // each clamp keeps the earlier ones satisfied, since every note's range contains 0
+        {
+            ds = Math.Max(-kv.Value.X, Math.Min(length - kv.Key.Len - kv.Value.X, ds));
+            dk = Math.Max(-kv.Value.Y, Math.Min(127 - kv.Value.Y, dk));
+        }
+        return new Point(ds, dk);
+    }
+
+    public static int DupOffset(IEnumerable<Note> notes)   // Ctrl+B: the notes' span rounded up to whole beats, so the copy follows right after
+    {
+        int a = notes.Min(n => n.Step), b = notes.Max(n => n.Step + n.Len);
+        return (b - a + 3) / 4 * 4;
+    }
+
+    public void SetBars(int bars)   // shortening drops notes past the new end and trims ones that run over it
+    {
+        Length = bars * Project.Steps;
+        foreach (var list in Notes)
+        {
+            list.RemoveAll(n => n.Step >= Length);
+            foreach (var n in list) n.Len = Math.Min(n.Len, Length - n.Step);
+        }
+    }
+}
+
+class Insert   // one mixer track: effects run in slot order, then fader and pan; output goes to master (+ an optional send)
+{
+    public const int SlotCount = 8;   // like FL's insert slots (FL has 10)
+    public float Vol = 1f, Pan = 0f, SendLevel = 0.5f;
+    public bool Mute;
+    public int SendTo, Sidechain;   // 0 = none. Send: post-fader copy into a later insert. Sidechain: an earlier insert's output drives this insert's Compressor
+    public Effect[] Slots = new Effect[SlotCount];
+}
+
+class Lane   // automation clip: one value (0..1) per 16th across the whole playlist, driving one control while the song plays
+{
+    public int Ins, Slot = -1, Param;   // Slot -1 = the strip itself (Param 0 volume, 1 pan, 2 send level); else an effect slot and its parameter (or FxMix)
+    public const int FxMix = 3;         // an effect lane's Param for the effect's wet/dry mix
+    public int Ch = -1;                 // >= 0: a channel's sound setting instead (Param = Channel.KAttack .. KPitch) or its rack volume / pan (LaneVol, LanePan); Ins and Slot unused
+    public bool Tempo;                  // true: the song tempo (0..1 = MinBpm..MaxBpm); every other field unused
+    public readonly float[] Values = new float[Project.Bars * Project.Steps];
+
+    public float Get(Project p)
+    {
+        if (Tempo) return (p.Bpm - Project.MinBpm) / (float)(Project.MaxBpm - Project.MinBpm);
+        if (Ch >= 0)
+        {
+            if (Ch >= p.Channels.Count) return 0.5f;
+            var ch = p.Channels[Ch];
+            return Param == Channel.LaneVol ? ch.Vol : Param == Channel.LanePan ? (ch.Pan + 1) / 2 : ch.K(Param);
+        }
+        var ins = p.Mixer[Ins];
+        if (Slot < 0) return Param == 0 ? ins.Vol : Param == 1 ? (ins.Pan + 1) / 2 : ins.SendLevel;
+        var fx = ins.Slots[Slot];
+        return fx == null ? 0.5f : Param == FxMix ? fx.Mix : fx.P[Param];
+    }
+
+    public void Set(Project p, float v)
+    {
+        if (Tempo) { p.Bpm = (int)Math.Round(Project.MinBpm + v * (Project.MaxBpm - Project.MinBpm)); return; }   // takes effect from the next audio block
+        if (Ch >= 0)
+        {
+            if (Ch >= p.Channels.Count) return;
+            var c = p.Channels[Ch];
+            if (Param == Channel.LaneVol) { c.Vol = v; return; }
+            if (Param == Channel.LanePan) { c.Pan = v * 2 - 1; return; }
+            var k = c.Knob ?? (float[])Channel.BuiltIn(c.Kind).Clone();   // fill the array before publishing it, so no one sees a half-made one
+            k[Param] = v; c.Knob = k;
+            return;
+        }
+        var ins = p.Mixer[Ins];
+        if (Slot < 0) { if (Param == 0) ins.Vol = v; else if (Param == 1) ins.Pan = v * 2 - 1; else ins.SendLevel = v; }
+        else { var fx = ins.Slots[Slot]; if (fx != null) { if (Param == FxMix) fx.Mix = v; else fx.P[Param] = v; } }   // follows whatever effect is in the slot now
+    }
+
+    public string Name(Project p)
+    {
+        if (Tempo) return "Tempo (BPM)";
+        if (Ch >= 0)
+        {
+            if (Ch >= p.Channels.Count) return "missing channel";
+            var c = p.Channels[Ch];
+            return c.Name + " · " + new[] { "Attack", "Release", c.IsDrum ? "Decay" : "Tone", "Pitch", "Volume", "Pan" }[Param];
+        }
+        string where = Ins == 0 ? "Master" : "Insert " + Ins;
+        if (Slot < 0) return where + " · " + new[] { "Volume", "Pan", "Send" }[Param];
+        var fx = p.Mixer[Ins].Slots[Slot];
+        return where + " · " + (fx == null ? "empty slot " + (Slot + 1) : fx.Type + " " + (Param == FxMix ? "Wet/dry" : fx.ParamName(Param)));
+    }
+}
+
+class Effect
+{
+    public static readonly string[] Types = { "Delay", "Reverb", "Filter", "Distortion", "EQ", "Compressor" };
+    static readonly string[][] Names = { new[] { "Time", "Feedback", "Mix" }, new[] { "Size", "Damp", "Mix" }, new[] { "Cutoff", "Reso", "Mode" }, new[] { "Drive", "Tone", "Mix" },
+        new[] { "Low", "Mid", "High" }, new[] { "Threshold", "Ratio", "Gain" } };
+    static readonly float[][] Defaults = { new[] { 0.35f, 0.4f, 0.35f }, new[] { 0.6f, 0.4f, 0.3f }, new[] { 0.6f, 0.2f, 0f }, new[] { 0.4f, 0.6f, 1f },
+        new[] { 0.5f, 0.5f, 0.5f }, new[] { 0.25f, 3f / 19, 0.25f } };   // EQ flat; compressor -12 dB, 4:1, +6 dB
+    static readonly int[] CombLen = { 1116, 1188, 1277, 1356 }, ApLen = { 556, 441 };   // Freeverb tunings at 44.1 kHz
+
+    public readonly string Type;
+    public readonly float[] P;   // 3 parameters, all 0..1; the UI writes them while audio reads (float writes are atomic)
+    public bool Bypass;          // switched off: skipped in the chain, settings kept (the on/off dot on its mixer slot)
+    public float Mix = 1;        // wet/dry: 1 = fully processed, 0 = untouched (the small bar on its mixer slot, like FL's slot mix knob)
+
+    // Process with the wet/dry mix applied; dry is scratch space, grown when needed.
+    public void Run(float[] b, int n2, float[] key, ref float[] dry)
+    {
+        float m = Mix;   // read once: the UI may move it mid-block
+        if (m >= 1) { Process(b, n2, key); return; }
+        if (dry == null || dry.Length < n2) dry = new float[n2];
+        Array.Copy(b, dry, n2);
+        Process(b, n2, key);
+        for (int k = 0; k < n2; k++) b[k] = dry[k] + (b[k] - dry[k]) * m;
+    }
+    readonly int t;
+    // DSP state, created on first use
+    float[] dl; int wp;
+    float[][] comb, ap; readonly float[] store = new float[8]; readonly int[] ci = new int[8], ai = new int[4];
+    readonly double[] s1 = new double[2], s2 = new double[2];
+
+    public Effect(string type)
+    {
+        t = Array.IndexOf(Types, type);
+        if (t < 0) throw new InvalidDataException("Unknown effect: " + type);
+        Type = type; P = (float[])Defaults[t].Clone();
+    }
+
+    public string ParamName(int i) { return Names[t][i]; }
+
+    public string Label(int i)
+    {
+        string v;
+        if (t == 0 && i == 0) v = (int)(DelaySec() * 1000) + " ms";
+        else if (t == 2 && i == 0) v = (int)CutoffHz() + " Hz";
+        else if (t == 2 && i == 2) v = new[] { "Low-pass", "Band-pass", "High-pass" }[Mode()];
+        else if (t == 4) v = EqDb(i).ToString("+0.0;-0.0;0.0", CultureInfo.InvariantCulture) + " dB";
+        else if (t == 5 && i == 0) v = ThreshDb().ToString("0", CultureInfo.InvariantCulture) + " dB";
+        else if (t == 5 && i == 1) v = Ratio().ToString("0.0", CultureInfo.InvariantCulture) + ":1";
+        else if (t == 5) v = "+" + MakeupDb().ToString("0.0", CultureInfo.InvariantCulture) + " dB";
+        else v = (int)Math.Round(P[i] * 100) + "%";
+        return Names[t][i] + "  " + v;
+    }
+
+    double DelaySec() { return 0.02 + P[0] * 0.98; }
+    double CutoffHz() { return 40 * Math.Pow(450, P[0]); }   // 40 Hz .. 18 kHz, exponential like a real knob
+    int Mode() { return Math.Min(2, (int)(P[2] * 3)); }
+    double EqDb(int i) { return (P[i] - 0.5) * 24; }          // ±12 dB, middle = flat
+    double ThreshDb() { return -48 * P[0]; }                  // 0 .. -48 dB: drag right to compress more
+    double Ratio() { return 1 + P[1] * 19; }                  // 1:1 .. 20:1
+    double MakeupDb() { return P[2] * 24; }                   // 0 .. +24 dB (the faders can't boost, this can)
+
+    public void Process(float[] b, int n2, float[] key = null)   // b = interleaved stereo, n2 = float count; key = sidechain input (Compressor only)
+    {
+        switch (t)
+        {
+            case 0: Delay(b, n2); break;
+            case 1: Reverb(b, n2); break;
+            case 2: Filter(b, n2); break;
+            case 3: Distort(b, n2); break;
+            case 4: Eq(b, n2); break;
+            default: Compress(b, n2, key ?? b); break;
+        }
+    }
+
+    void Eq(float[] b, int n2)   // 3-band split by one-pole low-passes at 200 Hz and 5 kHz; the bands sum back to the input exactly when flat
+    {
+        double a1 = 1 - Math.Exp(-2 * Math.PI * 200 / Engine.SR), a2 = 1 - Math.Exp(-2 * Math.PI * 5000 / Engine.SR);
+        double gl = Math.Pow(10, EqDb(0) / 20), gm = Math.Pow(10, EqDb(1) / 20), gh = Math.Pow(10, EqDb(2) / 20);
+        for (int i = 0; i < n2; i++)
+        {
+            int s = i & 1;
+            s1[s] += a1 * (b[i] - s1[s]); s2[s] += a2 * (b[i] - s2[s]);
+            b[i] = (float)(s1[s] * gl + (s2[s] - s1[s]) * gm + (b[i] - s2[s]) * gh);
+        }
+    }
+
+    void Compress(float[] b, int n2, float[] key)   // feed-forward, stereo-linked peak detector on key (b itself unless sidechained); 5 ms attack, 120 ms release
+    {
+        double thr = ThreshDb(), slope = 1 - 1 / Ratio(), makeup = MakeupDb();
+        double att = Math.Exp(-1 / (0.005 * Engine.SR)), rel = Math.Exp(-1 / (0.12 * Engine.SR));
+        for (int k = 0; k < n2; k += 2)
+        {
+            double peak = Math.Max(Math.Abs(key[k]), Math.Abs(key[k + 1]));
+            double want = Math.Max(0, 20 * Math.Log10(Math.Max(peak, 1e-6)) - thr) * slope;   // dB of gain reduction this sample asks for
+            s1[0] = want + (want > s1[0] ? att : rel) * (s1[0] - want);
+            float g = (float)Math.Pow(10, (makeup - s1[0]) / 20);
+            b[k] *= g; b[k + 1] *= g;
+        }
+    }
+
+    void Delay(float[] b, int n2)
+    {
+        int len = Engine.SR + 1;   // 1 s maximum delay
+        if (dl == null) dl = new float[len * 2];
+        int d = (int)(DelaySec() * Engine.SR);
+        float fb = P[1] * 0.9f, mix = P[2];
+        for (int k = 0; k < n2; k += 2)
+        {
+            int rp = (wp - d + len) % len;
+            float yl = dl[2 * rp], yr = dl[2 * rp + 1];
+            dl[2 * wp] = b[k] + yr * fb;   // cross feedback = ping-pong
+            dl[2 * wp + 1] = b[k + 1] + yl * fb;
+            b[k] += yl * mix; b[k + 1] += yr * mix;
+            wp = (wp + 1) % len;
+        }
+    }
+
+    void Reverb(float[] b, int n2)   // Freeverb-style: 4 damped combs + 2 allpasses per side
+    {
+        if (comb == null)
+        {
+            comb = new float[8][]; ap = new float[4][];
+            for (int s = 0; s < 2; s++)
+            {
+                for (int j = 0; j < 4; j++) comb[s * 4 + j] = new float[CombLen[j] + 23 * s];   // +23 samples on the right = stereo width
+                for (int j = 0; j < 2; j++) ap[s * 2 + j] = new float[ApLen[j] + 23 * s];
+            }
+        }
+        float fb = 0.7f + P[0] * 0.28f, damp = P[1] * 0.4f, mix = P[2];
+        for (int k = 0; k < n2; k += 2)
+        {
+            float input = (b[k] + b[k + 1]) * 0.015f;
+            for (int s = 0; s < 2; s++)
+            {
+                float o = 0;
+                for (int j = s * 4; j < s * 4 + 4; j++)
+                {
+                    var c = comb[j]; float y = c[ci[j]];
+                    store[j] = y * (1 - damp) + store[j] * damp;
+                    c[ci[j]] = input + store[j] * fb;
+                    if (++ci[j] == c.Length) ci[j] = 0;
+                    o += y;
+                }
+                for (int j = s * 2; j < s * 2 + 2; j++)
+                {
+                    var a = ap[j]; float bo = a[ai[j]];
+                    a[ai[j]] = o + bo * 0.5f;
+                    o = bo - o;
+                    if (++ai[j] == a.Length) ai[j] = 0;
+                }
+                b[k + s] = b[k + s] * (1 - mix * 0.5f) + o * mix * 3;
+            }
+        }
+    }
+
+    void Filter(float[] b, int n2)   // trapezoidal state-variable filter: stable at any cutoff
+    {
+        double g = Math.Tan(Math.PI * Math.Min(CutoffHz(), 0.45 * Engine.SR) / Engine.SR), k = 1 / (0.5 + P[1] * 9.5);
+        double a1 = 1 / (1 + g * (g + k)), a2 = g * a1, a3 = g * a2;
+        int mode = Mode();
+        for (int i = 0; i < n2; i++)
+        {
+            int s = i & 1;
+            double v0 = b[i], v3 = v0 - s2[s], v1 = a1 * s1[s] + a2 * v3, v2 = s2[s] + a2 * s1[s] + a3 * v3;
+            s1[s] = 2 * v1 - s1[s]; s2[s] = 2 * v2 - s2[s];
+            b[i] = (float)(mode == 0 ? v2 : mode == 1 ? v1 : v0 - k * v1 - v2);
+        }
+    }
+
+    void Distort(float[] b, int n2)   // tanh waveshaper into a one-pole tone filter
+    {
+        double gain = 1 + P[0] * 49, a = 1 - Math.Exp(-2 * Math.PI * 500 * Math.Pow(24, P[1]) / Engine.SR);
+        float mix = P[2];
+        for (int i = 0; i < n2; i++)
+        {
+            int s = i & 1;
+            s1[s] += a * (Math.Tanh(b[i] * gain) * 0.5 - s1[s]);
+            b[i] = (float)(b[i] * (1 - mix) + s1[s] * mix);
+        }
+    }
+}
+
+class Project
+{
+    public const int Steps = 16, Tracks = 8, Bars = 32, Inserts = 9;   // Steps = 16ths per bar; insert 0 = master
+    public const int MinBpm = 40, MaxBpm = 300;
+    public int Bpm = 128;
+    public float Swing;   // 0 = straight; 1 = every off-beat 16th is played half a 16th late (a 75/25 shuffle), like FL's swing knob
+    public Insert[] Mixer = new Insert[Inserts];
+    public List<Channel> Channels = new List<Channel>();
+    public List<Pattern> Patterns = new List<Pattern>();
+    public int[,] Playlist = new int[Tracks, Bars];   // pattern index or -1
+    public List<Lane> Automation = new List<Lane>();
+    public List<string> Warnings = new List<string>();
+
+    public Project()
+    {
+        for (int t = 0; t < Tracks; t++) for (int b = 0; b < Bars; b++) Playlist[t, b] = -1;
+        for (int i = 0; i < Inserts; i++) Mixer[i] = new Insert { Vol = i == 0 ? 0.8f : 1f };
+    }
+
+    public static Project Demo()
+    {
+        var p = new Project();
+        foreach (var k in new[] { "kick", "snare", "hat", "synth" })
+            p.Channels.Add(new Channel { Kind = k, Name = char.ToUpper(k[0]) + k.Substring(1) });
+        var a = new Pattern { Name = "Pattern 1" };
+        var b = new Pattern { Name = "Pattern 2" };
+        p.Patterns.Add(a); p.Patterns.Add(b);
+        for (int s = 0; s < 16; s += 4) a.For(0).Add(new Note { Step = s, Key = 60, Len = 1 });
+        a.For(1).Add(new Note { Step = 4, Key = 60, Len = 1 });
+        a.For(1).Add(new Note { Step = 12, Key = 60, Len = 1 });
+        for (int s = 2; s < 16; s += 4) { a.For(2).Add(new Note { Step = s, Key = 60, Len = 1 }); b.For(2).Add(new Note { Step = s, Key = 60, Len = 1 }); }
+        int[] keys = { 57, 60, 64, 67 };
+        for (int i = 0; i < 4; i++) b.For(3).Add(new Note { Step = i * 4, Key = keys[i], Len = 3 });
+        for (int bar = 0; bar < 4; bar++) p.Playlist[0, bar] = 0;
+        for (int bar = 2; bar < 6; bar++) p.Playlist[1, bar] = 1;
+        for (int i = 0; i < 4; i++) p.Channels[i].Insert = i + 1;   // like FL templates: one insert per channel
+        p.Mixer[2].Slots[0] = new Effect("Reverb");
+        p.Mixer[4].Slots[0] = new Effect("Delay");
+        return p;
+    }
+
+    // Copy for offline export: each effect gets fresh DSP state so the live audio thread's delay/reverb buffers aren't touched.
+    // Channels are copied too (their sound settings can be automated); their samples, the patterns and the playlist are shared,
+    // which is safe because export runs on the UI thread, their only writer.
+    public Project ExportCopy()
+    {
+        var p = new Project { Bpm = Bpm, Swing = Swing, Channels = Channels.Select(c => c.Copy()).ToList(), Patterns = Patterns, Playlist = Playlist,
+                              Automation = Automation };   // lanes target by index, so they drive the copy
+        for (int i = 0; i < Inserts; i++)
+        {
+            Insert m = Mixer[i], c = p.Mixer[i];
+            c.Vol = m.Vol; c.Pan = m.Pan; c.Mute = m.Mute; c.SendTo = m.SendTo; c.SendLevel = m.SendLevel; c.Sidechain = m.Sidechain;
+            for (int s = 0; s < Insert.SlotCount; s++)
+                if (m.Slots[s] != null) { c.Slots[s] = new Effect(m.Slots[s].Type); Array.Copy(m.Slots[s].P, c.Slots[s].P, c.Slots[s].P.Length); c.Slots[s].Bypass = m.Slots[s].Bypass; c.Slots[s].Mix = m.Slots[s].Mix; }
+        }
+        return p;
+    }
+
+    // shortcut: sends and sidechains only run from a lower to a higher insert, so index order is a valid processing order
+    // and loops are impossible; switch Engine.Render to a topological sort if any-to-any routing is needed
+    public static bool RouteOk(int from, int to) { return from >= 1 && to > from && to < Inserts; }
+
+    public void RemoveChannel(int i)   // patterns and sound-setting lanes refer to channels by index, so later ones shift down with them
+    {
+        Channels.RemoveAt(i);
+        foreach (var pat in Patterns) if (i < pat.Notes.Count) pat.Notes.RemoveAt(i);
+        Automation.RemoveAll(l => l.Ch == i);
+        foreach (var l in Automation) if (l.Ch > i) l.Ch--;
+    }
+
+    // Move an insert's effect from one slot to another; the ones in between shift by one. Automation lanes on that insert's
+    // effects follow them. Returns each old slot's new index.
+    public int[] MoveEffect(int ins, int from, int to)
+    {
+        var where = Enumerable.Range(0, Insert.SlotCount)
+            .Select(k => k == from ? to : from < to && k > from && k <= to ? k - 1 : from > to && k >= to && k < from ? k + 1 : k).ToArray();
+        var moved = new Effect[Insert.SlotCount];
+        for (int k = 0; k < Insert.SlotCount; k++) moved[where[k]] = Mixer[ins].Slots[k];
+        Mixer[ins].Slots = moved;   // one reference swap: the audio thread sees the old chain or the new one, never half of each
+        foreach (var l in Automation) if (!l.Tempo && l.Ch < 0 && l.Ins == ins && l.Slot >= 0) l.Slot = where[l.Slot];
+        return where;
+    }
+
+    public void RemovePattern(int k)   // the playlist stores pattern indices: clear this one's cells, shift later ones down
+    {
+        Patterns.RemoveAt(k);
+        for (int t = 0; t < Tracks; t++)
+            for (int b = 0; b < Bars; b++)
+            {
+                int v = Playlist[t, b];
+                if (v == k) Playlist[t, b] = -1; else if (v > k) Playlist[t, b] = v - 1;
+            }
+    }
+
+    public int SongBars()
+    {
+        int last = 0;
+        for (int t = 0; t < Tracks; t++)
+            for (int b = 0; b < Bars; b++)
+            {
+                int p = Playlist[t, b];
+                if (p >= 0) last = Math.Max(last, b + (p < Patterns.Count ? Patterns[p].Bars : 1));
+            }
+        return Math.Max(1, Math.Min(Bars, last));   // a long pattern near the end is cut at the last bar (automation lanes stop there too)
+    }
+
+    public void MoveClip(int t0, int b0, int t1, int b1, bool copy)   // the clip starting at track t0, bar b0 goes to t1, b1; copy keeps the original
+    {
+        int p = Playlist[t0, b0];
+        if (p < 0 || (t0 == t1 && b0 == b1)) return;
+        if (!copy) Playlist[t0, b0] = -1;
+        Playlist[t1, b1] = p;   // replaces a clip that started there, like placing a pattern does
+    }
+
+    public int ClipAt(int t, int b)   // start bar of the pattern clip on track t that covers bar b, or -1
+    {
+        for (int k = 0; k < Pattern.MaxBars && k <= b; k++)
+        {
+            int p = Playlist[t, b - k];
+            if (p >= 0 && p < Patterns.Count && Patterns[p].Bars > k) return b - k;
+        }
+        return -1;
+    }
+
+    public void Save(string path) { File.WriteAllLines(path, Lines()); }
+
+    public List<string> Lines()   // the whole project as text: the file format, and the undo snapshots
+    {
+        var w = new List<string> { "MINIDAW\t1", "bpm\t" + Bpm, "swing\t" + Swing.ToString("R") };
+        foreach (var c in Channels)
+            w.Add(string.Join("\t", "ch", c.Kind, c.Vol.ToString("R"), c.Pan.ToString("R"), c.Mute ? "1" : "0", Clean(c.Name), c.SamplePath ?? "", c.Insert,
+                              string.Join("\t", Enumerable.Range(0, 4).Select(i => c.K(i).ToString("R")))));
+        for (int i = 0; i < Inserts; i++)
+        {
+            var m = Mixer[i];
+            w.Add(string.Join("\t", "ins", i, m.Vol.ToString("R"), m.Pan.ToString("R"), m.Mute ? "1" : "0", m.SendTo, m.SendLevel.ToString("R"), m.Sidechain));
+            for (int s = 0; s < Insert.SlotCount; s++)
+                if (m.Slots[s] != null) w.Add(string.Join("\t", "fx", i, s, m.Slots[s].Type, string.Join("\t", m.Slots[s].P.Select(v => v.ToString("R"))), m.Slots[s].Bypass ? "1" : "0", m.Slots[s].Mix.ToString("R")));
+        }
+        foreach (var pat in Patterns)
+        {
+            w.Add("pat\t" + Clean(pat.Name) + "\t" + pat.Bars);
+            for (int ch = 0; ch < pat.Notes.Count; ch++)
+                foreach (var n in pat.Notes[ch]) w.Add(string.Join("\t", "n", ch, n.Step, n.Key, n.Len, n.Vel));
+        }
+        for (int t = 0; t < Tracks; t++) for (int b = 0; b < Bars; b++)
+            if (Playlist[t, b] >= 0) w.Add(string.Join("\t", "pl", t, b, Playlist[t, b]));
+        foreach (var l in Automation)   // "autotempo"; "autoch" = a channel's sound setting; "auto" = a mixer control (the older line kept as it was)
+            w.Add(l.Tempo ? "autotempo\t" + string.Join("\t", l.Values.Select(v => v.ToString("R")))
+                : l.Ch >= 0 ? string.Join("\t", "autoch", l.Ch, l.Param, string.Join("\t", l.Values.Select(v => v.ToString("R"))))
+                            : string.Join("\t", "auto", l.Ins, l.Slot, l.Param, string.Join("\t", l.Values.Select(v => v.ToString("R")))));
+        return w;
+    }
+
+    static string Clean(string s) { return s.Replace('\t', ' ').Replace('\n', ' ').Replace('\r', ' '); }
+
+    static int Int(string s, int lo, int hi)
+    {
+        int v = int.Parse(s, CultureInfo.InvariantCulture);
+        if (v < lo || v > hi) throw new InvalidDataException("Value " + v + " out of range " + lo + ".." + hi);
+        return v;
+    }
+
+    static float Num(string s, float lo, float hi)
+    {
+        float v = float.Parse(s, CultureInfo.InvariantCulture);
+        if (float.IsNaN(v)) throw new InvalidDataException("NaN in project file.");   // a NaN would silence the whole mix
+        return Math.Max(lo, Math.Min(hi, v));
+    }
+
+    public static Project Load(string path) { return Parse(File.ReadAllLines(path), null); }
+
+    // samplesFrom: reuse audio already in memory for the same file (undo/redo) instead of reading it from disk again
+    public static Project Parse(string[] lines, Project samplesFrom)
+    {
+        if (lines.Length == 0 || !lines[0].StartsWith("MINIDAW\t")) throw new InvalidDataException("Not a MiniDAW project.");
+        var p = new Project();
+        Pattern cur = null;
+        for (int li = 1; li < lines.Length; li++)
+        {
+            var f = lines[li].Split('\t');
+            if (f[0] == "bpm") p.Bpm = Int(f[1], 40, 300);
+            else if (f[0] == "swing") p.Swing = Num(f[1], 0, 1);   // older files have none: straight
+            else if (f[0] == "ch")
+            {
+                if (f.Length < 6 || Array.IndexOf(Channel.Kinds, f[1]) < 0) throw new InvalidDataException("Bad channel on line " + (li + 1));
+                var c = new Channel
+                {
+                    Kind = f[1], Name = f[5], Mute = f[4] == "1",
+                    Vol = Num(f[2], 0, 1), Pan = Num(f[3], -1, 1),
+                    SamplePath = f.Length > 6 && f[6] != "" ? f[6] : null,
+                    Insert = f.Length > 7 ? Int(f[7], 0, Inserts - 1) : 0,
+                    Knob = f.Length > 11 ? new[] { Num(f[8], 0, 1), Num(f[9], 0, 1), Num(f[10], 0, 1), Num(f[11], 0, 1) } : null   // older files: built-in settings
+                };
+                var mem = c.Kind == "sample" && c.SamplePath != null && samplesFrom != null ? samplesFrom.Channels.Find(x => x.SamplePath == c.SamplePath && x.Sample != null) : null;
+                if (mem != null) { c.Sample = mem.Sample; c.SampleR = mem.SampleR; c.SampleRate = mem.SampleRate; }   // arrays are never modified, so sharing is safe
+                else if (c.Kind == "sample" && c.SamplePath != null)
+                {
+                    try { Wav.Load(c.SamplePath, c); }
+                    catch (Exception e) { p.Warnings.Add(c.Name + ": " + e.Message); }
+                }
+                p.Channels.Add(c);
+            }
+            else if (f[0] == "ins")
+            {
+                if (f.Length < 5) throw new InvalidDataException("Bad mixer insert on line " + (li + 1));
+                int idx = Int(f[1], 0, Inserts - 1); var m = p.Mixer[idx];
+                m.Vol = Num(f[2], 0, 1); m.Pan = Num(f[3], -1, 1); m.Mute = f[4] == "1";
+                if (f.Length > 7)   // older files stop at mute
+                {
+                    m.SendTo = Int(f[5], 0, Inserts - 1); m.SendLevel = Num(f[6], 0, 1); m.Sidechain = Int(f[7], 0, Inserts - 1);
+                    if (m.SendTo != 0 && !RouteOk(idx, m.SendTo) || m.Sidechain != 0 && !RouteOk(m.Sidechain, idx))
+                        throw new InvalidDataException("Send or sidechain must go from a lower to a higher insert (line " + (li + 1) + ")");
+                }
+            }
+            else if (f[0] == "fx")
+            {
+                if (f.Length < 7) throw new InvalidDataException("Bad effect on line " + (li + 1));
+                var fx = new Effect(f[3]);
+                for (int j = 0; j < 3; j++) fx.P[j] = Num(f[4 + j], 0, 1);
+                fx.Bypass = f.Length > 7 && f[7] == "1";   // older files have no bypass field: on
+                fx.Mix = f.Length > 8 ? Num(f[8], 0, 1) : 1;  // ... and no mix field: fully wet
+                p.Mixer[Int(f[1], 0, Inserts - 1)].Slots[Int(f[2], 0, Insert.SlotCount - 1)] = fx;
+            }
+            else if (f[0] == "pat")   // older files have no length: one bar
+            {
+                cur = new Pattern { Name = f.Length > 1 ? f[1] : "Pattern", Length = (f.Length > 2 ? Int(f[2], 1, Pattern.MaxBars) : 1) * Steps };
+                p.Patterns.Add(cur);
+            }
+            else if (f[0] == "n")
+            {
+                if (cur == null || f.Length < 5) throw new InvalidDataException("Note outside a pattern on line " + (li + 1));
+                int step = Int(f[2], 0, cur.Length - 1);
+                cur.For(Int(f[1], 0, p.Channels.Count - 1)).Add(new Note { Step = step, Key = Int(f[3], 0, 127), Len = Int(f[4], 1, cur.Length - step),
+                                                                          Vel = f.Length > 5 ? Int(f[5], 1, 127) : 100 });   // older files have no velocity
+            }
+            else if (f[0] == "pl")
+            {
+                if (f.Length < 4) throw new InvalidDataException("Bad playlist item on line " + (li + 1));
+                p.Playlist[Int(f[1], 0, Tracks - 1), Int(f[2], 0, Bars - 1)] = Int(f[3], 0, int.MaxValue);
+            }
+            else if (f[0] == "auto")
+            {
+                var l = new Lane();
+                if (f.Length != 4 + l.Values.Length) throw new InvalidDataException("Bad automation lane on line " + (li + 1));
+                l.Ins = Int(f[1], 0, Inserts - 1); l.Slot = Int(f[2], -1, Insert.SlotCount - 1); l.Param = Int(f[3], 0, l.Slot < 0 ? 2 : Lane.FxMix);
+                for (int k = 0; k < l.Values.Length; k++) l.Values[k] = Num(f[4 + k], 0, 1);
+                p.Automation.Add(l);
+            }
+            else if (f[0] == "autotempo")
+            {
+                var l = new Lane { Tempo = true };
+                if (f.Length != 1 + l.Values.Length) throw new InvalidDataException("Bad tempo lane on line " + (li + 1));
+                for (int k = 0; k < l.Values.Length; k++) l.Values[k] = Num(f[1 + k], 0, 1);
+                p.Automation.Add(l);
+            }
+            else if (f[0] == "autoch")   // channel lines come first in the file, so the channel must already exist
+            {
+                var l = new Lane();
+                if (f.Length != 3 + l.Values.Length) throw new InvalidDataException("Bad automation lane on line " + (li + 1));
+                l.Ch = Int(f[1], 0, p.Channels.Count - 1); l.Param = Int(f[2], 0, Channel.LanePan);
+                for (int k = 0; k < l.Values.Length; k++) l.Values[k] = Num(f[3 + k], 0, 1);
+                p.Automation.Add(l);
+            }
+        }
+        if (p.Patterns.Count == 0) p.Patterns.Add(new Pattern { Name = "Pattern 1" });
+        for (int t = 0; t < Tracks; t++) for (int b = 0; b < Bars; b++)
+            if (p.Playlist[t, b] >= p.Patterns.Count) throw new InvalidDataException("Playlist refers to a missing pattern.");
+        return p;
+    }
+}
+
+// ---------------------------------------------------------------- WAV import
+static class Wav
+{
+    public static void Load(string path, Channel c)
+    {
+        if (new FileInfo(path).Length > 256L << 20) throw new InvalidDataException("WAV larger than 256 MB.");
+        var b = File.ReadAllBytes(path);
+        if (b.Length < 12 || Encoding.ASCII.GetString(b, 0, 4) != "RIFF" || Encoding.ASCII.GetString(b, 8, 4) != "WAVE")
+            throw new InvalidDataException("Not a WAV file.");
+        int fmt = 0, chans = 0, rate = 0, bits = 0, dataOff = -1, dataLen = 0;
+        for (int p = 12; p + 8 <= b.Length; )
+        {
+            string id = Encoding.ASCII.GetString(b, p, 4);
+            int len = BitConverter.ToInt32(b, p + 4), body = p + 8;
+            if (len < 0 || body + len < body) break;
+            if (id == "fmt " && body + 16 <= b.Length)
+            {
+                fmt = BitConverter.ToUInt16(b, body); chans = BitConverter.ToUInt16(b, body + 2);
+                rate = BitConverter.ToInt32(b, body + 4); bits = BitConverter.ToUInt16(b, body + 14);
+                if (fmt == 0xFFFE && len >= 26 && body + 26 <= b.Length) fmt = BitConverter.ToUInt16(b, body + 24); // WAVE_FORMAT_EXTENSIBLE subformat
+            }
+            else if (id == "data") { dataOff = body; dataLen = Math.Min(len, b.Length - body); }
+            p = body + len + (len & 1);
+        }
+        if (dataOff < 0 || chans < 1 || rate < 1000 || rate > 384000) throw new InvalidDataException("WAV has no usable fmt/data chunk.");
+        if (!((fmt == 1 && (bits == 16 || bits == 24)) || (fmt == 3 && bits == 32)))
+            throw new InvalidDataException("Only 16/24-bit PCM or 32-bit float WAV is supported.");
+        int bps = bits / 8, frames = dataLen / (bps * chans);
+        Func<int, float> read = o => bits == 16 ? BitConverter.ToInt16(b, o) / 32768f : bits == 24 ? (b[o] | b[o + 1] << 8 | (sbyte)b[o + 2] << 16) / 8388608f : BitConverter.ToSingle(b, o);
+        var left = new float[frames];
+        var right = chans >= 2 ? new float[frames] : null;   // stereo keeps both sides; files with more channels use their front left/right
+        for (int i = 0; i < frames; i++)
+        {
+            int o = dataOff + i * chans * bps;
+            left[i] = read(o);
+            if (right != null) right[i] = read(o + bps);
+        }
+        c.Sample = left; c.SampleR = right; c.SampleRate = rate; c.SamplePath = path;
+    }
+
+    public static byte[] Make16(float[] data, int rate, int chans)   // 16-bit PCM; data is interleaved when chans > 1
+    {
+        var m = new MemoryStream(); var w = new BinaryWriter(m);
+        w.Write(Encoding.ASCII.GetBytes("RIFF")); w.Write(36 + data.Length * 2); w.Write(Encoding.ASCII.GetBytes("WAVEfmt "));
+        w.Write(16); w.Write((short)1); w.Write((short)chans); w.Write(rate); w.Write(rate * 2 * chans); w.Write((short)(2 * chans)); w.Write((short)16);
+        w.Write(Encoding.ASCII.GetBytes("data")); w.Write(data.Length * 2);
+        foreach (var x in data) w.Write((short)(Math.Max(-1f, Math.Min(1f, x)) * 32767));   // clamp: an overflowing short would wrap into a click
+        return m.ToArray();
+    }
+}
+
+// ---------------------------------------------------------------- audio engine
+[StructLayout(LayoutKind.Sequential)]
+struct WAVEFORMATEX { public short wFormatTag, nChannels; public int nSamplesPerSec, nAvgBytesPerSec; public short nBlockAlign, wBitsPerSample, cbSize; }
+
+[StructLayout(LayoutKind.Sequential)]
+struct WAVEHDR { public IntPtr lpData; public int dwBufferLength, dwBytesRecorded; public IntPtr dwUser; public int dwFlags, dwLoops; public IntPtr lpNext, reserved; }
+
+class Engine
+{
+    [DllImport("winmm.dll")] static extern int waveOutOpen(out IntPtr h, int dev, ref WAVEFORMATEX fmt, IntPtr cb, IntPtr inst, int flags);
+    [DllImport("winmm.dll")] static extern int waveOutPrepareHeader(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveOutUnprepareHeader(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveOutWrite(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveOutReset(IntPtr h);
+    [DllImport("winmm.dll")] static extern int waveOutClose(IntPtr h);
+    [DllImport("winmm.dll")] static extern int timeBeginPeriod(int ms);
+    [DllImport("winmm.dll")] static extern int timeEndPeriod(int ms);
+
+    public const int SR = 44100;
+    const int Frames = 1024, NBuf = 4, MaxVoices = 64;   // ~93 ms of buffered output
+
+    public class Voice { public Channel Ch; public int Key, Age, Len, Wait; public float Gain = 1; public double Phase, Pos, Rate, Z1, Z2; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)
+
+    public volatile Project Proj;
+    public volatile bool Playing, SongMode;
+    public volatile int CurPattern, PlayStep = -1;
+    public volatile string LastError;
+    public int StepLimit = int.MaxValue;   // offline export: no notes start at or after this step, so the song doesn't loop
+    long rendered, songEnd = -1;           // frames rendered so far; the frame where step StepLimit would have started (-1 = not yet)
+    public readonly float[] Peaks = new float[Project.Inserts];   // per-insert meter levels for the mixer view
+    readonly float[][] ib = new float[Project.Inserts][];          // per-insert stereo bus buffers
+    float[] dryBuf;                                                 // scratch for effects' wet/dry mix
+    public readonly ConcurrentQueue<Voice> Preview = new ConcurrentQueue<Voice>();
+    public readonly ConcurrentQueue<int> MidiIn = new ConcurrentQueue<int>();   // raw MIDI messages from the keyboard
+    public readonly ConcurrentQueue<KeyValuePair<int, double>> MidiRec = new ConcurrentQueue<KeyValuePair<int, double>>();   // (message, pattern step as heard) for recording
+    public volatile Channel MidiTarget;                                          // the channel the keyboard plays, like FL's selected channel
+    readonly Voice[] held = new Voice[128];                                      // sounding keyboard notes, by key
+    bool pedal; readonly bool[] sustained = new bool[128];                       // sustain pedal down; keys let go while it was down
+    const double BendRange = 2;                                                  // semitones at full wheel, the usual default
+    double bendMul = 1;                                                          // pitch wheel as a frequency factor for live notes
+    const double VibHz = 5.5, VibSemis = 0.5;                                    // vibrato speed, and its depth at full mod wheel (± semitones)
+    double modDepth;                                                             // mod wheel, 0..1
+
+    readonly List<Voice> voices = new List<Voice>();
+    double toNext; int step; bool wasPlaying; uint rng = 2463534242;
+    IntPtr hwo; Thread thread; volatile bool running;
+
+    // Render interleaved stereo floats. Runs on the audio thread (or the self-test).
+    public void Render(float[] lr, int frames)
+    {
+        var proj = Proj;
+        Voice pv; while (Preview.TryDequeue(out pv)) AddVoice(pv);
+        bool playing = Playing;
+        if (playing && !wasPlaying) { step = 0; toNext = 0; }
+        if (!playing && wasPlaying) PlayStep = -1;
+        wasPlaying = playing;
+        double sps = 60.0 / proj.Bpm / 4 * SR;   // samples per 16th
+        if (playing && SongMode && proj.Automation.Count > 0) { Automate(proj, sps); sps = 60.0 / proj.Bpm / 4 * SR; }   // a tempo lane may have just changed the BPM
+        int msg; while (MidiIn.TryDequeue(out msg)) MidiEvent(proj, msg, playing, sps);
+        int n2 = frames * 2;
+        for (int i = 0; i < ib.Length; i++)
+            if (ib[i] == null || ib[i].Length < n2) ib[i] = new float[n2]; else Array.Clear(ib[i], 0, n2);
+        for (int f = 0; f < frames; f++)
+        {
+            if (playing)
+            {
+                if (toNext <= 0 && step < StepLimit) { Trigger(proj, step++, sps); toNext += sps; }
+                else if (toNext <= 0 && songEnd < 0) songEnd = rendered + f;   // export: the moment the step after the last would have started
+                toNext--;
+            }
+            for (int i = voices.Count - 1; i >= 0; i--)
+            {
+                var v = voices[i];
+                if (v.Wait > 0) { v.Wait--; continue; }
+                float s = Voice1(v);
+                if (v.Done) { voices.RemoveAt(i); continue; }
+                if (v.Ch.Mute) continue;
+                float g = v.Ch.Vol * v.Gain, pan = v.Ch.Pan;
+                var bus = ib[(uint)v.Ch.Insert < (uint)ib.Length ? v.Ch.Insert : 0];
+                bus[2 * f] += s * g * Math.Min(1, 1 - pan); bus[2 * f + 1] += (v.Stereo ? v.Right : s) * g * Math.Min(1, 1 + pan);   // pan acts as balance on stereo
+            }
+        }
+        var master = ib[0];
+        for (int i = 1; i < ib.Length; i++)   // index order works because routes only go upwards (Project.RouteOk)
+        {
+            var ins = proj.Mixer[i]; int to = ins.SendTo, sc = ins.Sidechain;   // read once: the UI may change them mid-block
+            Strip(ins, ib[i], n2, i, Project.RouteOk(sc, i) ? ib[sc] : null);   // ib[sc] is already that insert's post-fader output
+            for (int k = 0; k < n2; k++) master[k] += ib[i][k];
+            if (Project.RouteOk(i, to)) { float lvl = ins.SendLevel; for (int k = 0; k < n2; k++) ib[to][k] += ib[i][k] * lvl; }
+        }
+        Strip(proj.Mixer[0], master, n2, 0, null);
+        for (int k = 0; k < n2; k++) lr[k] = (float)Math.Tanh(master[k]);   // soft clip instead of hard wrap-around
+        rendered += frames;
+    }
+
+    // Offline bounce, like FL's File > Export: the whole song (or one pattern), then the reverb/delay tail until it goes quiet.
+    // Pass a Project.ExportCopy() so the live engine's effect state isn't shared.
+    public static float[] Bounce(Project proj, bool song, int pattern)
+    {
+        int steps = song ? proj.SongBars() * Project.Steps : proj.Patterns[Math.Min(pattern, proj.Patterns.Count - 1)].Length;
+        var e = new Engine { Proj = proj, Playing = true, SongMode = song, CurPattern = pattern, StepLimit = steps };
+        int maxTail = 10 * SR, maxSong = 10 * 60 * SR;   // the slowest possible song (32 bars at 40 BPM) takes 3.2 minutes
+        int quietNeeded = (int)(1.2 * SR);   // longer than the 1 s max delay time, so a gap before an echo isn't taken for the end
+        const float Silent = 1e-4f;          // -80 dBFS, below 16-bit's last few bits
+        var outp = new List<float>(); var buf = new float[Frames * 2];
+        int quiet = 0;
+        while (outp.Count / 2 < (e.songEnd < 0 ? maxSong : e.songEnd + maxTail))   // the engine marks the song's end, which a tempo lane can move
+        {
+            e.Render(buf, Frames);
+            quiet = buf.All(x => Math.Abs(x) < Silent) ? quiet + Frames : 0;
+            outp.AddRange(buf);
+            if (e.songEnd >= 0 && quiet >= quietNeeded) break;
+        }
+        int body = (int)Math.Max(0, e.songEnd);
+        int last = outp.FindLastIndex(x => Math.Abs(x) >= Silent) / 2 + 1;   // cut the silent end, but keep the full song length
+        return outp.Take(2 * Math.Max(body, last)).ToArray();
+    }
+
+    void Strip(Insert ins, float[] b, int n2, int idx, float[] key)
+    {
+        foreach (var fx in ins.Slots) if (fx != null && !fx.Bypass) fx.Run(b, n2, key, ref dryBuf);
+        float g = ins.Mute ? 0 : ins.Vol, gl = g * Math.Min(1, 1 - ins.Pan), gr = g * Math.Min(1, 1 + ins.Pan), pk = 0;
+        for (int k = 0; k < n2; k += 2)
+        {
+            b[k] *= gl; b[k + 1] *= gr;
+            pk = Math.Max(pk, Math.Max(Math.Abs(b[k]), Math.Abs(b[k + 1])));
+        }
+        Peaks[idx] = Math.Max(pk, Peaks[idx] * 0.85f);   // meter falls back gradually
+    }
+
+    // Set automated controls from their lanes at the current song position, once per block (~23 ms),
+    // interpolating between 16th-note values so sweeps and fades move smoothly.
+    void Automate(Project proj, double sps)
+    {
+        lock (proj)
+        {
+            int len = proj.SongBars() * Project.Steps, idx = step == 0 ? 0 : (step - 1) % len, next = Math.Min(idx + 1, len - 1);
+            float frac = step == 0 ? 0 : (float)Math.Max(0, Math.Min(1, (sps - toNext) / sps));   // how far we are into the current 16th
+            foreach (var l in proj.Automation) l.Set(proj, l.Values[idx] + (l.Values[next] - l.Values[idx]) * frac);
+        }
+    }
+
+    // Keyboard note-on starts a voice that holds until its note-off. The sustain pedal holds note-offs back until it comes up,
+    // and the pitch wheel bends every live note by up to ±BendRange semitones. Everything else (other controllers, clock) is ignored.
+    void MidiEvent(Project proj, int msg, bool playing, double sps)
+    {
+        int status = msg & 0xF0, key = (msg >> 8) & 0x7F, vel = (msg >> 16) & 0x7F;
+        if (status == 0xE0)   // pitch wheel: 14 bits, 8192 = centre
+        {
+            bendMul = Math.Pow(2, ((key | vel << 7) - 8192) / 8192.0 * BendRange / 12);
+            return;
+        }
+        if (status == 0xB0 && key == 1) { modDepth = vel / 127.0; return; }   // controller 1 = mod wheel: vibrato depth
+        if (status == 0xB0 && key == 64)   // controller 64 = sustain pedal: 64..127 down, 0..63 up
+        {
+            pedal = vel >= 64;
+            if (!pedal)   // let go: every key released meanwhile gets its note-off now (it also ends that note when recording)
+                for (int k = 0; k < 128; k++) if (sustained[k]) { sustained[k] = false; MidiEvent(proj, 0x80 | k << 8, playing, sps); }
+            return;
+        }
+        bool on = status == 0x90 && vel > 0;
+        if (!on && status != 0x80 && status != 0x90) return;   // note-on with velocity 0 means note-off
+        if (!on && pedal) { sustained[key] = true; return; }   // pedal down: keep sounding
+        sustained[key] = false;
+        if (held[key] != null) { held[key].Len = held[key].Age; held[key] = null; }   // release: the synth fades out from here
+        var ch = MidiTarget;
+        if (on && ch != null) { held[key] = new Voice { Ch = ch, Key = key, Len = int.MaxValue / 2, Gain = vel / 100f, Live = true }; AddVoice(held[key]); }
+        if (playing && !SongMode)   // tell the UI where in the pattern the player heard this, for recording
+        {
+            double pos = step == 0 ? 0 : step - 1 + Math.Max(0, Math.Min(1, (sps - toNext) / sps));
+            pos -= (NBuf + 0.5) * Frames / sps;   // audio is heard about NBuf blocks after it is rendered (+ half a block of event wait)
+            int len; lock (proj) len = proj.Patterns[Math.Min(CurPattern, proj.Patterns.Count - 1)].Length;
+            MidiRec.Enqueue(new KeyValuePair<int, double>(msg, (pos % len + len) % len));
+        }
+    }
+
+    void AddVoice(Voice v) { if (voices.Count >= MaxVoices) voices.RemoveAt(0); voices.Add(v); }
+
+    void Trigger(Project proj, int st, double sps)
+    {
+        lock (proj)
+        {
+            var hits = new List<KeyValuePair<Pattern, int>>();   // each pattern sounding now, and the step within it
+            if (SongMode)
+            {
+                int abs = st % (proj.SongBars() * Project.Steps), bar = abs / Project.Steps;
+                PlayStep = abs;
+                for (int t = 0; t < Project.Tracks; t++)
+                {
+                    int b0 = proj.ClipAt(t, bar);   // a 2-bar pattern placed at bar 3 also plays through bar 4
+                    if (b0 >= 0) hits.Add(new KeyValuePair<Pattern, int>(proj.Patterns[proj.Playlist[t, b0]], (bar - b0) * Project.Steps + abs % Project.Steps));
+                }
+            }
+            else
+            {
+                var cur = proj.Patterns[Math.Min(CurPattern, proj.Patterns.Count - 1)];
+                PlayStep = st % cur.Length;
+                hits.Add(new KeyValuePair<Pattern, int>(cur, st % cur.Length));
+            }
+            foreach (var hit in hits)
+                for (int ch = 0, s = hit.Value; ch < Math.Min(hit.Key.Notes.Count, proj.Channels.Count); ch++)
+                {
+                    var c = proj.Channels[ch];
+                    if (c.Mute) continue;
+                    foreach (var n in hit.Key.Notes[ch])
+                        if (n.Step == s) AddVoice(new Voice { Ch = c, Key = n.Key, Len = (int)(n.Len * sps), Gain = n.Vel / 100f,
+                                                              Wait = s % 2 == 1 ? (int)Math.Round(proj.Swing * 0.5 * sps) : 0 });   // swing delays off-beat 16ths
+                }
+        }
+    }
+
+    static double Hz(int key) { return 440 * Math.Pow(2, (key - 69) / 12.0); }   // MIDI 69 = A, 440 Hz
+    static double Wrap(double phase) { return phase >= 1 ? phase - 1 : phase; }    // oscillator phase in 0..1 (rates stay below 1)
+
+    static double Env(Voice v, int attack, int release)   // rise over attack samples, hold for the note, fade over release samples; ends the voice
+    {
+        double e = Math.Min(1, v.Age / (double)attack);
+        if (v.Age > v.Len) { e *= Math.Max(0, 1 - (v.Age - v.Len) / (double)release); if (v.Age >= v.Len + release) v.Done = true; }
+        return e;
+    }
+
+    double Noise() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng / 2147483648.0 - 1; }
+
+    float Voice1(Voice v)
+    {
+        double t = v.Age / (double)SR, br = 1;   // br scales every oscillator's speed: pitch wheel and vibrato, for keyboard notes only
+        if (v.Live) br = modDepth == 0 ? bendMul : bendMul * Math.Exp(modDepth * VibSemis * Math.Sin(2 * Math.PI * VibHz * t) * Math.Log(2) / 12);
+        v.Age++;
+        var c = v.Ch; double b = c.Bright();   // tone knob: filter brightness for synths, decay length for drums (1 = built-in)
+        switch (c.Kind)
+        {
+            case "kick":
+            {
+                if (v.Rate == 0) v.Rate = Math.Pow(2, c.Semitones() / 12.0);   // pitch knob as a frequency factor
+                v.Phase += 2 * Math.PI * (45 + 110 * Math.Exp(-t * 28)) * v.Rate / SR;   // pitch sweep 155 -> 45 Hz
+                if (t > 0.5 * b) v.Done = true;
+                return (float)(Math.Sin(v.Phase) * Math.Exp(-t * 8 / b));
+            }
+            case "snare":
+            {
+                if (v.Rate == 0) v.Rate = Math.Pow(2, c.Semitones() / 12.0);
+                double n = Noise(), hp = n - v.Z1; v.Z1 = n;   // first difference = crude high-pass
+                if (t > 0.3 * b) v.Done = true;
+                return (float)(hp * 0.35 * Math.Exp(-t * 18 / b) + Math.Sin(2 * Math.PI * 190 * v.Rate * t) * 0.5 * Math.Exp(-t * 30 / b));
+            }
+            case "hat":
+            {
+                double n = Noise(), hp = n - 2 * v.Z1 + v.Z2; v.Z2 = v.Z1; v.Z1 = n;   // second difference = steeper high-pass
+                if (t > 0.1 * b) v.Done = true;
+                return (float)(hp * 0.2 * Math.Exp(-t * 55 / b));
+            }
+            case "clap":   // three quick noise bursts 10 ms apart, then a short tail
+            {
+                double n = Noise(), hp = n - v.Z1; v.Z1 = n;
+                if (t > 0.35 * b) v.Done = true;
+                return (float)(hp * 0.3 * (t < 0.03 ? Math.Exp(-(t % 0.01) * 300) : Math.Exp(-(t - 0.03) * 25 / b)));
+            }
+            case "synth":   // saw through a one-pole low-pass
+            {
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                v.Phase = Wrap(v.Phase + v.Rate * br);
+                v.Z1 += Math.Min(1, 0.15 * b) * ((2 * v.Phase - 1) - v.Z1);
+                return (float)(v.Z1 * 0.35 * Env(v, c.AttackSamples(), c.ReleaseSamples()));
+            }
+            case "square":   // hollow square lead
+            {
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                v.Phase = Wrap(v.Phase + v.Rate * br);
+                v.Z1 += Math.Min(1, 0.25 * b) * ((v.Phase < 0.5 ? 1 : -1) - v.Z1);
+                return (float)(v.Z1 * 0.25 * Env(v, c.AttackSamples(), c.ReleaseSamples()));
+            }
+            case "pad":   // three saws detuned ±0.7%, slow to swell and to fade
+            {
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                v.Phase = Wrap(v.Phase + v.Rate * br); v.Pos = Wrap(v.Pos + v.Rate * br * 1.007); v.Z2 = Wrap(v.Z2 + v.Rate * br * 0.993);
+                v.Z1 += Math.Min(1, 0.06 * b) * ((v.Phase + v.Pos + v.Z2) * 2 / 3 - 1 - v.Z1);
+                return (float)(v.Z1 * 0.45 * Env(v, c.AttackSamples(), c.ReleaseSamples()));
+            }
+            case "bass":   // filtered square plus a sine an octave below
+            {
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                v.Phase = Wrap(v.Phase + v.Rate * br); v.Pos = Wrap(v.Pos + v.Rate * br / 2);
+                v.Z1 += Math.Min(1, 0.12 * b) * ((v.Phase < 0.5 ? 1 : -1) - v.Z1);
+                return (float)((v.Z1 * 0.2 + Math.Sin(2 * Math.PI * v.Pos) * 0.3) * Env(v, c.AttackSamples(), c.ReleaseSamples()));
+            }
+            case "keys":   // two-operator FM: a sine bent by itself, the bend fading fast, like an electric piano
+            {
+                if (v.Rate == 0) v.Rate = Hz(v.Key + c.Semitones()) / SR;
+                v.Phase = Wrap(v.Phase + v.Rate * br);
+                double bend = 2.2 * b * Math.Exp(-t * 4);
+                return (float)(Math.Sin(2 * Math.PI * v.Phase + bend * Math.Sin(2 * Math.PI * v.Phase)) * 0.3 * Math.Exp(-t * 1.5) * Env(v, c.AttackSamples(), c.ReleaseSamples()));
+            }
+            case "pluck":   // Karplus-Strong: a burst of noise circulating in a one-period delay, softened on every pass
+            {
+                if (v.Buf == null)
+                {
+                    v.Buf = new float[Math.Max(2, (int)Math.Round(SR / Hz(v.Key + c.Semitones())))];
+                    for (int i = 0; i < v.Buf.Length; i++) v.Buf[i] = (float)Noise();
+                }
+                int p = (int)v.Pos, q = (p + 1) % v.Buf.Length;
+                float o = v.Buf[p];
+                double s = Math.Min(0.5, 0.5 / b), keep = 1 - 0.004 / Math.Min(1, b);   // brighter: less smoothing; darker: more loss per pass
+                v.Buf[p] = (float)((v.Buf[p] * (1 - s) + v.Buf[q] * s) * keep);   // built-in: average with the next sample and lose 0.4%
+                v.Pos = q;
+                return (float)(o * 0.35 * Env(v, c.AttackSamples(), c.ReleaseSamples()));
+            }
+            case "sample":
+            {
+                var smp = c.Sample;
+                int i = (int)v.Pos;
+                if (smp == null || i + 1 >= smp.Length) { v.Done = true; return 0; }
+                if (v.Rate == 0) v.Rate = c.SampleRate / (double)SR * Math.Pow(2, (v.Key - 60 + c.Semitones()) / 12.0);   // key 60 = original pitch
+                float s = (float)(smp[i] + (smp[i + 1] - smp[i]) * (v.Pos - i));
+                var right = c.SampleR;   // stereo: the right side goes out through v.Right
+                v.Stereo = right != null && i + 1 < right.Length;
+                if (v.Stereo) v.Right = (float)(right[i] + (right[i + 1] - right[i]) * (v.Pos - i));
+                v.Pos += v.Rate * br;
+                return s;
+            }
+        }
+        v.Done = true;
+        return 0;
+    }
+
+    public string Start()
+    {
+        var fmt = new WAVEFORMATEX { wFormatTag = 1, nChannels = 2, nSamplesPerSec = SR, wBitsPerSample = 16, nBlockAlign = 4, nAvgBytesPerSec = SR * 4 };
+        int err = waveOutOpen(out hwo, -1, ref fmt, IntPtr.Zero, IntPtr.Zero, 0);   // -1 = WAVE_MAPPER (default device)
+        if (err != 0) return "Could not open the audio device (waveOutOpen error " + err + ").";
+        running = true;
+        thread = new Thread(Loop) { IsBackground = true, Priority = ThreadPriority.Highest, Name = "audio" };
+        thread.Start();
+        return null;
+    }
+
+    public void Stop()
+    {
+        if (thread == null) return;
+        running = false; thread.Join(1000); thread = null;
+    }
+
+    void Loop()
+    {
+        timeBeginPeriod(1);
+        int hsz = Marshal.SizeOf(typeof(WAVEHDR)), flagsOff = (int)Marshal.OffsetOf(typeof(WAVEHDR), "dwFlags");
+        var hdrs = new IntPtr[NBuf]; var data = new IntPtr[NBuf];
+        var lr = new float[Frames * 2]; var pcm = new short[Frames * 2];
+        for (int i = 0; i < NBuf; i++)
+        {
+            data[i] = Marshal.AllocHGlobal(Frames * 4); hdrs[i] = Marshal.AllocHGlobal(hsz);
+            Marshal.StructureToPtr(new WAVEHDR { lpData = data[i], dwBufferLength = Frames * 4 }, hdrs[i], false);
+            waveOutPrepareHeader(hwo, hdrs[i], hsz);
+            Marshal.WriteInt32(hdrs[i], flagsOff, Marshal.ReadInt32(hdrs[i], flagsOff) | 1);   // mark WHDR_DONE so it gets filled first
+        }
+        while (running)
+        {
+            bool wrote = false;
+            for (int i = 0; i < NBuf; i++)
+            {
+                int fl = Marshal.ReadInt32(hdrs[i], flagsOff);
+                if ((fl & 1) == 0) continue;   // still queued in the driver
+                try { Render(lr, Frames); }
+                catch (Exception e) { LastError = e.Message; Array.Clear(lr, 0, lr.Length); }   // keep the app alive; UI shows the error
+                for (int k = 0; k < pcm.Length; k++) pcm[k] = (short)(lr[k] * 32767);
+                Marshal.Copy(pcm, 0, data[i], pcm.Length);
+                Marshal.WriteInt32(hdrs[i], flagsOff, fl & ~1);
+                waveOutWrite(hwo, hdrs[i], hsz);
+                wrote = true;
+            }
+            if (!wrote) Thread.Sleep(2);
+        }
+        waveOutReset(hwo);
+        for (int i = 0; i < NBuf; i++) { waveOutUnprepareHeader(hwo, hdrs[i], hsz); Marshal.FreeHGlobal(hdrs[i]); Marshal.FreeHGlobal(data[i]); }
+        waveOutClose(hwo);
+        timeEndPeriod(1);
+    }
+}
+
+// The app's logo: a banana, drawn in code so it's sharp at every size (window, taskbar, and the .exe via --logo + /win32icon).
+static class Logo
+{
+    public static Bitmap Draw(int size)
+    {
+        var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(bmp))
+        using (var body = new System.Drawing.Drawing2D.GraphicsPath())
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.ScaleTransform(size / 100f, size / 100f);   // drawn on a 100 x 100 grid
+            body.AddBezier(8, 46, 10, 98, 80, 100, 86, 26);   // the outer (lower) curve, tip to stem
+            body.AddBezier(86, 26, 76, 62, 32, 66, 8, 46);    // the inner (upper) curve, back to the tip: a plump middle
+            body.CloseFigure();
+            using (var fill = new System.Drawing.Drawing2D.LinearGradientBrush(new PointF(0, 34), new PointF(0, 94), Color.FromArgb(255, 238, 120), Color.FromArgb(236, 176, 28)))
+                g.FillPath(fill, body);
+            g.SetClip(body);   // keep the shine inside the peel
+            using (var shine = new Pen(Color.FromArgb(150, 255, 255, 228), 6) { StartCap = System.Drawing.Drawing2D.LineCap.Round, EndCap = System.Drawing.Drawing2D.LineCap.Round })
+                g.DrawBezier(shine, 20, 66, 32, 82, 58, 84, 72, 68);   // light along the belly
+            g.ResetClip();
+            using (var edge = new Pen(Color.FromArgb(150, 98, 18), Math.Max(4f, 100f / size)))   // at least one real pixel wide at 16 px
+                g.DrawPath(edge, body);
+            using (var stem = new Pen(Color.FromArgb(104, 72, 26), 9) { StartCap = System.Drawing.Drawing2D.LineCap.Round })
+                g.DrawLine(stem, 87, 26, 92, 10);
+            using (var tip = new SolidBrush(Color.FromArgb(70, 44, 14))) g.FillEllipse(tip, 3, 42, 9, 9);
+        }
+        return bmp;
+    }
+
+    public static Icon Icon() { using (var b = Draw(32)) return System.Drawing.Icon.FromHandle(b.GetHicon()); }
+
+    public static byte[] Ico()   // a Windows .ico with the banana at 16, 24, 32, 48 and 256 px (PNG-compressed entries, Vista and later)
+    {
+        int[] sizes = { 16, 24, 32, 48, 256 };
+        var pngs = sizes.Select(n => { using (var b = Draw(n)) using (var ms = new MemoryStream()) { b.Save(ms, System.Drawing.Imaging.ImageFormat.Png); return ms.ToArray(); } }).ToList();
+        var m = new MemoryStream(); var w = new BinaryWriter(m);
+        w.Write((short)0); w.Write((short)1); w.Write((short)sizes.Length);   // ICONDIR: reserved, type 1 = icon, count
+        int offset = 6 + 16 * sizes.Length;
+        for (int i = 0; i < sizes.Length; i++)   // ICONDIRENTRY: width, height (0 = 256), colours, reserved, planes, bits, bytes, offset
+        {
+            w.Write((byte)(sizes[i] % 256)); w.Write((byte)(sizes[i] % 256)); w.Write((byte)0); w.Write((byte)0);
+            w.Write((short)1); w.Write((short)32); w.Write(pngs[i].Length); w.Write(offset);
+            offset += pngs[i].Length;
+        }
+        foreach (var p in pngs) w.Write(p);
+        return m.ToArray();
+    }
+}
+
+// Recently opened or saved projects, newest first, kept per Windows user in %APPDATA%\MiniDAW\recent.txt.
+static class Recent
+{
+    public const int Max = 8;
+    public static string FilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MiniDAW", "recent.txt");
+
+    public static List<string> Load()
+    {
+        try { return File.Exists(FilePath) ? File.ReadAllLines(FilePath).Where(l => l.Trim() != "").Distinct(StringComparer.OrdinalIgnoreCase).Take(Max).ToList() : new List<string>(); }
+        catch (Exception) { return new List<string>(); }   // an unreadable list just means none
+    }
+
+    public static void Add(string path)   // to the top; an existing entry moves up instead of repeating
+    {
+        var list = Load(); string full = Path.GetFullPath(path);
+        list.RemoveAll(p => string.Equals(p, full, StringComparison.OrdinalIgnoreCase));
+        list.Insert(0, full);
+        Write(list);
+    }
+
+    public static void Remove(string path) { var list = Load(); list.RemoveAll(p => string.Equals(p, path, StringComparison.OrdinalIgnoreCase)); Write(list); }
+
+    static void Write(List<string> list)
+    {
+        try { Directory.CreateDirectory(Path.GetDirectoryName(FilePath)); File.WriteAllLines(FilePath, list.Take(Max)); }
+        catch (Exception) { }   // a read-only profile only costs the recent list, never the project
+    }
+}
+
+// The start-up splash (splash = true) and the About window (F1, or the banana at the end of the toolbar).
+class AboutForm : Form
+{
+    public const string Version = "1.1";   // bump for every release: running copies compare it with the latest GitHub release
+    static readonly Color Bg = MainForm.PanelBg, Dim = MainForm.Dim;
+    readonly bool splash;
+    readonly Font big = new Font("Segoe UI", 26, FontStyle.Bold), text = new Font("Segoe UI", 9.5f);
+    public readonly Panel view = new Canvas();
+
+    public AboutForm(bool splash)
+    {
+        this.splash = splash;
+        Text = "About MiniDAW"; Icon = Logo.Icon(); BackColor = view.BackColor = Bg;
+        FormBorderStyle = splash ? FormBorderStyle.None : FormBorderStyle.FixedDialog; MaximizeBox = MinimizeBox = false; ShowInTaskbar = false;
+        StartPosition = splash ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent;
+        ClientSize = splash ? new Size(440, 180) : new Size(580, 330);
+        view.Dock = DockStyle.Fill; view.Paint += PaintView; Controls.Add(view);
+        if (splash) { view.Click += (s, e) => Close(); return; }   // a click dismisses the splash early
+        var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Size = new Size(84, 28), Location = new Point(580 - 84 - 16, 330 - 28 - 14), FlatStyle = FlatStyle.Flat,
+            BackColor = MainForm.Raised, ForeColor = MainForm.Txt, Cursor = Cursors.Hand };
+        ok.FlatAppearance.BorderColor = MainForm.Line;
+        Controls.Add(ok); ok.BringToFront(); AcceptButton = CancelButton = ok;
+    }
+
+    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); MainForm.DarkTitle(Handle); }
+
+    void PaintView(object sender, PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        using (var b = new SolidBrush(MainForm.On)) g.FillRectangle(b, 0, 0, view.Width, 3);   // accent stripe
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        using (var logo = Logo.Draw(splash ? 120 : 104)) g.DrawImage(logo, 20, splash ? 28 : 22);
+        float x = splash ? 156 : 140;
+        g.DrawString("MiniDAW", big, Brushes.White, x, splash ? 40 : 28);
+        using (var dim = new SolidBrush(Dim))
+        {
+            g.DrawString("a tiny pattern-based music studio", text, dim, x + 4, splash ? 92 : 80);
+            if (splash) { g.DrawString("starting up…", text, dim, x + 4, 124); return; }
+            string built = File.GetLastWriteTime(typeof(AboutForm).Assembly.Location).ToString("d MMMM yyyy", CultureInfo.InvariantCulture);
+            g.DrawString("Version " + Version + "  ·  built " + built, text, Brushes.Gainsboro, x + 4, 104);
+            string[] lines =
+            {
+                "Channel rack, patterns, playlist, mixer with 8 effects per insert, automation,",
+                "MIDI keyboard, recording and WAV export, all in one small program.",
+                "",
+                "Space  play / stop     F9  mixer     F1  this window     Ctrl+Z / Ctrl+Y  undo / redo",
+                "The full guide is README.md, next to MiniDAW.exe.",
+                "",
+                "Workflow inspired by FL Studio. Not affiliated with or endorsed by Image-Line.",
+            };
+            for (int i = 0; i < lines.Length; i++) g.DrawString(lines[i], text, i == lines.Length - 1 ? dim : Brushes.Gainsboro, 24, 146 + i * 19);
+        }
+    }
+
+    protected override void Dispose(bool disposing) { if (disposing) { big.Dispose(); text.Dispose(); } base.Dispose(disposing); }
+}
+
+// Updates are the GitHub repository's releases, each carrying MiniDAW-Setup.exe. github.com/<repo>/releases/latest redirects to
+// .../releases/tag/<tag>, so the newest version is read from that redirect: no API token, no JSON.
+static class Updates
+{
+    public const string Repo = "grigorehunduu-droid/MiniDAW";   // "owner/name" on GitHub; empty = no update check
+    public const string SetupName = "MiniDAW-Setup.exe";
+
+    static Updates() { System.Net.ServicePointManager.SecurityProtocol |= (System.Net.SecurityProtocolType)3072; }   // TLS 1.2, which GitHub requires
+
+    public static string LatestTag()   // e.g. "v1.2"; null when offline, blocked, or nothing is released yet
+    {
+        if (string.IsNullOrEmpty(Repo)) return null;
+        try
+        {
+            var req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create("https://github.com/" + Repo + "/releases/latest");
+            req.Method = "HEAD"; req.AllowAutoRedirect = false; req.Timeout = 15000; req.UserAgent = "MiniDAW/" + AboutForm.Version;
+            using (var resp = req.GetResponse())
+            {
+                var m = System.Text.RegularExpressions.Regex.Match(resp.Headers["Location"] ?? "", @"/releases/tag/([^/?#]+)$");
+                return m.Success ? Uri.UnescapeDataString(m.Groups[1].Value) : null;
+            }
+        }
+        catch (System.Net.WebException) { return null; }
+        catch (IOException) { return null; }
+    }
+
+    public static bool Newer(string tag, string current) { var a = Parse(tag); var b = Parse(current); return a != null && b != null && a > b; }
+
+    static Version Parse(string s)   // "v1.2" and "1.2.0" are the same version (System.Version alone ranks 1.2 below 1.2.0)
+    {
+        Version v;
+        if (s == null || !Version.TryParse(s.TrimStart('v', 'V'), out v)) return null;
+        return new Version(v.Major, v.Minor, Math.Max(0, v.Build), Math.Max(0, v.Revision));
+    }
+
+    public static string SetupUrl(string tag) { return "https://github.com/" + Repo + "/releases/download/" + Uri.EscapeDataString(tag) + "/" + SetupName; }
+}
+
+// MIDI keyboard input through winmm. The driver calls back on its own thread, so the callback only queues the raw message.
+class MidiInput
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct MIDIINCAPS { public ushort wMid, wPid; public uint vDriverVersion; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szPname; public uint dwSupport; }
+    delegate void MidiProc(IntPtr h, uint msg, IntPtr inst, IntPtr p1, IntPtr p2);
+    [DllImport("winmm.dll")] static extern int midiInGetNumDevs();
+    [DllImport("winmm.dll", EntryPoint = "midiInGetDevCapsW")] static extern int midiInGetDevCaps(IntPtr id, out MIDIINCAPS caps, int size);
+    [DllImport("winmm.dll")] static extern int midiInOpen(out IntPtr h, int id, MidiProc cb, IntPtr inst, int flags);
+    [DllImport("winmm.dll")] static extern int midiInStart(IntPtr h);
+    [DllImport("winmm.dll")] static extern int midiInStop(IntPtr h);
+    [DllImport("winmm.dll")] static extern int midiInReset(IntPtr h);
+    [DllImport("winmm.dll")] static extern int midiInClose(IntPtr h);
+
+    readonly MidiProc proc;   // kept in a field: the driver holds the callback, so the GC must not collect it
+    readonly ConcurrentQueue<int> sink;
+    IntPtr h;
+
+    public MidiInput(ConcurrentQueue<int> sink) { this.sink = sink; proc = OnMidi; }
+
+    public static List<string> Devices()
+    {
+        var names = new List<string>();
+        for (int i = 0; i < midiInGetNumDevs(); i++)
+        {
+            MIDIINCAPS c;
+            names.Add(midiInGetDevCaps((IntPtr)i, out c, Marshal.SizeOf(typeof(MIDIINCAPS))) == 0 ? c.szPname : "MIDI device " + (i + 1));
+        }
+        return names;
+    }
+
+    public string Open(int id)
+    {
+        Close();
+        int err = midiInOpen(out h, id, proc, IntPtr.Zero, 0x30000);   // CALLBACK_FUNCTION
+        if (err != 0) { h = IntPtr.Zero; return "MIDI device is busy or unavailable (midiInOpen error " + err + ")"; }
+        midiInStart(h);
+        return null;
+    }
+
+    public void Close()
+    {
+        if (h == IntPtr.Zero) return;
+        midiInStop(h); midiInReset(h); midiInClose(h); h = IntPtr.Zero;
+    }
+
+    void OnMidi(IntPtr hm, uint msg, IntPtr inst, IntPtr p1, IntPtr p2)
+    {
+        if (msg == 0x3C3) sink.Enqueue((int)((long)p1 & 0xFFFFFF));   // MIM_DATA: status | data1 << 8 | data2 << 16
+    }
+}
+
+// Snapshot undo/redo: the whole project as text before each edit gesture (a click or drag, a toolbar action, a recording take).
+// A gesture that changed nothing leaves no step.
+class History
+{
+    const int Max = 100;
+    readonly List<string> undo = new List<string>(), redo = new List<string>();
+    string pending;
+
+    public void Begin(Func<string> snap) { if (pending == null) pending = snap(); }
+
+    public void End(Func<string> snap)
+    {
+        if (pending == null) return;
+        if (pending != snap()) { undo.Add(pending); if (undo.Count > Max) undo.RemoveAt(0); redo.Clear(); }
+        pending = null;
+    }
+
+    public string Undo(Func<string> snap) { End(snap); return Move(undo, redo, snap); }
+    public string Redo(Func<string> snap) { End(snap); return Move(redo, undo, snap); }
+    public void Clear() { undo.Clear(); redo.Clear(); pending = null; }
+
+    static string Move(List<string> from, List<string> to, Func<string> snap)   // returns the state to restore, or null
+    {
+        if (from.Count == 0) return null;
+        to.Add(snap());
+        string s = from[from.Count - 1]; from.RemoveAt(from.Count - 1);
+        return s;
+    }
+}
+
+// ---------------------------------------------------------------- UI
+class Canvas : Panel
+{
+    public Canvas() { DoubleBuffered = true; ResizeRedraw = true; BackColor = MainForm.PanelBg; }
+}
+
+// A drop-down list in the app's colours. Windows draws a flat combo's border white and its arrow black, so both are painted over
+// after each paint (and each WM_PRINT, which is what DrawToBitmap uses).
+class DarkCombo : ComboBox
+{
+    public DarkCombo() { DropDownStyle = ComboBoxStyle.DropDownList; FlatStyle = FlatStyle.Flat; BackColor = MainForm.Raised; ForeColor = MainForm.Txt; }
+
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (m.Msg == 0x000F) using (var g = Graphics.FromHwnd(Handle)) Draw(g);
+        else if (m.Msg == 0x0317) using (var g = Graphics.FromHdc(m.WParam)) Draw(g);
+    }
+
+    void Draw(Graphics g)
+    {
+        var r = new Rectangle(0, 0, Width - 1, Height - 1);
+        using (var b = new SolidBrush(BackColor)) g.FillRectangle(b, r);
+        using (var pen = new Pen(Focused || DroppedDown ? MainForm.On : MainForm.Line)) g.DrawRectangle(pen, r);
+        TextRenderer.DrawText(g, Text, Font, new Rectangle(6, 0, Width - 28, Height), ForeColor, TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+        float ax = Width - 13, ay = Height / 2f;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var pen = new Pen(MainForm.Dim, 1.6f)) g.DrawLines(pen, new[] { new PointF(ax - 4, ay - 2), new PointF(ax, ay + 2), new PointF(ax + 4, ay - 2) });
+    }
+}
+
+// Right-click menus in the app's colours (every ContextMenuStrip uses the manager's renderer).
+class DarkMenus : ToolStripProfessionalRenderer
+{
+    public DarkMenus() : base(new Colors()) { RoundedEdges = false; }
+    protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) { e.TextColor = e.Item.Enabled ? MainForm.Txt : Color.FromArgb(100, 107, 120); base.OnRenderItemText(e); }
+    protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e) { e.ArrowColor = MainForm.Dim; base.OnRenderArrow(e); }
+    protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)   // an accent dot: the stock black tick vanishes on a dark menu
+    {
+        var r = e.ImageRectangle; e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var b = new SolidBrush(MainForm.On)) e.Graphics.FillEllipse(b, r.X + r.Width / 2f - 4, r.Y + r.Height / 2f - 4, 8, 8);
+    }
+    class Colors : ProfessionalColorTable
+    {
+        public override Color ToolStripDropDownBackground { get { return MainForm.Raised; } }
+        public override Color ImageMarginGradientBegin { get { return MainForm.Raised; } }
+        public override Color ImageMarginGradientMiddle { get { return MainForm.Raised; } }
+        public override Color ImageMarginGradientEnd { get { return MainForm.Raised; } }
+        public override Color MenuBorder { get { return MainForm.Line; } }
+        public override Color MenuItemBorder { get { return MainForm.Sel; } }
+        public override Color MenuItemSelected { get { return MainForm.Sel; } }
+        public override Color SeparatorDark { get { return MainForm.Line; } }
+        public override Color SeparatorLight { get { return MainForm.Raised; } }
+    }
+}
+
+class MainForm : Form
+{
+    readonly Engine eng = new Engine();
+    Project P { get { return eng.Proj; } }
+    readonly Canvas rack = new Canvas(), roll = new Canvas(), playlist = new Canvas(), mixer = new Canvas();
+    readonly ComboBox patBox = new DarkCombo { Width = 124 };
+    readonly NumericUpDown bpm = new NumericUpDown { Minimum = Project.MinBpm, Maximum = Project.MaxBpm, Width = 62, BackColor = Well, ForeColor = Txt,
+        BorderStyle = BorderStyle.FixedSingle, TextAlign = HorizontalAlignment.Center, Font = new Font("Segoe UI", 10, FontStyle.Bold) };
+    readonly Button playBtn, modeBtn, mixBtn, recBtn;
+    readonly ComboBox midiBox = new DarkCombo { Width = 126 };
+    readonly MidiInput midi;
+    bool recording; readonly Note[] recNotes = new Note[128];   // notes being recorded, by key, until their note-off
+    readonly History hist = new History();
+    bool syncingBpm;   // the BPM box is being updated from the project, not by the user
+    static bool screenshotMode;   // --screenshot: built off-screen, never activated; no recovery prompt, no MIDI device, the autosave left alone
+    protected override bool ShowWithoutActivation { get { return screenshotMode; } }
+    readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 33 };
+    int selCh = 3; Note dragNote; string dragMode; int dragCh; string filePath; bool dirty; int lastStep = -2;
+    Effect dragFx; int dragParam; float dragX0, dragW;
+    int selLane = -1, autoK = -1; float autoV;   // automation lane shown in the playlist (-1 = editing patterns), last painted step
+    List<Note> sel = new List<Note>(), clip = new List<Note>();   // piano roll selection, and the copy buffer
+    Point? boxFrom, boxTo;                                        // right-drag selection box in the piano roll
+    List<Note> moving; Dictionary<Note, Point> moveFrom; Note moveHit; Point moveAt; bool moved, resizing;   // notes being dragged: start step/key of each, the grabbed one, the grab cell
+
+    // Theme: one dark palette for every panel and window. Shapes keep the layout coordinates, so clicking works as before.
+    internal static readonly Color Txt = Color.FromArgb(230, 233, 238), Dim = Color.FromArgb(138, 147, 163),
+        AppBg = Color.FromArgb(21, 24, 29), PanelBg = Color.FromArgb(28, 32, 38), HeadBg = Color.FromArgb(35, 40, 49),
+        Raised = Color.FromArgb(44, 50, 61), Line = Color.FromArgb(58, 66, 79), Well = Color.FromArgb(16, 18, 22), Sel = Color.FromArgb(58, 72, 96),
+        Cell1 = Color.FromArgb(42, 47, 57), Cell2 = Color.FromArgb(54, 60, 72), On = Color.FromArgb(255, 159, 58),
+        Blue = Color.FromArgb(90, 169, 230), DeepBlue = Color.FromArgb(56, 102, 168), Green = Color.FromArgb(110, 220, 140);
+    static readonly Color[] PatColors = { Color.FromArgb(70, 168, 112), Color.FromArgb(78, 132, 224), Color.FromArgb(222, 92, 108),
+        Color.FromArgb(214, 150, 56), Color.FromArgb(150, 104, 224), Color.FromArgb(52, 176, 188) };
+    const int Row = 26, RackX = 284, Cell = 26, Top0 = 26, KeyW = 44, PlLabel = 64, HeadH = 19, ParamsH = 3 * 14 + 4, StripHead = 86, AutoBoxX = 444, AutoBoxW = 360, VelH = 56, SwingW = 150;
+    static readonly Font Small = new Font("Segoe UI", 8), Bold = new Font("Segoe UI", 9, FontStyle.Bold);
+    static readonly SolidBrush TxtB = new SolidBrush(Txt), DimB = new SolidBrush(Dim);
+    static readonly StringFormat Mid = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center },
+        Fit = new StringFormat(StringFormatFlags.NoWrap) { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter };
+
+    static GraphicsPath RoundPath(RectangleF r, float rad)
+    {
+        var p = new GraphicsPath(); float d = Math.Min(rad * 2, Math.Min(r.Width, r.Height));
+        if (d < 1) { p.AddRectangle(r); return p; }
+        p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure(); return p;
+    }
+
+    internal static void Round(Graphics g, Color c, float x, float y, float w, float h, float rad)   // anti-aliased rounded box; grid lines stay pixel-crisp
+    {
+        if (w <= 0 || h <= 0) return;
+        var keep = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var p = RoundPath(new RectangleF(x, y, w, h), rad)) using (var b = new SolidBrush(c)) g.FillPath(b, p);
+        g.SmoothingMode = keep;
+    }
+
+    static void RoundEdge(Graphics g, Color c, float width, RectangleF r, float rad)
+    {
+        var keep = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+        using (var p = RoundPath(r, rad)) using (var pen = new Pen(c, width)) g.DrawPath(pen, p);
+        g.SmoothingMode = keep;
+    }
+
+    internal static void ValueBar(Graphics g, float x, float y, float w, float h, float from, float to, Color c)   // rounded track, filled between two fractions of its width
+    {
+        float rad = Math.Min(h / 2, 4);
+        Round(g, Well, x, y, w, h, rad);
+        if (to <= from) return;
+        var st = g.Save();
+        g.SetClip(new RectangleF(x + w * from, y, w * (to - from), h), CombineMode.Intersect);
+        Round(g, c, x, y, w, h, rad);
+        g.Restore(st);
+    }
+
+    static void Led(Graphics g, float x, float y, float d, bool lit)   // status dot: lit green with a glow, or an empty ring
+    {
+        var keep = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+        if (lit)
+        {
+            using (var b = new SolidBrush(Color.FromArgb(45, Green))) g.FillEllipse(b, x - 2, y - 2, d + 4, d + 4);
+            using (var b = new SolidBrush(Green)) g.FillEllipse(b, x, y, d, d);
+        }
+        else using (var pen = new Pen(Dim, 1.5f)) g.DrawEllipse(pen, x + 0.5f, y + 0.5f, d - 1, d - 1);
+        g.SmoothingMode = keep;
+    }
+
+    static void Header(Graphics g, Control c, string title)   // the strip across the top of each panel
+    {
+        using (var b = new SolidBrush(HeadBg)) g.FillRectangle(b, 0, 0, c.Width, 22);
+        using (var b = new SolidBrush(On)) g.FillRectangle(b, 0, 0, 3, 22);
+        using (var pen = new Pen(AppBg)) g.DrawLine(pen, 0, 22, c.Width, 22);
+        g.DrawString(title, Bold, TxtB, 9, 4);
+    }
+
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int value, int size);
+    internal static void DarkTitle(IntPtr h)   // dark title bar (attribute 20) on Windows 10 20H1+ and 11; elsewhere the call fails and the bar stays light
+    {
+        int on = 1;
+        try { DwmSetWindowAttribute(h, 20, ref on, 4); } catch (DllNotFoundException) { } catch (EntryPointNotFoundException) { }
+    }
+    protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); DarkTitle(Handle); }
+
+    public MainForm()
+    {
+        Text = "MiniDAW"; ClientSize = new Size(1380, 800); MinimumSize = new Size(800, 600); Icon = Logo.Icon();
+        BackColor = AppBg; ForeColor = Txt; Font = new Font("Segoe UI", 9);
+        ToolStripManager.Renderer = new DarkMenus();
+        eng.Proj = Project.Demo();
+
+        var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(8, 7, 8, 7) };
+        playBtn = Btn(bar, "▶ Play", (s, e) => TogglePlay());
+        playBtn.BackColor = playBtn.FlatAppearance.BorderColor = On; playBtn.ForeColor = Color.FromArgb(28, 22, 14); playBtn.Font = Bold; playBtn.MinimumSize = new Size(76, 28);
+        playBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(255, 180, 100); playBtn.FlatAppearance.MouseDownBackColor = Color.FromArgb(230, 135, 40);
+        modeBtn = Btn(bar, "Mode: Pattern", (s, e) => { eng.SongMode = !eng.SongMode; modeBtn.Text = eng.SongMode ? "Mode: Song" : "Mode: Pattern"; });
+        modeBtn.MinimumSize = new Size(104, 28);   // same width in both modes, so the toolbar doesn't shift
+        bar.Controls.Add(Gap(Lbl("BPM"))); bar.Controls.Add(bpm);
+        bpm.Margin = new Padding(3, 5, 3, 3);
+        bpm.Controls[0].Visible = false;   // Windows draws the spin arrows light; the wheel and ↑/↓ still change the tempo
+        new ToolTip().SetToolTip(bpm, "Tempo: type it, scroll the wheel or press ↑/↓ · right-click: automate it");
+        bpm.ValueChanged += (s, e) => { if (!syncingBpm) Edit(() => { lock (P) P.Bpm = (int)bpm.Value; dirty = true; }); };
+        bpm.ContextMenuStrip = new ContextMenuStrip();   // right-click the BPM box: a tempo lane, like FL's tempo automation clip
+        bpm.ContextMenuStrip.Items.Add("Automate tempo", null, (s, e) => Edit(() => Automate(new Lane { Tempo = true })));
+        patBox.Margin = midiBox.Margin = new Padding(3, 5, 3, 3);
+        bar.Controls.Add(Gap(patBox));   // the list shows "Pattern 1"…, so it needs no label
+        patBox.SelectedIndexChanged += (s, e) => { eng.CurPattern = Math.Max(0, patBox.SelectedIndex); Changed(false); };
+        patBox.MouseUp += (s, e) => { if (e.Button == MouseButtons.Right) PatternMenu(); };
+        Btn(bar, "+ Pattern", (s, e) => Edit(() => { lock (P) P.Patterns.Add(new Pattern { Name = "Pattern " + (P.Patterns.Count + 1) }); RefreshAll(P.Patterns.Count - 1); dirty = true; }));
+        Button soundBtn = null;
+        soundBtn = Btn(bar, "+ Sound", (s, e) => SoundMenu(kind => AddChannel(new Channel { Kind = kind, Name = FreeName(Channel.Title(kind)) })).Show(soundBtn, 0, soundBtn.Height));
+        Gap(soundBtn);
+        Btn(bar, "+ Sample…", (s, e) => AddSample());
+        Gap(Btn(bar, "New", (s, e) => { if (ConfirmDiscard()) { ClearAutosave(); eng.Proj = Project.Demo(); filePath = null; hist.Clear(); RefreshAll(0); dirty = false; } }));
+        Button openBtn = null;
+        openBtn = Btn(bar, "Open…", (s, e) => OpenProject(openBtn));
+        Btn(bar, "Save…", (s, e) => SaveProject());
+        Btn(bar, "Export WAV…", (s, e) => ExportWav());
+        mixBtn = Gap(Btn(bar, "Mixer (F9)", (s, e) => ToggleMixer()));
+        mixBtn.MinimumSize = new Size(108, 28);   // fits "Piano roll (F9)" too, so the toolbar doesn't shift
+        midi = new MidiInput(eng.MidiIn);
+        bar.Controls.Add(Gap(midiBox));   // the keyboard plays the selected channel, like FL
+        midiBox.DropDown += (s, e) => FillMidi();   // re-list on open, so a keyboard plugged in later shows up
+        midiBox.SelectedIndexChanged += (s, e) => OpenMidi();
+        recBtn = Btn(bar, "● Rec", (s, e) => { EndEdit(); recording = !recording; recBtn.BackColor = recording ? Color.FromArgb(200, 52, 60) : Raised; });
+        updateBtn = Gap(Btn(bar, "Update", (s, e) => InstallUpdate()));   // shown only when GitHub has a newer release
+        updateBtn.BackColor = updateBtn.FlatAppearance.BorderColor = Color.FromArgb(46, 140, 82); updateBtn.Font = Bold; updateBtn.Visible = false;
+        updateBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(60, 165, 100);
+        var about = new PictureBox { Image = Logo.Draw(24), Size = new Size(28, 28), SizeMode = PictureBoxSizeMode.CenterImage, Cursor = Cursors.Hand, Margin = new Padding(14, 2, 0, 0) };
+        about.Click += (s, e) => ShowAbout();   // the banana at the end of the toolbar
+        new ToolTip().SetToolTip(about, "About MiniDAW (F1)");
+        bar.Controls.Add(about);
+
+        playlist.Dock = DockStyle.Bottom; playlist.Height = 220;
+        rack.Dock = DockStyle.Top;
+        roll.Dock = mixer.Dock = DockStyle.Fill;
+        mixer.Visible = false;   // mixer and piano roll share the middle area; F9 swaps them
+        Controls.Add(roll); Controls.Add(mixer); Controls.Add(playlist); Controls.Add(rack); Controls.Add(bar);   // dock order: last added docks first
+
+        // every click or drag is one undo step: the snapshot is taken before the panel's own MouseDown and closed after its own MouseUp
+        foreach (var c in new[] { rack, roll, playlist, mixer }) c.MouseDown += (s, e) => BeginEdit();
+        rack.Paint += PaintRack; rack.MouseDown += RackDown; rack.MouseMove += RackMove; rack.MouseUp += (s, e) => dragMode = null;
+        rack.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left && e.X >= 20 && e.X < 134 && e.Y >= Top0 && (e.Y - Top0) / Row < P.Channels.Count) ShowSoundSettings(); };
+        roll.Paint += PaintRoll; roll.MouseDown += RollDown; roll.MouseMove += RollMove;
+        roll.MouseUp += (s, e) => { dragNote = null; dragMode = null; if (boxFrom.HasValue) FinishBox(); if (moving != null) FinishMove(); };
+        playlist.Paint += PaintPlaylist; playlist.MouseDown += PlaylistDown; playlist.MouseMove += PlaylistMouse; playlist.MouseUp += (s, e) => FinishClipDrag();
+        mixer.Paint += PaintMixer; mixer.MouseDown += MixerDown; mixer.MouseMove += MixerMove;
+        mixer.MouseUp += (s, e) => { dragMode = null; dragFx = null; if (slotDragIns >= 0) FinishSlotDrag(e); };
+        foreach (var c in new[] { rack, roll, playlist, mixer }) c.MouseUp += (s, e) => EndEdit();
+
+        timer.Tick += (s, e) =>
+        {
+            int st = eng.PlayStep;
+            if (st != lastStep) { lastStep = st; rack.Invalidate(); roll.Invalidate(); playlist.Invalidate(); }
+            if (mixer.Visible) mixer.Invalidate();   // meters move every frame
+            string err = eng.LastError;
+            if (err != null) { eng.LastError = null; Text = "MiniDAW — audio error: " + err; }
+            eng.MidiTarget = selCh < P.Channels.Count ? P.Channels[selCh] : null;
+            if (!bpm.Focused && bpm.Value != P.Bpm)   // a tempo lane moved the tempo: show it, without that counting as an edit
+            {
+                syncingBpm = true; bpm.Value = Math.Max(bpm.Minimum, Math.Min(bpm.Maximum, P.Bpm)); syncingBpm = false;
+            }
+            KeyValuePair<int, double> ev;
+            while (eng.MidiRec.TryDequeue(out ev)) RecordMidi(ev.Key, ev.Value);
+        };
+        timer.Start();
+        autoTimer.Tick += (s, e) => Autosave(); autoTimer.Start();
+        Shown += (s, e) => { OfferRecovery(); CheckForUpdate(); };
+        foreach (var c in Descendants(this))   // drag-and-drop: every panel takes files, since a drop goes to the control under the mouse
+        {
+            c.AllowDrop = true;
+            c.DragEnter += (s, e) => e.Effect = Droppable(e.Data.GetData(DataFormats.FileDrop) as string[]) ? DragDropEffects.Copy : DragDropEffects.None;
+            c.DragDrop += (s, e) =>
+            {
+                var files = e.Data.GetData(DataFormats.FileDrop) as string[];
+                if (files != null) BeginInvoke((Action)(() => OpenFiles(files)));   // after the drop returns, so Explorer isn't held up by any dialog
+            };
+        }
+        FormClosing += (s, e) => { if (!ConfirmDiscard()) { e.Cancel = true; return; } if (!screenshotMode) ClearAutosave(); midi.Close(); eng.Stop(); };   // saved or knowingly discarded: nothing to recover
+        KeyPreview = true;   // the form sees letter keys before the focused control
+        KeyDown += (s, e) => PianoKey(e, true);
+        KeyUp += (s, e) => PianoKey(e, false);
+        Deactivate += (s, e) => ReleasePiano();
+        RefreshAll(0);
+        dirty = false;
+        string startErr = eng.Start();
+        if (startErr != null) MessageBox.Show(this, startErr + "\nThe editor works, but nothing will be heard.", "MiniDAW");
+        FillMidi();
+    }
+
+    readonly Button updateBtn; string updateTag;
+
+    void CheckForUpdate()   // once per start, in the background; offline or no release just means no Update button
+    {
+        if (screenshotMode || Updates.Repo == "") return;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            string tag = Updates.LatestTag();
+            if (tag == null || !Updates.Newer(tag, AboutForm.Version)) return;
+            try { BeginInvoke((Action)(() => { updateTag = tag; updateBtn.Text = "⬆ Update to " + tag.TrimStart('v', 'V'); updateBtn.Visible = true; })); }
+            catch (InvalidOperationException) { }   // the window closed while we were asking
+        });
+    }
+
+    void InstallUpdate()   // download the release's installer, then let it replace this copy and start the new one
+    {
+        string tag = updateTag, ver = tag.TrimStart('v', 'V');
+        if (MessageBox.Show(this, "MiniDAW " + ver + " is available (you have " + AboutForm.Version + ").\n\nDownload and install it now? MiniDAW closes for the install and opens again afterwards.",
+                "MiniDAW update", MessageBoxButtons.OKCancel, MessageBoxIcon.Information) != DialogResult.OK || !ConfirmDiscard()) return;
+        string file = Path.Combine(Path.GetTempPath(), "MiniDAW-Setup-" + ver + ".exe");
+        var wc = new System.Net.WebClient();
+        wc.Headers[System.Net.HttpRequestHeader.UserAgent] = "MiniDAW/" + AboutForm.Version;
+        updateBtn.Enabled = false; updateBtn.Text = "Downloading…";
+        wc.DownloadProgressChanged += (s, e) => updateBtn.Text = "Downloading " + e.ProgressPercentage + "%";
+        wc.DownloadFileCompleted += (s, e) =>
+        {
+            wc.Dispose();
+            if (e.Error != null || e.Cancelled)
+            {
+                updateBtn.Enabled = true; updateBtn.Text = "⬆ Update to " + ver;
+                MessageBox.Show(this, "The download didn't finish" + (e.Error != null ? ": " + e.Error.Message : ".") + "\nNothing was changed; try again later.", "MiniDAW update");
+                return;
+            }
+            System.Diagnostics.Process.Start(file, "/update");   // it waits for this window to close
+            dirty = false; Close();                              // the project was saved or knowingly discarded above
+        };
+        wc.DownloadFileAsync(new Uri(Updates.SetupUrl(tag)), file);
+    }
+
+    void FillMidi()   // (re)list MIDI inputs, keeping the current one; the first time, pick the first keyboard found
+    {
+        string keep = midiBox.SelectedIndex > 0 ? (string)midiBox.SelectedItem : null;
+        bool first = midiBox.Items.Count == 0;
+        midiBox.Items.Clear();
+        midiBox.Items.Add("(no MIDI input)");
+        foreach (var d in MidiInput.Devices()) midiBox.Items.Add(d);
+        int k = keep != null ? midiBox.Items.IndexOf(keep) : first && midiBox.Items.Count > 1 ? 1 : 0;
+        midiBox.SelectedIndex = Math.Max(0, k);
+    }
+
+    void OpenMidi()
+    {
+        midi.Close();
+        if (screenshotMode) return;   // a screenshot never takes a MIDI device away from a running MiniDAW
+        eng.MidiIn.Enqueue(0xB0 | 64 << 8);   // pedal up first, or the note-offs below would be held back
+        eng.MidiIn.Enqueue(0xE0 | 64 << 16);  // pitch wheel back to centre (8192)
+        eng.MidiIn.Enqueue(0xB0 | 1 << 8);    // mod wheel down: no vibrato
+        for (int k = 0; k < 128; k++) eng.MidiIn.Enqueue(0x80 | k << 8);   // release notes still held from the old device
+        if (midiBox.SelectedIndex <= 0) return;
+        string err = midi.Open(midiBox.SelectedIndex - 1);
+        if (err != null) { Text = "MiniDAW — " + err; midiBox.SelectedIndex = 0; }
+    }
+
+    // Rec on + playing in Pattern mode: keyboard notes land in the current pattern on the selected channel, snapped to the nearest 16th.
+    void RecordMidi(int msg, double pos)
+    {
+        int key = (msg >> 8) & 0x7F, step = (int)Math.Round(pos) % CurPat.Length;
+        var open = recNotes[key]; recNotes[key] = null;
+        if (open != null) open.Len = Math.Max(1, Math.Min(CurPat.Length - open.Step, (step - open.Step + CurPat.Length) % CurPat.Length));   // note-off sets the length
+        bool on = (msg & 0xF0) == 0x90 && (msg >> 16 & 0x7F) > 0;
+        if (on && recording && selCh < P.Channels.Count)
+        {
+            BeginEdit();   // a whole take is one undo step; it ends when playback or Rec stops
+            Note n;
+            lock (P)
+            {
+                var list = CurPat.For(selCh);
+                n = list.Find(x => x.Step == step && x.Key == key);
+                if (n == null) list.Add(n = new Note { Step = step, Key = key, Len = 1 });
+                n.Vel = msg >> 16 & 0x7F;   // how hard the key was hit
+            }
+            recNotes[key] = n;
+        }
+        if (open != null || on && recording) Changed();
+    }
+
+    static Label Lbl(string t) { return new Label { Text = t, AutoSize = true, Font = Small, ForeColor = Dim, Padding = new Padding(0, 9, 0, 0) }; }
+
+    static T Gap<T>(T c) where T : Control { c.Margin = new Padding(c.Margin.Left + 7, c.Margin.Top, c.Margin.Right, c.Margin.Bottom); return c; }   // space before a toolbar group
+
+    static Button Btn(Control parent, string t, EventHandler click)
+    {
+        var b = new Button { Text = t, AutoSize = true, FlatStyle = FlatStyle.Flat, BackColor = Raised, ForeColor = Txt, AutoSizeMode = AutoSizeMode.GrowAndShrink, MinimumSize = new Size(0, 28), Cursor = Cursors.Hand, Padding = new Padding(3, 0, 3, 0) };
+        b.FlatAppearance.BorderColor = Line; b.FlatAppearance.MouseOverBackColor = Color.FromArgb(56, 64, 78); b.FlatAppearance.MouseDownBackColor = Sel;
+        b.Click += click; parent.Controls.Add(b); return b;
+    }
+
+    // Computer keyboard as a piano, like FL's typing keyboard. Notes go through the MIDI path, so Rec records them too.
+    static readonly Keys[] PianoKeys = { Keys.Z, Keys.S, Keys.X, Keys.D, Keys.C, Keys.V, Keys.G, Keys.B, Keys.H, Keys.N, Keys.J, Keys.M,   // C4..B4
+        Keys.Q, Keys.D2, Keys.W, Keys.D3, Keys.E, Keys.R, Keys.D5, Keys.T, Keys.D6, Keys.Y, Keys.D7, Keys.U, Keys.I };                     // C5..C6
+    readonly int[] pianoHeld = Enumerable.Repeat(-1, PianoKeys.Length).ToArray();   // the note each held key started, -1 = up
+    const int MinOctave = -3, MaxOctave = 3;
+    int pianoOctave;   // - and = move the keyboard down and up; 0: Z = C4, Q = C5
+    int Lo { get { return 48 + 12 * pianoOctave; } }   // the piano roll shows 3 octaves from the keyboard's lowest note, so the view follows the octave shift
+    int Hi { get { return Lo + 36; } }
+
+    static int PianoMsg(Keys k, bool down, int[] held, int octave)   // MIDI message for a key press/release, or 0
+    {
+        int i = Array.IndexOf(PianoKeys, k);
+        if (i < 0 || (held[i] >= 0) == down) return 0;   // not a piano key, or Windows' auto-repeat of a key already held
+        int key = down ? 48 + 12 * octave + i : held[i];   // a release ends the note that press started, even if the octave moved meanwhile
+        held[i] = down ? key : -1;
+        return down ? 0x90 | key << 8 | 100 << 16 : 0x80 | key << 8;
+    }
+
+    static string NoteName(int key) { return new[] { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" }[key % 12] + key / 12; }   // FL naming: 60 = C5
+
+    void PianoKey(KeyEventArgs e, bool down)
+    {
+        bool octaveKey = e.KeyCode == Keys.OemMinus || e.KeyCode == Keys.Oemplus;
+        if (Array.IndexOf(PianoKeys, e.KeyCode) < 0 && !octaveKey) return;
+        if (down && (e.Modifiers != Keys.None || ActiveControl is NumericUpDown)) return;   // shortcuts and typing a BPM aren't notes
+        e.SuppressKeyPress = true;   // stops a focused drop-down from jumping to an item that starts with this letter
+        if (octaveKey)
+        {
+            if (down) { pianoOctave = Math.Max(MinOctave, Math.Min(MaxOctave, pianoOctave + (e.KeyCode == Keys.Oemplus ? 1 : -1))); roll.Invalidate(); }
+            return;
+        }
+        int m = PianoMsg(e.KeyCode, down, pianoHeld, pianoOctave);
+        if (m != 0) eng.MidiIn.Enqueue(m);
+    }
+
+    void ReleasePiano()   // the window lost focus, so key-ups will never arrive
+    {
+        foreach (var k in PianoKeys) { int m = PianoMsg(k, false, pianoHeld, pianoOctave); if (m != 0) eng.MidiIn.Enqueue(m); }
+    }
+
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (keyData == Keys.Space && !(ActiveControl is NumericUpDown)) { TogglePlay(); return true; }   // space = play/stop, like FL
+        if (keyData == Keys.F9) { ToggleMixer(); return true; }
+        if (keyData == Keys.F1) { ShowAbout(); return true; }
+        if (keyData == (Keys.Control | Keys.Z)) { UndoRedo(false); return true; }
+        if (keyData == (Keys.Control | Keys.Y) || keyData == (Keys.Control | Keys.Shift | Keys.Z)) { UndoRedo(true); return true; }
+        if (!(ActiveControl is NumericUpDown) && P.Channels.Count > 0)   // note editing; the BPM box keeps its own text keys
+        {
+            if (keyData == (Keys.Control | Keys.A)) { sel = CurPat.For(selCh).ToList(); roll.Invalidate(); return true; }
+            if (keyData == (Keys.Control | Keys.C) || keyData == (Keys.Control | Keys.X)) { CopyNotes(keyData == (Keys.Control | Keys.X)); return true; }
+            if (keyData == (Keys.Control | Keys.V) || keyData == (Keys.Control | Keys.B)) { PasteNotes(keyData == (Keys.Control | Keys.B)); return true; }
+            if (keyData == Keys.Delete) { DeleteNotes(); return true; }
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
+    void TogglePlay() { EndEdit(); eng.Playing = !eng.Playing; playBtn.Text = eng.Playing ? "■ Stop" : "▶ Play"; }   // ends a recording take's undo step
+
+    void ShowAbout() { using (var a = new AboutForm(false)) a.ShowDialog(this); }
+
+    // ---- autosave: every minute, unsaved work is copied to %APPDATA%\MiniDAW\autosave.mdaw. Saving, discarding or closing
+    // normally deletes it, so finding one at start-up means the last session ended abruptly, and it's offered back.
+    public static string AutosavePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MiniDAW", "autosave.mdaw");
+    readonly System.Windows.Forms.Timer autoTimer = new System.Windows.Forms.Timer { Interval = 60 * 1000 };
+    string lastAutosave;   // what was last written, so an unchanged project isn't written again
+
+    void Autosave()
+    {
+        if (!dirty) return;
+        var lines = P.Lines();
+        lines.Add("origin\t" + (filePath ?? ""));   // where it came from; Project.Parse skips line types it doesn't know
+        string text = string.Join("\r\n", lines);
+        if (text == lastAutosave) return;
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(AutosavePath));
+            string tmp = AutosavePath + ".tmp";   // write aside, then swap in, so a crash mid-write can't spoil the last good autosave
+            File.WriteAllText(tmp, text);
+            if (File.Exists(AutosavePath)) File.Replace(tmp, AutosavePath, null); else File.Move(tmp, AutosavePath);
+            lastAutosave = text;
+        }
+        catch (Exception) { }   // a safety net: a failed autosave must never interrupt the music
+    }
+
+    void ClearAutosave() { lastAutosave = null; try { File.Delete(AutosavePath); } catch (Exception) { } }
+
+    void OfferRecovery()
+    {
+        if (screenshotMode || !File.Exists(AutosavePath)) return;
+        string when = File.GetLastWriteTime(AutosavePath).ToString("HH:mm 'on' d MMM", CultureInfo.InvariantCulture);
+        var r = MessageBox.Show(this, "MiniDAW didn't close normally last time.\n\nRecover the unsaved work autosaved at " + when + "?",
+                                "MiniDAW", MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+        if (r != DialogResult.Yes) { ClearAutosave(); return; }
+        try { LoadRecovered(); }
+        catch (Exception e) { MessageBox.Show(this, "The autosave couldn't be read:\n" + e.Message, "MiniDAW"); ClearAutosave(); }
+    }
+
+    void LoadRecovered()   // the autosave becomes the current, unsaved project; the file stays until that work is saved or discarded
+    {
+        var lines = File.ReadAllLines(AutosavePath);
+        var p = Project.Parse(lines, null);
+        string origin = lines.Where(l => l.StartsWith("origin\t")).Select(l => l.Substring(7)).FirstOrDefault();
+        eng.Proj = p; filePath = string.IsNullOrEmpty(origin) ? null : origin; hist.Clear();
+        RefreshAll(0); dirty = true;
+        Text = "MiniDAW — " + (filePath != null ? Path.GetFileName(filePath) : "untitled") + " (recovered)";
+    }
+
+    string Snap() { return string.Join("\n", P.Lines()); }
+    void BeginEdit() { hist.Begin(Snap); }
+    void EndEdit() { hist.End(Snap); }
+    void Edit(Action a) { BeginEdit(); a(); EndEdit(); }
+
+    void UndoRedo(bool redo)
+    {
+        string s = redo ? hist.Redo(Snap) : hist.Undo(Snap);
+        if (s == null) return;
+        eng.Proj = Project.Parse(s.Split('\n'), P);   // our own snapshot, so it parses; samples come from memory
+        RefreshAll(patBox.SelectedIndex);
+        dirty = true;
+    }
+
+    void Changed(bool edit = true)
+    {
+        if (edit) dirty = true;
+        rack.Invalidate(); roll.Invalidate(); playlist.Invalidate(); mixer.Invalidate();
+        if (soundWin != null && !soundWin.IsDisposed) soundWin.view.Invalidate();   // it follows the selected channel, and undo
+    }
+
+    // ---- sound settings window: the selected channel's knobs, like FL's channel settings. Double-click a channel name to open it.
+    SoundWindow soundWin;
+
+    void ShowSoundSettings()
+    {
+        if (P.Channels.Count == 0) return;
+        if (soundWin == null || soundWin.IsDisposed) { soundWin = new SoundWindow(this); soundWin.Show(this); }
+        else soundWin.Activate();
+        soundWin.view.Invalidate();
+    }
+
+    class SoundWindow : Form
+    {
+        const int BarsTop = 30, RowH = 30, BarX = 12, BarW = 296;
+        readonly MainForm m;
+        public readonly Canvas view = new Canvas();
+        int drag = -1;
+
+        public SoundWindow(MainForm main)
+        {
+            m = main;
+            FormBorderStyle = FormBorderStyle.FixedToolWindow; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(BarX * 2 + BarW, BarsTop + 4 * RowH + 6); Font = main.Font;
+            view.Dock = DockStyle.Fill; Controls.Add(view);
+            view.Paint += PaintView;
+            view.MouseDown += (s, e) =>
+            {
+                var c = Ch(); if (c == null || e.Y < BarsTop) return;
+                var shown = c.KnobsShown(); int r = (e.Y - BarsTop) / RowH;
+                if (r >= shown.Length) return;
+                if (e.Button == MouseButtons.Right) { int k = shown[r]; m.Edit(() => m.AutomateKnob(m.P.Channels.IndexOf(c), k)); return; }   // a lane for it, over the playlist
+                if (e.Button != MouseButtons.Left) return;
+                m.BeginEdit(); drag = shown[r]; Set(e);   // one drag = one undo step
+            };
+            view.MouseMove += (s, e) => { if (drag >= 0 && e.Button == MouseButtons.Left) Set(e); };
+            view.MouseUp += (s, e) => { if (drag >= 0) { drag = -1; m.EndEdit(); } };
+            HandleCreated += (s, e) => DarkTitle(Handle);
+            KeyPreview = true;   // keep the computer-keyboard piano playing while this window has focus
+            KeyDown += (s, e) => m.PianoKey(e, true);
+            KeyUp += (s, e) => m.PianoKey(e, false);
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData) { return m.ProcessCmdKey(ref msg, keyData); }   // Space, F9, Ctrl+Z… work here too
+
+        Channel Ch() { var ch = m.P.Channels; return ch.Count == 0 ? null : ch[Math.Max(0, Math.Min(m.selCh, ch.Count - 1))]; }
+
+        void Set(MouseEventArgs e)
+        {
+            var c = Ch(); if (c == null) return;
+            if (c.Knob == null) c.Knob = (float[])Channel.BuiltIn(c.Kind).Clone();
+            c.Knob[drag] = Clamp01((e.X - BarX) / (float)BarW);   // the audio thread reads it on its next sample
+            m.dirty = true; view.Invalidate();
+        }
+
+        void PaintView(object sender, PaintEventArgs e)
+        {
+            var g = e.Graphics; var c = Ch();
+            if (c == null) return;
+            Text = c.Name + " — sound settings";
+            g.DrawString(Channel.Title(c.Kind) + "  ·  drag a bar · right-click: automate it in the playlist", Small, DimB, BarX, 9);
+            var shown = c.KnobsShown();
+            for (int r = 0; r < shown.Length; r++)
+            {
+                float y = BarsTop + r * RowH;
+                ValueBar(g, BarX, y, BarW, RowH - 8, 0, c.K(shown[r]), DeepBlue);
+                g.DrawString(c.KnobLabel(shown[r]), Font, TxtB, new RectangleF(BarX + 8, y, BarW - 12, RowH - 8), Fit);
+            }
+        }
+    }
+
+    void RefreshAll(int pattern)
+    {
+        patBox.Items.Clear();
+        foreach (var p in P.Patterns) patBox.Items.Add(p.Name + (p.Bars > 1 ? "  (" + p.Bars + " bars)" : ""));
+        patBox.SelectedIndex = Math.Min(pattern, P.Patterns.Count - 1);
+        bpm.Value = Math.Max(bpm.Minimum, Math.Min(bpm.Maximum, P.Bpm));
+        selCh = Math.Max(0, Math.Min(selCh, P.Channels.Count - 1));
+        if (selLane >= P.Automation.Count) selLane = -1;   // New/Open may bring fewer lanes
+        rack.Height = Top0 + Math.Max(1, P.Channels.Count) * Row + 6;
+        Changed(false);
+    }
+
+    Pattern CurPat { get { return P.Patterns[Math.Max(0, Math.Min(patBox.SelectedIndex, P.Patterns.Count - 1))]; } }
+
+    void AddChannel(Channel c) { Edit(() => AddChannel1(c)); }
+
+    void AddChannel1(Channel c)
+    {
+        c.Insert = Math.Min(P.Channels.Count + 1, Project.Inserts - 1);
+        lock (P) P.Channels.Add(c);
+        selCh = P.Channels.Count - 1;
+        RefreshAll(patBox.SelectedIndex);
+        dirty = true;
+    }
+
+    static IEnumerable<Control> Descendants(Control root) { yield return root; foreach (Control c in root.Controls) foreach (var d in Descendants(c)) yield return d; }
+
+    static bool IsExt(string path, string ext) { return path.EndsWith(ext, StringComparison.OrdinalIgnoreCase); }
+    static bool Droppable(string[] files) { return files != null && files.Any(f => IsExt(f, ".wav") || IsExt(f, ".mdaw")); }
+
+    // Files dropped on the window or handed to MiniDAW.exe: a project opens (the first one, if several); otherwise each WAV
+    // becomes a sample channel, all in one undo step. Other files are ignored.
+    void OpenFiles(string[] files)
+    {
+        var project = files.FirstOrDefault(f => IsExt(f, ".mdaw"));
+        if (project != null) { if (ConfirmDiscard()) OpenPath(project); return; }
+        var failed = new List<string>();
+        Edit(() =>
+        {
+            foreach (var path in files.Where(f => IsExt(f, ".wav")))
+            {
+                var c = new Channel { Kind = "sample", Name = FreeName(Path.GetFileNameWithoutExtension(path)) };
+                try { Wav.Load(path, c); }
+                catch (Exception e) { failed.Add(Path.GetFileName(path) + ": " + e.Message); continue; }
+                AddChannel1(c);
+            }
+        });
+        if (failed.Count > 0) MessageBox.Show(this, "Could not load:\n" + string.Join("\n", failed), "MiniDAW");
+    }
+
+    void AddSample()
+    {
+        using (var d = new OpenFileDialog { Filter = "WAV audio (*.wav)|*.wav" })
+        {
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            var c = new Channel { Kind = "sample", Name = Path.GetFileNameWithoutExtension(d.FileName) };
+            try { Wav.Load(d.FileName, c); }
+            catch (Exception e) { MessageBox.Show(this, "Could not load " + d.FileName + ":\n" + e.Message, "MiniDAW"); return; }
+            AddChannel(c);
+        }
+    }
+
+    bool ConfirmDiscard()
+    {
+        if (!dirty) return true;
+        var r = MessageBox.Show(this, "Save changes to the current project?", "MiniDAW", MessageBoxButtons.YesNoCancel);
+        if (r == DialogResult.Cancel) return false;
+        return r == DialogResult.No || SaveProject();
+    }
+
+    bool SaveProject()
+    {
+        using (var d = new SaveFileDialog { Filter = "MiniDAW project (*.mdaw)|*.mdaw", FileName = filePath ?? "song.mdaw" })
+        {
+            if (d.ShowDialog(this) != DialogResult.OK) return false;
+            try { lock (P) P.Save(d.FileName); }
+            catch (Exception e) { MessageBox.Show(this, "Save failed:\n" + e.Message, "MiniDAW"); return false; }
+            filePath = d.FileName; dirty = false; Text = "MiniDAW — " + Path.GetFileName(filePath);
+            Recent.Add(filePath); ClearAutosave();
+            return true;
+        }
+    }
+
+    void ExportWav()   // exports what Play would play: the whole song in Song mode, the current pattern in Pattern mode
+    {
+        string name = Path.GetFileNameWithoutExtension(filePath ?? "song") + ".wav";
+        using (var d = new SaveFileDialog { Filter = "WAV audio (*.wav)|*.wav", FileName = name })
+        {
+            if (d.ShowDialog(this) != DialogResult.OK) return;
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                var lr = Engine.Bounce(P.ExportCopy(), eng.SongMode, eng.CurPattern);
+                File.WriteAllBytes(d.FileName, Wav.Make16(lr, Engine.SR, 2));
+                MessageBox.Show(this, "Exported " + (eng.SongMode ? "the song" : "the pattern") + " (" + (lr.Length / 2.0 / Engine.SR).ToString("0.0")
+                    + " s, 44.1 kHz 16-bit stereo) to\n" + d.FileName, "MiniDAW");
+            }
+            catch (Exception ex) { MessageBox.Show(this, "Export failed:\n" + ex.Message, "MiniDAW"); }
+            finally { Cursor = Cursors.Default; }
+        }
+    }
+
+    void OpenProject(Control anchor)   // the Open… button: recent projects first (if any), then Browse…
+    {
+        var recent = Recent.Load().Where(File.Exists).ToList();   // files moved or deleted since are left out
+        if (recent.Count == 0) { BrowseProject(); return; }
+        var m = new ContextMenuStrip { ShowItemToolTips = true };
+        foreach (var path in recent)
+        {
+            string pth = path;   // foreach variables are shared between iterations in C# 5
+            var item = m.Items.Add(Path.GetFileNameWithoutExtension(pth) + "   —   " + Path.GetFileName(Path.GetDirectoryName(pth)), null, (s, e) => { if (ConfirmDiscard()) OpenPath(pth); });
+            item.ToolTipText = pth;
+        }
+        m.Items.Add(new ToolStripSeparator());
+        m.Items.Add("Browse…", null, (s, e) => BrowseProject());
+        m.Show(anchor, 0, anchor.Height);
+    }
+
+    void BrowseProject()
+    {
+        if (!ConfirmDiscard()) return;
+        using (var d = new OpenFileDialog { Filter = "MiniDAW project (*.mdaw)|*.mdaw" })
+            if (d.ShowDialog(this) == DialogResult.OK) OpenPath(d.FileName);
+    }
+
+    void OpenPath(string path)   // unsaved changes were already confirmed by the caller
+    {
+        Project p;
+        try { p = Project.Load(path); }
+        catch (Exception e)
+        {
+            MessageBox.Show(this, "Could not open project:\n" + e.Message, "MiniDAW");
+            if (!File.Exists(path)) Recent.Remove(path);   // gone: stop offering it
+            return;
+        }
+        eng.Proj = p; filePath = path; Text = "MiniDAW — " + Path.GetFileName(filePath); hist.Clear();
+        RefreshAll(0); dirty = false; ClearAutosave();
+        Recent.Add(path);
+        if (p.Warnings.Count > 0) MessageBox.Show(this, "Some samples could not be loaded:\n" + string.Join("\n", p.Warnings), "MiniDAW");
+    }
+
+    // ---- channel rack: [mute] [name] [vol] [pan] [16 steps]
+    void PaintRack(object sender, PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        Header(g, rack, "CHANNEL RACK");
+        g.DrawString("dot = mute · name: click = piano roll, double-click = sound settings, right-click = menu · vol / pan: drag, right-click = automate · box = mixer insert (click +1, right-click −1) · click steps", Small, DimB, 120, 5);
+        float swx = rack.Width - SwingW - 10;   // swing bar, top right, like FL's swing knob on the channel rack
+        ValueBar(g, swx, 4, SwingW, 15, 0, P.Swing, DeepBlue);
+        g.DrawString("Swing  " + (int)Math.Round(P.Swing * 100) + "%", Small, TxtB, swx + 6, 5);
+        var pat = CurPat; int ps = eng.PlayStep;
+        for (int i = 0; i < P.Channels.Count; i++)
+        {
+            var c = P.Channels[i]; int y = Top0 + i * Row;
+            Led(g, 6, y + 8, 10, !c.Mute);
+            Round(g, i == selCh ? Sel : Raised, 22, y + 2, 110, Row - 4, 4);
+            if (i == selCh) Round(g, On, 22, y + 2, 3, Row - 4, 1.5f);   // the channel the piano roll shows
+            g.DrawString(c.Name, Font, TxtB, new RectangleF(30, y + 2, 100, Row - 4), Fit);
+            ValueBar(g, 136, y + 10, 60, 6, 0, c.Vol, On);
+            float pan = 0.5f + c.Pan / 2;
+            ValueBar(g, 202, y + 10, 40, 6, Math.Min(0.5f, pan), Math.Max(0.5f, pan), Blue);
+            using (var pen = new Pen(Dim)) g.DrawLine(pen, 222, y + 7, 222, y + 18);   // centre mark
+            Round(g, Raised, 248, y + 4, 28, Row - 8, 4);
+            g.DrawString(c.Insert == 0 ? "M" : c.Insert.ToString(), Small, c.Insert == 0 ? DimB : TxtB, new RectangleF(248, y + 4, 28, Row - 8), Mid);
+            var notes = pat.For(i);
+            float sw = StepW();
+            for (int s = 0; s < pat.Length; s++)
+            {
+                bool on = notes.Any(n => n.Step == s), now = ps >= 0 && ps % pat.Length == s;
+                var col = on ? (now ? Color.FromArgb(255, 205, 150) : On) : now ? Color.FromArgb(84, 94, 112) : s / 4 % 2 == 0 ? Cell2 : Cell1;
+                float gap = s % Project.Steps == Project.Steps - 1 && s < pat.Length - 1 ? sw * 0.4f : Math.Max(2, sw * 0.15f);   // wider gap between bars
+                float px = RackX + s * sw, pw = sw - gap;
+                Round(g, col, px, y + 2, pw, Row - 4, 3);
+                if (on) Round(g, Color.FromArgb(70, 255, 255, 255), px + 2, y + 3, pw - 4, 5, 2);   // a little shine on lit pads
+            }
+        }
+    }
+
+    float StepW() { return Math.Min(Cell, (rack.Width - RackX - 6) / (float)CurPat.Length); }   // 1-bar patterns keep full-size steps; longer ones shrink to fit
+
+    void RackMove(object sender, MouseEventArgs e)
+    {
+        if (dragMode == "swing" && e.Button == MouseButtons.Left) { P.Swing = Clamp01((e.X - (rack.Width - SwingW - 10)) / (float)SwingW); Changed(); return; }
+        if (dragMode == null || e.Button != MouseButtons.Left || dragCh >= P.Channels.Count) return;
+        var c = P.Channels[dragCh];
+        if (dragMode == "vol") c.Vol = Math.Max(0, Math.Min(1, (e.X - 136) / 60f));
+        else c.Pan = Math.Max(-1, Math.Min(1, (e.X - 222) / 20f));
+        Changed();
+    }
+
+    void RackDown(object sender, MouseEventArgs e)
+    {
+        if (e.Y < Top0)   // header: only the swing bar is clickable
+        {
+            if (e.Button == MouseButtons.Left && e.X >= rack.Width - SwingW - 10) { dragMode = "swing"; RackMove(sender, e); }
+            return;
+        }
+        int i = (e.Y - Top0) / Row;
+        if (i >= P.Channels.Count) return;
+        var c = P.Channels[i];
+        if (e.X >= 246 && e.X < RackX)   // insert box: left click +1, right click -1
+        {
+            c.Insert = (c.Insert + (e.Button == MouseButtons.Right ? -1 : 1) + Project.Inserts) % Project.Inserts;
+            Changed(); return;
+        }
+        if (e.Button == MouseButtons.Right && e.X >= 20 && e.X < 134) { ChannelMenu(c, e.Location); return; }
+        if (e.Button == MouseButtons.Right && e.X >= 134 && e.X < 246) { AutomateKnob(i, e.X < 198 ? Channel.LaneVol : Channel.LanePan); return; }   // volume / pan bar: a lane for it
+        if (e.Button != MouseButtons.Left) return;
+        if (e.X < 20) c.Mute = !c.Mute;
+        else if (e.X < 134) { selCh = i; if (mixer.Visible) ToggleMixer(); }
+        else if (e.X < 198) { dragMode = "vol"; dragCh = i; c.Vol = Math.Max(0, Math.Min(1, (e.X - 136) / 60f)); }
+        else if (e.X < 246) { dragMode = "pan"; dragCh = i; c.Pan = Math.Max(-1, Math.Min(1, (e.X - 222) / 20f)); }
+        else
+        {
+            int s = (int)Math.Floor((e.X - RackX) / StepW());
+            if (s < 0 || s >= CurPat.Length) return;
+            lock (P)
+            {
+                var notes = CurPat.For(i);
+                if (notes.RemoveAll(n => n.Step == s) == 0) notes.Add(new Note { Step = s, Key = 60, Len = 1 });
+            }
+        }
+        Changed();
+    }
+
+    static ContextMenuStrip SoundMenu(Action<string> pick)   // the built-in sounds: synths, a separator, then drums
+    {
+        var m = new ContextMenuStrip();
+        foreach (var kind in Channel.Sounds)
+        {
+            if (kind == "kick") m.Items.Add(new ToolStripSeparator());
+            string k = kind;   // foreach variables are shared between iterations in C# 5
+            m.Items.Add(Channel.Title(k), null, (s, e) => pick(k));
+        }
+        return m;
+    }
+
+    string FreeName(string title)   // "Pluck", then "Pluck 2", "Pluck 3"...
+    {
+        string n = title;
+        for (int i = 2; P.Channels.Any(c => c.Name == n); i++) n = title + " " + i;
+        return n;
+    }
+
+    void SetSound(Channel c, string kind)   // switch a channel to another built-in sound; a name that was just the old sound's title follows along
+    {
+        if (!P.Channels.Contains(c) || c.Kind == kind) return;
+        Edit(() =>
+        {
+            if (c.Name == Channel.Title(c.Kind)) c.Name = FreeName(Channel.Title(kind));
+            c.Kind = kind; c.Sample = null; c.SampleR = null; c.SamplePath = null; c.Knob = null;   // the new sound starts from its own built-in settings
+            dirty = true; Changed();
+        });
+    }
+
+    void ChannelMenu(Channel c, Point at)   // right-click a channel name, like FL's channel menu
+    {
+        var m = new ContextMenuStrip();
+        var sound = new ToolStripMenuItem("Sound");
+        foreach (ToolStripItem it in SoundMenu(kind => SetSound(c, kind)).Items.Cast<ToolStripItem>().ToList())
+        {
+            var mi = it as ToolStripMenuItem;
+            if (mi != null) mi.Checked = mi.Text == Channel.Title(c.Kind);
+            sound.DropDownItems.Add(it);
+        }
+        m.Items.Add(sound);
+        m.Items.Add("Sound settings…", null, (s, e) => { int i = P.Channels.IndexOf(c); if (i >= 0) { selCh = i; Changed(false); ShowSoundSettings(); } });
+        m.Items.Add("Rename…", null, (s, e) =>
+        {
+            string n = Prompt("Rename channel", c.Name);
+            if (n != null && P.Channels.Contains(c)) Edit(() => { c.Name = n; dirty = true; Changed(); });
+        });
+        m.Items.Add("Delete channel", null, (s, e) =>
+        {
+            int i = P.Channels.IndexOf(c);
+            if (i < 0) return;   // the project was replaced (undo, open) since the menu opened
+            Edit(() => { lock (P) P.RemoveChannel(i); RefreshAll(patBox.SelectedIndex); dirty = true; });
+        }).Enabled = P.Channels.Count > 1;   // keep one channel so the piano roll always has something to edit
+        m.Show(rack, at);
+    }
+
+    void PatternMenu()   // right-click the pattern list
+    {
+        var m = new ContextMenuStrip(); int k = Math.Max(0, patBox.SelectedIndex);
+        m.Items.Add("Rename pattern…", null, (s, e) =>
+        {
+            string n = Prompt("Rename pattern", P.Patterns[k].Name);
+            if (n != null && k < P.Patterns.Count) Edit(() => { P.Patterns[k].Name = n; RefreshAll(k); dirty = true; });
+        });
+        m.Items.Add("Delete pattern", null, (s, e) =>
+        {
+            if (k < P.Patterns.Count) Edit(() => { lock (P) P.RemovePattern(k); RefreshAll(Math.Min(k, P.Patterns.Count - 1)); dirty = true; });
+        }).Enabled = P.Patterns.Count > 1;
+        m.Items.Add(new ToolStripSeparator());
+        for (int bars = 1; bars <= Pattern.MaxBars; bars++)   // pattern length
+        {
+            int nb = bars;   // C# 5 shares a for variable between iterations, so copy it for the lambda
+            var item = (ToolStripMenuItem)m.Items.Add(nb == 1 ? "1 bar" : nb + " bars", null, (s, e) =>
+            {
+                if (k < P.Patterns.Count && P.Patterns[k].Bars != nb) Edit(() => { lock (P) P.Patterns[k].SetBars(nb); RefreshAll(k); dirty = true; });
+            });
+            item.Checked = P.Patterns[k].Bars == nb;
+        }
+        m.Show(patBox, 0, patBox.Height);
+    }
+
+    string Prompt(string title, string value)   // small text-input dialog; null = cancelled or empty
+    {
+        using (var f = new Form { Text = title, FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false,
+                                  StartPosition = FormStartPosition.CenterParent, ClientSize = new Size(300, 72), ShowInTaskbar = false })
+        {
+            f.BackColor = PanelBg; f.ForeColor = Txt; f.HandleCreated += (s, e) => DarkTitle(f.Handle);
+            var t = new TextBox { Text = value, Left = 10, Top = 10, Width = 280, BackColor = Well, ForeColor = Txt, BorderStyle = BorderStyle.FixedSingle };
+            var ok = Btn(f, "OK", null); ok.DialogResult = DialogResult.OK; ok.AutoSize = false; ok.SetBounds(134, 40, 75, 26);
+            var cancel = Btn(f, "Cancel", null); cancel.DialogResult = DialogResult.Cancel; cancel.AutoSize = false; cancel.SetBounds(215, 40, 75, 26);
+            f.Controls.Add(t);
+            f.AcceptButton = ok; f.CancelButton = cancel;
+            return f.ShowDialog(this) == DialogResult.OK && t.Text.Trim() != "" ? t.Text.Trim() : null;
+        }
+    }
+
+    // ---- piano roll for the selected channel
+    void PaintRoll(object sender, PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        string name = P.Channels.Count > 0 ? P.Channels[selCh].Name : "";
+        int nsel = P.Channels.Count > 0 ? Selected().Count : 0;
+        Header(g, roll, "PIANO ROLL — " + name + (nsel > 0 ? "  (" + nsel + " selected)" : ""));
+        g.DrawString("click: add / remove note · drag a note: move · drag its right edge: length · VEL lane: velocity · right-drag: select · Ctrl+A / C / X / V, Ctrl+B duplicate, Del",
+            Small, DimB, 300, 5);
+        int lowKey = 48 + 12 * pianoOctave;   // the computer keyboard's current range, right-aligned in the header
+        string keysHint = "keys Z–M, Q–I play " + NoteName(lowKey) + "–" + NoteName(lowKey + 24) + "  (− / = shift the octave and this view)";
+        g.DrawString(keysHint, Small, TxtB, roll.Width - g.MeasureString(keysHint, Small).Width - 8, 5);
+        if (P.Channels.Count == 0) return;
+        float rh = (roll.Height - Top0 - VelH) / (float)(Hi - Lo), cw = (roll.Width - KeyW) / (float)CurPat.Length, vy = roll.Height - VelH;
+        using (var ivory = new SolidBrush(Color.FromArgb(222, 225, 231))) g.FillRectangle(ivory, 0, Top0, KeyW - 2, vy - Top0);   // white keys behind every row
+        using (var seam = new Pen(Color.FromArgb(150, 156, 168)))
+        using (var octave = new Pen(Color.FromArgb(48, 55, 67)))
+            for (int r = 0; r < Hi - Lo; r++)
+            {
+                int key = Hi - 1 - r; bool black = "010100101010"[key % 12] == '1';
+                float y = Top0 + r * rh;
+                using (var b = new SolidBrush(black ? Color.FromArgb(24, 27, 33) : Color.FromArgb(31, 35, 42))) g.FillRectangle(b, KeyW, y, roll.Width, rh);
+                if (black) { g.DrawLine(seam, 0, y + rh / 2, KeyW - 2, y + rh / 2); Round(g, Color.FromArgb(26, 28, 33), 0, y, (KeyW - 2) * 0.62f, rh, 2); }   // a short black key over the seam of two white ones
+                else if (key % 12 == 0 || key % 12 == 5) g.DrawLine(seam, 0, y + rh, KeyW - 2, y + rh);   // B|C and E|F: white keys side by side
+                if (key % 12 == 0)
+                {
+                    g.DrawLine(octave, KeyW, y + rh, roll.Width, y + rh);
+                    g.DrawString("C" + (key / 12), Small, Brushes.DimGray, new RectangleF(0, y + rh / 2 - 8, KeyW - 4, 16), new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center });   // FL naming: MIDI 60 = C5
+                }
+            }
+        using (var b = new SolidBrush(Color.FromArgb(22, 25, 30))) g.FillRectangle(b, 0, vy, roll.Width, VelH);   // velocity lane
+        using (var pen = new Pen(AppBg)) g.DrawLine(pen, 0, vy, roll.Width, vy);
+        g.DrawString("VEL", Small, DimB, 6, vy + VelH / 2 - 7);
+        for (int s = 0; s <= CurPat.Length; s++)
+            using (var pen = new Pen(s % Project.Steps == 0 ? Color.FromArgb(78, 87, 103) : s % 4 == 0 ? Color.FromArgb(50, 57, 69) : Color.FromArgb(37, 42, 51)))
+                g.DrawLine(pen, KeyW + s * cw, Top0, KeyW + s * cw, roll.Height);
+        int ps = eng.PlayStep;
+        if (ps >= 0) using (var b = new SolidBrush(Color.FromArgb(34, On))) g.FillRectangle(b, KeyW + (ps % CurPat.Length) * cw, Top0, cw, roll.Height);
+        var keepAa = g.SmoothingMode;
+        foreach (var n in CurPat.For(selCh))
+        {
+            var col = Color.FromArgb(70 + 185 * n.Vel / 127, On);   // softer notes are drawn fainter
+            float bh = n.Vel / 127f * (VelH - 8), vx = KeyW + n.Step * cw + Math.Min(6, cw / 2);   // velocity: a stem with a knob on top
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var pen = new Pen(col, 2)) g.DrawLine(pen, vx, roll.Height - 4, vx, roll.Height - 4 - bh);
+            using (var b = new SolidBrush(col)) g.FillEllipse(b, vx - 3.5f, roll.Height - 7.5f - bh, 7, 7);
+            g.SmoothingMode = keepAa;
+            if (n.Key < Lo || n.Key >= Hi) continue;
+            var rc = new RectangleF(KeyW + n.Step * cw + 1, Top0 + (Hi - 1 - n.Key) * rh + 0.5f, n.Len * cw - 2, rh - 1);
+            Round(g, col, rc.X, rc.Y, rc.Width, rc.Height, 2.5f);
+            RoundEdge(g, sel.Contains(n) ? Color.White : Color.FromArgb(150, 120, 60, 10), sel.Contains(n) ? 1.5f : 1, rc, 2.5f);
+        }
+        if (boxFrom.HasValue)
+        {
+            using (var b = new SolidBrush(Color.FromArgb(30, Blue))) g.FillRectangle(b, BoxRect());
+            using (var pen = new Pen(Blue) { DashStyle = DashStyle.Dash }) g.DrawRectangle(pen, BoxRect());
+        }
+    }
+
+    Rectangle BoxRect() { Point a = boxFrom.Value, b = boxTo.Value; return Rectangle.FromLTRB(Math.Min(a.X, b.X), Math.Min(a.Y, b.Y), Math.Max(a.X, b.X), Math.Max(a.Y, b.Y)); }
+
+    void FinishBox()   // notes the box touches become the selection; a right-click without a drag clears it
+    {
+        RectangleF r = BoxRect(); boxFrom = boxTo = null;
+        float rh = (roll.Height - Top0 - VelH) / (float)(Hi - Lo), cw = (roll.Width - KeyW) / (float)CurPat.Length;
+        sel = r.Width < 3 && r.Height < 3 ? new List<Note>()
+            : CurPat.For(selCh).Where(n => new RectangleF(KeyW + n.Step * cw, Top0 + (Hi - 1 - n.Key) * rh, n.Len * cw, rh).IntersectsWith(r)).ToList();
+        roll.Invalidate();
+    }
+
+    List<Note> Selected() { var list = CurPat.For(selCh); return sel.Where(list.Contains).ToList(); }   // skips notes an undo or a pattern/channel switch left behind
+
+    void CopyNotes(bool cut)   // Ctrl+C / Ctrl+X: the selection, or the channel's whole pattern when nothing is selected
+    {
+        var src = Selected();
+        if (src.Count == 0) src = CurPat.For(selCh).ToList();
+        if (src.Count == 0) return;
+        clip = src.Select(n => new Note { Step = n.Step, Key = n.Key, Len = n.Len, Vel = n.Vel }).ToList();
+        if (cut) Edit(() => { lock (P) CurPat.For(selCh).RemoveAll(src.Contains); sel.Clear(); Changed(); });
+    }
+
+    // Ctrl+V: at the copied steps, onto the selected channel and pattern (moved left by whole bars if it would all land past the end).
+    // Ctrl+B: duplicate the selection (or the whole channel) right after itself.
+    void PasteNotes(bool duplicate)
+    {
+        var src = duplicate ? Selected() : clip;
+        if (duplicate && src.Count == 0) src = CurPat.For(selCh).ToList();
+        if (src.Count == 0) return;
+        int first = src.Min(n => n.Step);
+        int off = duplicate ? Pattern.DupOffset(src) : first >= CurPat.Length ? -(first - first % Project.Steps) : 0;
+        List<Note> added = null;
+        Edit(() => { lock (P) added = CurPat.Paste(selCh, src, off); Changed(); });
+        sel = added;   // the pasted notes stay selected, so Ctrl+B again keeps extending
+    }
+
+    void DeleteNotes()
+    {
+        var src = Selected();
+        if (src.Count > 0) Edit(() => { lock (P) CurPat.For(selCh).RemoveAll(src.Contains); sel.Clear(); Changed(); });
+    }
+
+    void SetVelocity(MouseEventArgs e)   // velocity lane: every note starting in the step under the mouse (a chord moves together)
+    {
+        int s = (int)Math.Floor((e.X - KeyW) / ((roll.Width - KeyW) / (float)CurPat.Length));
+        int v = Math.Max(1, Math.Min(127, (int)Math.Round((roll.Height - 4 - e.Y) / (float)(VelH - 8) * 127)));
+        bool any = false;
+        lock (P) foreach (var n in CurPat.For(selCh)) if (n.Step == s && n.Vel != v) { n.Vel = v; any = true; }
+        if (any) Changed();
+    }
+
+    bool RollCell(MouseEventArgs e, out int step, out int key)
+    {
+        float rh = (roll.Height - Top0 - VelH) / (float)(Hi - Lo), cw = (roll.Width - KeyW) / (float)CurPat.Length;
+        step = (int)Math.Floor((e.X - KeyW) / cw);
+        int r = (int)Math.Floor((e.Y - Top0) / rh);
+        key = Hi - 1 - r;
+        return step >= 0 && step < CurPat.Length && r >= 0 && r < Hi - Lo;
+    }
+
+    void RollDown(object sender, MouseEventArgs e)
+    {
+        int step, key;
+        if (e.Button == MouseButtons.Right && P.Channels.Count > 0 && e.Y < roll.Height - VelH) { boxFrom = boxTo = e.Location; roll.Invalidate(); return; }
+        if (e.Button != MouseButtons.Left || P.Channels.Count == 0) return;
+        if (e.Y >= roll.Height - VelH) { dragMode = "vel"; SetVelocity(e); return; }
+        if (!RollCell(e, out step, out key)) return;
+        lock (P)
+        {
+            var list = CurPat.For(selCh);
+            var hit = list.FirstOrDefault(n => n.Key == key && step >= n.Step && step < n.Step + n.Len);
+            float cw = (roll.Width - KeyW) / (float)CurPat.Length;
+            if (hit != null)   // drag the body to move it (with the rest of the selection), the right edge to change its length; a click without a drag removes it
+            {
+                resizing = e.X >= KeyW + (hit.Step + hit.Len) * cw - Math.Min(8, cw / 3);
+                moving = !resizing && sel.Contains(hit) ? Selected() : new List<Note> { hit };
+                moveFrom = moving.ToDictionary(n => n, n => new Point(n.Step, n.Key));
+                moveHit = hit; moveAt = new Point(step, key); moved = false;
+            }
+            else
+            {
+                dragNote = new Note { Step = step, Key = key, Len = 1 };
+                list.Add(dragNote);
+                eng.Preview.Enqueue(new Engine.Voice { Ch = P.Channels[selCh], Key = key, Len = Engine.SR / 4 });
+            }
+        }
+        Changed();
+    }
+
+    void RollMove(object sender, MouseEventArgs e)
+    {
+        if (boxFrom.HasValue && e.Button == MouseButtons.Right) { boxTo = e.Location; roll.Invalidate(); return; }
+        if (dragMode == "vel" && e.Button == MouseButtons.Left) { SetVelocity(e); return; }
+        if (moving != null && e.Button == MouseButtons.Left)
+        {
+            if (!resizing) { MoveNotes(e); return; }
+            int ns = (int)Math.Floor((e.X - KeyW) / ((roll.Width - KeyW) / (float)CurPat.Length));
+            int nl = Math.Max(1, Math.Min(CurPat.Length - moveHit.Step, ns - moveHit.Step + 1));
+            if (nl != moveHit.Len) { moveHit.Len = nl; moved = true; Changed(); }
+            return;
+        }
+        if (dragNote == null || e.Button != MouseButtons.Left) return;
+        float cw = (roll.Width - KeyW) / (float)CurPat.Length;
+        int s = (int)Math.Floor((e.X - KeyW) / cw);
+        int len = Math.Max(1, Math.Min(CurPat.Length - dragNote.Step, s - dragNote.Step + 1));
+        if (len != dragNote.Len) { dragNote.Len = len; Changed(); }
+    }
+
+    void MoveNotes(MouseEventArgs e)   // shift every grabbed note by the mouse's step/key offset, kept inside the pattern and the MIDI range
+    {
+        float rh = (roll.Height - Top0 - VelH) / (float)(Hi - Lo), cw = (roll.Width - KeyW) / (float)CurPat.Length;
+        int ds = (int)Math.Floor((e.X - KeyW) / cw) - moveAt.X, dk = Hi - 1 - (int)Math.Floor((e.Y - Top0) / rh) - moveAt.Y;
+        var d = Pattern.ClampMove(moveFrom, CurPat.Length, ds, dk); ds = d.X; dk = d.Y;
+        bool newPitch = moveHit.Key != moveFrom[moveHit].Y + dk;
+        foreach (var kv in moveFrom) { kv.Key.Step = kv.Value.X + ds; kv.Key.Key = kv.Value.Y + dk; }
+        if (ds != 0 || dk != 0) moved = true;
+        if (newPitch) eng.Preview.Enqueue(new Engine.Voice { Ch = P.Channels[selCh], Key = moveHit.Key, Len = Engine.SR / 8 });   // hear the new pitch
+        Changed();
+    }
+
+    void FinishMove()
+    {
+        lock (P)
+        {
+            var list = CurPat.For(selCh);
+            if (!moved) { list.Remove(moveHit); sel.Remove(moveHit); }   // a plain click still removes the note, as before
+            else list.RemoveAll(x => !moveFrom.ContainsKey(x) && moveFrom.Keys.Any(m => m.Step == x.Step && m.Key == x.Key));   // a moved note replaces one it lands on
+        }
+        moving = null; moveFrom = null; moveHit = null;
+        Changed();
+    }
+
+    // ---- mixer: master + inserts, each with fader, pan, mute, meter and effect slots
+    void ToggleMixer()
+    {
+        mixer.Visible = !mixer.Visible;
+        roll.Visible = !mixer.Visible;
+        mixBtn.Text = mixer.Visible ? "Piano roll (F9)" : "Mixer (F9)";
+    }
+
+    static float Clamp01(float v) { return Math.Max(0, Math.Min(1, v)); }
+
+    // Like FL's right-click > "Create automation clip": one lane per control, starting flat at its current value, shown in the playlist.
+    void AutomateControl(int ins, int slot, int param) { Automate(new Lane { Ins = ins, Slot = slot, Param = param }); }   // a mixer control
+    void AutomateKnob(int ch, int param) { Automate(new Lane { Ch = ch, Param = param }); }                               // a channel's sound setting
+
+    void Automate(Lane want)
+    {
+        int k = P.Automation.FindIndex(l => l.Tempo == want.Tempo && (want.Tempo || l.Ch == want.Ch && l.Param == want.Param && (want.Ch >= 0 || l.Ins == want.Ins && l.Slot == want.Slot)));
+        if (k < 0)
+        {
+            float v = want.Get(P);
+            for (int s = 0; s < want.Values.Length; s++) want.Values[s] = v;
+            lock (P) P.Automation.Add(want);
+            k = P.Automation.Count - 1; dirty = true;
+        }
+        selLane = k; Changed(false);
+    }
+
+    static int Next(IEnumerable<int> options, int cur, int dir)   // step through options, wrapping around
+    {
+        var o = options.ToArray(); int k = Math.Max(0, Array.IndexOf(o, cur));
+        return o[(k + dir + o.Length) % o.Length];
+    }
+
+    static void RouteBox(Graphics g, float x, float y, float w, string text, bool on)   // a pill-shaped switch
+    {
+        Round(g, on ? Sel : Raised, x, y, w, 14, 7);
+        g.DrawString(text, Small, on ? TxtB : DimB, new RectangleF(x + 5, y, w - 7, 14), Fit);
+    }
+
+    void MixGeom(out float sw, out float fy, out float fh, out float slotsTop)
+    {
+        sw = (mixer.Width - 8) / (float)Project.Inserts;
+        slotsTop = mixer.Height - Insert.SlotCount * HeadH - ParamsH - 4;
+        fy = Top0 + StripHead;
+        fh = Math.Max(30, slotsTop - fy - 22);   // leave room for the dB readout
+    }
+
+    // Slot list: one short row per slot; the open effect's three settings sit right under its row (one open effect per insert).
+    readonly int[] openSlot = new int[Project.Inserts];   // view state only, not saved
+    bool IsOpen(int i, int s) { return s == openSlot[i] && P.Mixer[i].Slots[s] != null; }
+    int slotDragIns = -1, slotDragFrom, slotDownY, slotDropY; bool slotDragging;   // an effect row being clicked or dragged to a new slot
+
+    int SlotAtY(int i, float y, float slotsTop)   // the slot whose row (or open settings) is at height y, clamped to the list
+    {
+        for (int s = Insert.SlotCount - 1; s >= 0; s--) if (y >= SlotY(i, s, slotsTop)) return s;
+        return 0;
+    }
+
+    void FinishSlotDrag(MouseEventArgs e)   // a click opens the effect (or shows its menu if it's already open); a drag moves it
+    {
+        int i = slotDragIns, from = slotDragFrom; slotDragIns = -1;
+        if (!slotDragging) { if (!IsOpen(i, from)) openSlot[i] = from; else ShowFxMenu(i, from, e.Location); mixer.Invalidate(); return; }
+        slotDragging = false;
+        float sw, fy, fh, st; MixGeom(out sw, out fy, out fh, out st);
+        int to = SlotAtY(i, e.Y, st);
+        if (to != from) { int[] where; lock (P) where = P.MoveEffect(i, from, to); openSlot[i] = where[openSlot[i]]; dirty = true; }
+        Changed();
+    }
+    float SlotY(int i, int s, float slotsTop) { return slotsTop + s * HeadH + (s > openSlot[i] && IsOpen(i, openSlot[i]) ? ParamsH : 0); }
+
+    void PaintMixer(object sender, PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        Header(g, mixer, "MIXER");
+        g.DrawString("slots: click to add or open an effect, drag to reorder, bar = wet/dry, dot = on/off, right-click to change or remove · drag faders, pan, settings · right-click a control: automate · dot = mute · send → later insert, sidechain ← earlier (drives its Compressor)", Small, DimB, 64, 5);
+        float sw, fy, fh, st; MixGeom(out sw, out fy, out fh, out st);
+        for (int i = 0; i < Project.Inserts; i++)
+        {
+            var ins = P.Mixer[i]; float sx = 4 + i * sw, w = sw - 6;
+            Round(g, i == 0 ? Color.FromArgb(36, 41, 50) : Color.FromArgb(32, 36, 44), sx, Top0 - 2, w, mixer.Height - Top0 - 2, 6);
+            g.DrawString(i == 0 ? "Master" : "Insert " + i, Bold, i == 0 ? new SolidBrush(On) : TxtB, sx + 5, Top0);
+            string from = string.Join(", ", P.Channels.Where(c => c.Insert == i).Select(c => c.Name));
+            g.DrawString(from, Small, DimB, new RectangleF(sx + 5, Top0 + 17, w - 8, 14), Fit);
+            Led(g, sx + 4, Top0 + 36, 10, !ins.Mute);
+            float pw = w - 24, pan = 0.5f + ins.Pan / 2;
+            ValueBar(g, sx + 20, Top0 + 38, pw, 6, Math.Min(0.5f, pan), Math.Max(0.5f, pan), Blue);
+            using (var pen = new Pen(Dim)) g.DrawLine(pen, sx + 20 + pw / 2, Top0 + 35, sx + 20 + pw / 2, Top0 + 47);
+            if (i > 0)   // send row (target box + level bar) and sidechain row; master has neither
+            {
+                float ry = Top0 + 52, bx = sx + 66, bw = w - 70;
+                RouteBox(g, sx + 4, ry, 58, ins.SendTo > 0 ? "send → " + ins.SendTo : "send: off", ins.SendTo > 0);
+                if (ins.SendTo > 0)
+                {
+                    ValueBar(g, bx, ry, bw, 14, 0, ins.SendLevel, DeepBlue);
+                    g.DrawString((int)Math.Round(ins.SendLevel * 100) + "%", Small, TxtB, bx + 4, ry);
+                }
+                RouteBox(g, sx + 4, ry + 16, w - 8, ins.Sidechain > 0 ? "sidechain ← " + ins.Sidechain : "sidechain: off", ins.Sidechain > 0);
+            }
+            // fader: dB ticks, a slim track lit below the handle, and the handle; the whole area still takes clicks
+            float fw = w - 26, cx = sx + 4 + fw / 2, hy = fy + fh * (1 - ins.Vol);
+            using (var pen = new Pen(Line))
+                for (float t = 1; t > 0.03f; t /= 2) { float ty = fy + fh * (1 - t); g.DrawLine(pen, cx - 14, ty, cx - 7, ty); g.DrawLine(pen, cx + 7, ty, cx + 14, ty); }   // 0, −6, −12… dB
+            Round(g, Well, cx - 3, fy, 6, fh, 3);
+            var keep = g.Save();
+            g.SetClip(new RectangleF(cx - 3, hy, 6, fy + fh - hy), CombineMode.Intersect);
+            Round(g, ins.Mute ? Dim : On, cx - 3, fy, 6, fh, 3);
+            g.Restore(keep);
+            float hw = Math.Min(fw - 4, 34);
+            Round(g, Color.FromArgb(70, 0, 0, 0), cx - hw / 2, hy - 6, hw, 14, 3);   // shadow
+            Round(g, Color.FromArgb(206, 211, 220), cx - hw / 2, hy - 7, hw, 14, 3);
+            using (var pen = new Pen(Color.FromArgb(70, 76, 88))) g.DrawLine(pen, cx - hw / 2 + 4, hy, cx + hw / 2 - 4, hy);
+            // level meter: green → yellow → red, lit up to the peak
+            float pk = Math.Min(1, eng.Peaks[i]), mx = sx + w - 16;
+            Round(g, Well, mx, fy, 8, fh, 3);
+            if (pk > 0)
+            {
+                var keepM = g.Save();
+                g.SetClip(new RectangleF(mx, fy + fh * (1 - pk), 8, fh * pk), CombineMode.Intersect);
+                using (var grad = new LinearGradientBrush(new RectangleF(mx, fy - 1, 8, fh + 2), Color.Red, Green, LinearGradientMode.Vertical))
+                {
+                    grad.InterpolationColors = new ColorBlend { Colors = new[] { Color.FromArgb(255, 70, 70), Color.FromArgb(255, 210, 70), Green, Green }, Positions = new[] { 0f, 0.18f, 0.45f, 1f } };
+                    var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+                    using (var path = RoundPath(new RectangleF(mx, fy, 8, fh), 3)) g.FillPath(grad, path);
+                    g.SmoothingMode = am;
+                }
+                g.Restore(keepM);
+            }
+            g.DrawString(ins.Vol <= 0 ? "-inf dB" : (20 * Math.Log10(ins.Vol)).ToString("0.0") + " dB", Small, ins.Mute ? DimB : TxtB, new RectangleF(sx + 4, fy + fh + 3, fw, 16), new StringFormat { Alignment = StringAlignment.Center });
+            for (int s = 0; s < Insert.SlotCount; s++)
+            {
+                var fx = ins.Slots[s]; float sy = SlotY(i, s, st); bool open = IsOpen(i, s);
+                Round(g, fx == null ? Color.FromArgb(38, 43, 52) : open ? Sel : Raised, sx + 2, sy, w - 4, HeadH - 2, 3);
+                bool mixing = fx != null && dragFx == fx && dragParam == Lane.FxMix;   // while its mix bar is dragged, the row shows the value
+                string label = fx == null ? "+ effect" : mixing ? "Wet/dry " + (int)Math.Round(fx.Mix * 100) + "%" : (open ? "▾ " : "▸ ") + fx.Type + (fx.Bypass ? " off" : "");
+                g.DrawString(label, Small, fx == null || fx.Bypass ? DimB : TxtB, new RectangleF(sx + 5, sy, fx == null ? w - 8 : w - 60, HeadH - 2), Fit);
+                if (fx == null) continue;
+                ValueBar(g, sx + w - 52, sy + 6, 30, 6, 0, fx.Mix, fx.Bypass ? Dim : Blue);   // wet/dry, left of the on/off dot
+                Led(g, sx + w - 16, sy + 4, 9, !fx.Bypass);
+                if (!open) continue;
+                for (int p = 0; p < 3; p++)
+                {
+                    float py = sy + HeadH + 1 + p * 14;
+                    ValueBar(g, sx + 2, py, w - 4, 12, 0, fx.P[p], DeepBlue);
+                    g.DrawString(fx.Label(p), Small, TxtB, new RectangleF(sx + 6, py - 1, w - 10, 14), Fit);
+                }
+            }
+            if (slotDragging && slotDragIns == i)   // where the dragged effect will land: under the target row moving down, above it moving up
+            {
+                int to = SlotAtY(i, slotDropY, st);
+                float ly = SlotY(i, to, st) + (to > slotDragFrom ? HeadH - 1 : -1);
+                using (var pen = new Pen(On, 2)) g.DrawLine(pen, sx + 2, ly, sx + w - 2, ly);
+            }
+        }
+    }
+
+    void MixerDown(object sender, MouseEventArgs e)
+    {
+        float sw, fy, fh, st; MixGeom(out sw, out fy, out fh, out st);
+        int i = (int)Math.Floor((e.X - 4) / sw);
+        if (i < 0 || i >= Project.Inserts || e.Y < Top0) return;
+        var ins = P.Mixer[i]; float sx = 4 + i * sw, w = sw - 6;
+        if (e.Y >= st)   // effect slots
+        {
+            for (int s = 0; s < Insert.SlotCount; s++)
+            {
+                float sy = SlotY(i, s, st); var fx = ins.Slots[s];
+                if (e.Y >= sy && e.Y < sy + HeadH)   // a slot's row: click a closed effect to open it; otherwise pick, change or remove
+                {
+                    if (fx != null && e.Button == MouseButtons.Left && e.X >= sx + w - 20) { fx.Bypass = !fx.Bypass; Changed(); }   // the on/off dot
+                    else if (fx != null && e.X >= sx + w - 56 && e.X < sx + w - 20)   // the mix bar: drag it, or right-click to automate it
+                    {
+                        if (e.Button == MouseButtons.Right) AutomateControl(i, s, Lane.FxMix);
+                        else if (e.Button == MouseButtons.Left) { dragFx = fx; dragParam = Lane.FxMix; dragX0 = sx + w - 52; dragW = 30; MixerMove(sender, e); }
+                    }
+                    else if (fx != null && e.Button == MouseButtons.Left) { slotDragIns = i; slotDragFrom = s; slotDownY = slotDropY = e.Y; slotDragging = false; }   // decided on mouse-up: click or drag
+                    else ShowFxMenu(i, s, e.Location);
+                    return;
+                }
+                if (IsOpen(i, s) && e.Y >= sy + HeadH && e.Y < sy + HeadH + ParamsH)   // the open effect's settings
+                {
+                    int p = (int)((e.Y - sy - HeadH - 1) / 14);
+                    if (p < 0 || p > 2) return;
+                    if (e.Button == MouseButtons.Right) { AutomateControl(i, s, p); return; }
+                    if (e.Button != MouseButtons.Left) return;
+                    dragFx = fx; dragParam = p; dragX0 = sx + 2; dragW = w - 4;
+                    MixerMove(sender, e); return;
+                }
+            }
+            return;
+        }
+        if (e.Y >= Top0 + 50 && e.Y < fy)   // send / sidechain rows: click = next option, right-click = previous
+        {
+            int dir = e.Button == MouseButtons.Right ? -1 : 1;
+            if (i == 0) return;
+            if (e.Y >= Top0 + 67) ins.Sidechain = Next(Enumerable.Range(0, Project.Inserts).Where(t => t == 0 || Project.RouteOk(t, i)), ins.Sidechain, dir);
+            else if (e.X < sx + 64) ins.SendTo = Next(Enumerable.Range(0, Project.Inserts).Where(t => t == 0 || Project.RouteOk(i, t)), ins.SendTo, dir);
+            else if (ins.SendTo > 0 && e.Button == MouseButtons.Left) { dragCh = i; dragMode = "send"; MixerMove(sender, e); return; }
+            else if (ins.SendTo > 0 && e.Button == MouseButtons.Right) { AutomateControl(i, -1, 2); return; }
+            else return;
+            Changed(); return;
+        }
+        if (e.Button == MouseButtons.Right && e.Y >= Top0 + 34 && (e.Y >= fy || e.X >= sx + 18)) { AutomateControl(i, -1, e.Y >= fy ? 0 : 1); return; }   // fader or pan
+        if (e.Button != MouseButtons.Left || e.Y < Top0 + 34) return;
+        dragCh = i;
+        if (e.Y < fy)
+        {
+            if (e.X < sx + 18) { ins.Mute = !ins.Mute; Changed(); }
+            else { dragMode = "mixpan"; MixerMove(sender, e); }
+            return;
+        }
+        dragMode = "mixvol"; MixerMove(sender, e);
+    }
+
+    void MixerMove(object sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        if (slotDragIns >= 0) { if (Math.Abs(e.Y - slotDownY) > 4) slotDragging = true; slotDropY = e.Y; mixer.Invalidate(); return; }   // a few pixels make it a drag
+        float sw, fy, fh, st; MixGeom(out sw, out fy, out fh, out st);
+        if (dragFx != null && dragParam == Lane.FxMix) dragFx.Mix = Clamp01((e.X - dragX0) / dragW);
+        else if (dragFx != null) dragFx.P[dragParam] = Clamp01((e.X - dragX0) / dragW);
+        else if (dragMode == "mixvol") P.Mixer[dragCh].Vol = Clamp01(1 - (e.Y - fy) / fh);
+        else if (dragMode == "send") P.Mixer[dragCh].SendLevel = Clamp01((e.X - (4 + dragCh * sw + 66)) / (sw - 76));   // same bar as PaintMixer
+        else if (dragMode == "mixpan")
+        {
+            float x0 = 4 + dragCh * sw + 20, pw = sw - 30;
+            P.Mixer[dragCh].Pan = Math.Max(-1, Math.Min(1, (e.X - x0) / pw * 2 - 1));
+        }
+        else return;
+        Changed();
+    }
+
+    void ShowFxMenu(int i, int slot, Point at)   // the insert is looked up when an item is picked, in case undo replaced the project meanwhile
+    {
+        var m = new ContextMenuStrip();
+        foreach (var type in Effect.Types)
+        {
+            string t = type;   // foreach variables are shared between iterations in C# 5
+            m.Items.Add(t, null, (s, e) => Edit(() => { P.Mixer[i].Slots[slot] = new Effect(t); openSlot[i] = slot; Changed(); }));   // new object = fresh effect state; show its settings
+        }
+        m.Items.Add("(remove)", null, (s, e) => Edit(() => { P.Mixer[i].Slots[slot] = null; Changed(); }));
+        m.Show(mixer, at);
+    }
+
+    // ---- playlist: tracks x bars, each cell holds a pattern
+    void PaintPlaylist(object sender, PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        Header(g, playlist, "PLAYLIST");
+        int nl = P.Automation.Count; bool auto = selLane >= 0 && selLane < nl;
+        g.DrawString(auto ? "drag: draw the automation curve (top = max) · plays in Song mode" : "click: place pattern · drag a clip: move (Shift: copy) · click a clip: edit its pattern · right: erase · Pattern list right-click: rename / delete / length", Small, DimB, 80, 5);
+        RouteBox(g, playlist.Width - AutoBoxX, 4, AutoBoxW, nl == 0 ? "automation: right-click a mixer control, a rack bar or BPM to add a lane"
+            : auto ? "automating " + P.Automation[selLane].Name(P) + "  (" + (selLane + 1) + "/" + nl + ")" : "automation: off · click to edit (" + nl + " lanes)", auto);
+        if (auto) RouteBox(g, playlist.Width - 78, 4, 72, "delete lane", true);
+        float cw = (playlist.Width - PlLabel) / (float)Project.Bars, rh = (playlist.Height - Top0 - 14) / (float)Project.Tracks;
+        float y0 = Top0 + 12, gh = Project.Tracks * rh;
+        for (int b = 0; b < Project.Bars; b += 4) g.DrawString((b + 1).ToString(), Small, b == 0 ? TxtB : DimB, PlLabel + b * cw + 2, Top0 - 2);
+        for (int t = 0; t < Project.Tracks; t++)   // lanes, alternating shades, with a name tab
+        {
+            float y = y0 + t * rh;
+            using (var br = new SolidBrush(t % 2 == 0 ? Color.FromArgb(31, 35, 42) : Color.FromArgb(27, 31, 37))) g.FillRectangle(br, PlLabel, y, playlist.Width - PlLabel, rh);
+            Round(g, Raised, 4, y + 1, PlLabel - 8, rh - 2, 3);
+            g.DrawString("Track " + (t + 1), Small, DimB, new RectangleF(8, y, PlLabel - 12, rh), Fit);
+        }
+        for (int b = 0; b <= Project.Bars; b++)   // bar lines, stronger every 4 bars
+            using (var pen = new Pen(b % 4 == 0 ? Color.FromArgb(60, 68, 82) : Color.FromArgb(40, 45, 54)))
+                g.DrawLine(pen, PlLabel + b * cw, y0, PlLabel + b * cw, y0 + gh);
+        for (int t = 0; t < Project.Tracks; t++)
+            for (int b = 0; b < Project.Bars; b++)   // clips on top, as wide as their pattern; a later clip covers an earlier one's tail, as in playback
+            {
+                int p = P.Playlist[t, b];
+                if (p < 0) continue;
+                int span = Math.Min(p < P.Patterns.Count ? P.Patterns[p].Bars : 1, Project.Bars - b);
+                var rc = new RectangleF(PlLabel + b * cw + 1, y0 + t * rh + 1, span * cw - 2, rh - 2);
+                var col = PatColors[p % PatColors.Length];
+                Round(g, col, rc.X, rc.Y, rc.Width, rc.Height, 4);
+                Round(g, Color.FromArgb(50, 255, 255, 255), rc.X + 1, rc.Y + 1, rc.Width - 2, rc.Height * 0.4f, 3);   // light top edge
+                RoundEdge(g, ControlPaint.Dark(col, 0.25f), 1, rc, 4);
+                string label = p < P.Patterns.Count ? P.Patterns[p].Name : (p + 1).ToString();
+                if (rc.Width > 18) g.DrawString(rc.Width > 44 ? label : (p + 1).ToString(), Small, Brushes.White, new RectangleF(rc.X + 4, rc.Y, rc.Width - 6, rc.Height), Fit);
+            }
+        if (auto)   // the lane's curve over the whole grid; patterns fade back while it is edited
+        {
+            var vals = P.Automation[selLane].Values; float sw = cw / Project.Steps;
+            using (var dim = new SolidBrush(Color.FromArgb(170, PanelBg))) g.FillRectangle(dim, PlLabel, y0, playlist.Width - PlLabel, gh);
+            var pts = new PointF[vals.Length + 2];
+            for (int k = 0; k < vals.Length; k++) pts[k] = new PointF(PlLabel + k * sw, y0 + (1 - vals[k]) * gh);   // playback interpolates between these points
+            pts[vals.Length] = new PointF(pts[vals.Length - 1].X, y0 + gh); pts[vals.Length + 1] = new PointF(PlLabel, y0 + gh);
+            var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var fill = new SolidBrush(Color.FromArgb(40, On))) g.FillPolygon(fill, pts);
+            using (var pen = new Pen(On, 2)) g.DrawLines(pen, pts.Take(vals.Length).ToArray());
+            g.SmoothingMode = am;
+        }
+        if (clipT >= 0 && clipMoved)   // where the dragged clip will land
+        {
+            int p = P.Playlist[clipT, clipB], span = p >= 0 && p < P.Patterns.Count ? Math.Min(P.Patterns[p].Bars, Project.Bars - clipToB) : 1;
+            var gr = new RectangleF(PlLabel + clipToB * cw + 1, y0 + clipToT * rh + 1, span * cw - 2, rh - 2);
+            Round(g, Color.FromArgb(120, p >= 0 ? PatColors[p % PatColors.Length] : On), gr.X, gr.Y, gr.Width, gr.Height, 4);
+            RoundEdge(g, Color.White, 1.5f, gr, 4);
+        }
+        int ps = eng.PlayStep;
+        if (eng.SongMode && ps >= 0)   // playhead: a line with a marker in the bar-number row
+        {
+            float x = PlLabel + ps / (float)Project.Steps * cw;
+            using (var pen = new Pen(Color.FromArgb(230, 255, 255, 255), 2)) g.DrawLine(pen, x, y0, x, y0 + gh);
+            var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+            using (var b = new SolidBrush(On)) g.FillPolygon(b, new[] { new PointF(x - 5, y0 - 8), new PointF(x + 5, y0 - 8), new PointF(x, y0 - 1) });
+            g.SmoothingMode = am;
+        }
+    }
+
+    // Grid cell under the mouse, clamped to the playlist (dragging past an edge keeps the clip at that edge).
+    void PlCell(MouseEventArgs e, out int t, out int b)
+    {
+        float cw = (playlist.Width - PlLabel) / (float)Project.Bars, rh = (playlist.Height - Top0 - 14) / (float)Project.Tracks;
+        b = Math.Max(0, Math.Min(Project.Bars - 1, (int)Math.Floor((e.X - PlLabel) / cw)));
+        t = Math.Max(0, Math.Min(Project.Tracks - 1, (int)Math.Floor((e.Y - Top0 - 12) / rh)));
+    }
+
+    int clipT = -1, clipB, clipGrab, clipToT, clipToB; bool clipMoved;   // a clip being clicked or dragged: where it starts, where it'd land
+
+    void PlaylistDown(object sender, MouseEventArgs e)
+    {
+        autoK = -1;
+        bool automating = selLane >= 0 && selLane < P.Automation.Count;
+        if (e.Y >= 22 && e.Button == MouseButtons.Left && !automating && e.X >= PlLabel)   // pressing on a clip: a click picks its pattern, a drag moves it
+        {
+            int t, b; PlCell(e, out t, out b);
+            int at = P.ClipAt(t, b);
+            if (at >= 0) { clipT = clipToT = t; clipB = clipToB = at; clipGrab = b - at; clipMoved = false; return; }
+        }
+        if (e.Y >= 22) { PlaylistMouse(sender, e); return; }
+        int nl = P.Automation.Count;   // header: lane picker (click next, right-click previous, through "off") and delete
+        if (selLane >= 0 && selLane < nl && e.X >= playlist.Width - 78) { lock (P) P.Automation.RemoveAt(selLane); selLane = -1; dirty = true; }
+        else if (nl > 0 && e.X >= playlist.Width - AutoBoxX && e.X < playlist.Width - AutoBoxX + AutoBoxW)
+            selLane = Next(Enumerable.Range(-1, nl + 1), selLane, e.Button == MouseButtons.Right ? -1 : 1);
+        else return;
+        playlist.Invalidate();
+    }
+
+    void FinishClipDrag()   // mouse-up after pressing on a clip; Shift copies instead of moving
+    {
+        if (clipT < 0) return;
+        int t0 = clipT; clipT = -1;
+        if (!clipMoved) { int p = P.Playlist[t0, clipB]; if (p >= 0 && p < P.Patterns.Count) patBox.SelectedIndex = p; return; }   // a click: edit that pattern
+        lock (P) P.MoveClip(t0, clipB, clipToT, clipToB, (ModifierKeys & Keys.Shift) != 0);
+        Changed();
+    }
+
+    void PlaylistMouse(object sender, MouseEventArgs e)
+    {
+        if (clipT >= 0)   // dragging a clip: follow the mouse, keeping the bar it was grabbed by under the pointer
+        {
+            if (e.Button != MouseButtons.Left) return;
+            int ct, cb; PlCell(e, out ct, out cb);
+            int nb = Math.Max(0, Math.Min(Project.Bars - 1, cb - clipGrab));
+            if (ct != clipToT || nb != clipToB) { clipToT = ct; clipToB = nb; clipMoved = true; playlist.Invalidate(); }
+            return;
+        }
+        if (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right) return;
+        float cw = (playlist.Width - PlLabel) / (float)Project.Bars, rh = (playlist.Height - Top0 - 14) / (float)Project.Tracks;
+        if (selLane >= 0 && selLane < P.Automation.Count)   // automation mode: drag paints the lane; patterns are locked
+        {
+            if (e.Button != MouseButtons.Left || e.Y < 22) return;
+            var vals = P.Automation[selLane].Values;
+            int k = Math.Max(0, Math.Min(vals.Length - 1, (int)Math.Floor((e.X - PlLabel) / (cw / Project.Steps))));
+            float val = Clamp01(1 - (e.Y - Top0 - 12) / (Project.Tracks * rh));
+            int from = autoK < 0 ? k : autoK;   // fill every step since the last mouse event, so a fast drag leaves no gaps
+            for (int s = Math.Min(from, k); s <= Math.Max(from, k); s++) vals[s] = from == k ? val : autoV + (val - autoV) * (s - from) / (k - from);
+            autoK = k; autoV = val; dirty = true;
+            playlist.Invalidate(); return;
+        }
+        int b = (int)Math.Floor((e.X - PlLabel) / cw), t = (int)Math.Floor((e.Y - Top0 - 12) / rh);
+        if (b < 0 || b >= Project.Bars || t < 0 || t >= Project.Tracks) return;
+        int v = e.Button == MouseButtons.Left ? patBox.SelectedIndex : -1, at = P.ClipAt(t, b);
+        if (v < 0) { if (at < 0) return; b = at; }   // right-click anywhere on a clip erases the whole clip
+        else if (at >= 0 && at != b) return;         // inside a longer clip: leave it (so a drag tiles a 2-bar pattern every 2 bars)
+        if (P.Playlist[t, b] == v) return;
+        lock (P) P.Playlist[t, b] = v;
+        Changed();
+    }
+
+    // ---------------------------------------------------------------- entry + self-test
+    [STAThread]
+    static int Main(string[] args)
+    {
+        CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
+        Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
+        if (args.Length == 2 && args[0] == "--selftest") return SelfTest(args[1]);
+        if (args.Length == 2 && args[0] == "--logo")   // write the logo as an .ico (for /win32icon) and a 256 px .png next to it
+        {
+            File.WriteAllBytes(args[1], Logo.Ico());
+            using (var b = Logo.Draw(256)) b.Save(Path.ChangeExtension(args[1], ".png"), System.Drawing.Imaging.ImageFormat.Png);
+            return 0;
+        }
+        Application.EnableVisualStyles();
+        if (args.Length >= 2 && args[0] == "--screenshot")   // the real window drawn to a PNG: built off-screen, never activated, then closed
+        {
+            screenshotMode = true;
+            var f = new MainForm { StartPosition = FormStartPosition.Manual, Location = new Point(-32000, -32000), ShowInTaskbar = false };
+            if (args.Length >= 3 && args[2] == "mixer") f.ToggleMixer();
+            f.Shown += (s, e) =>
+            {
+                var t = new System.Windows.Forms.Timer { Interval = 400 };   // let layout and the first paint settle
+                t.Tick += (s2, e2) => { t.Stop(); using (var bmp = new Bitmap(f.Width, f.Height)) { f.DrawToBitmap(bmp, new Rectangle(0, 0, f.Width, f.Height)); bmp.Save(args[1]); } f.Close(); };
+                t.Start();
+            };
+            Application.Run(f);
+            return 0;
+        }
+        var splash = new AboutForm(true);   // shown while the main window builds (audio, MIDI), then for a moment on top of it
+        splash.Show(); splash.Refresh();
+        var main = new MainForm();
+        splash.Owner = main;   // owned: stays above the main window without being top-most over other apps
+        var given = args.Where(a => File.Exists(a) && Droppable(new[] { a })).ToArray();   // files dropped on MiniDAW.exe, or "Open with"
+        if (given.Length > 0) main.Shown += (s, e) => main.OpenFiles(given);              // after the recovery offer, which is hooked first
+        main.Shown += (s, e) => { var t = new System.Windows.Forms.Timer { Interval = 900 }; t.Tick += (s2, e2) => { t.Dispose(); splash.Close(); }; t.Start(); };
+        Application.Run(main);
+        return 0;
+    }
+
+    static int SelfTest(string outPath)
+    {
+        var log = new List<string>(); bool ok = true;
+        Action<bool, string> check = (c, m) => { log.Add((c ? "ok   " : "FAIL ") + m); if (!c) ok = false; };
+        try
+        {
+            var e = new Engine { Proj = Project.Demo(), Playing = true };
+            var buf = new float[Engine.SR * 2 * 2];
+            e.Render(buf, Engine.SR * 2);
+            check(buf.All(x => !float.IsNaN(x) && Math.Abs(x) <= 1), "pattern render is finite and within [-1, 1]");
+            check(buf.Take(2000).Max(x => Math.Abs(x)) > 0.1, "kick on step 1 sounds immediately");
+            check(buf.Max(x => Math.Abs(x)) > 0.3, "demo pattern is audible");
+
+            var song = new Engine { Proj = Project.Demo(), Playing = true, SongMode = true };
+            song.Render(buf, Engine.SR * 2);
+            check(song.PlayStep > Project.Steps, "song mode advances past bar 1 (step " + song.PlayStep + ")");
+
+            string dir = Path.GetTempPath(), wav = Path.Combine(dir, "minidaw_test.wav"), f = Path.Combine(dir, "minidaw_test.mdaw");
+            var tone = Enumerable.Range(0, 4410).Select(i => (float)Math.Sin(i * 0.1) * 0.5f).ToArray();
+            File.WriteAllBytes(wav, Wav.Make16(tone, 22050, 1));
+            var ch = new Channel { Kind = "sample", Name = "Tone" };
+            Wav.Load(wav, ch);
+            check(ch.Sample.Length == 4410 && ch.SampleRate == 22050 && Math.Abs(ch.Sample[100] - tone[100]) < 1e-3, "16-bit WAV import");
+
+            var p = Project.Demo(); p.Bpm = 97; p.Channels.Add(ch);
+            p.Patterns[0].For(4).Add(new Note { Step = 3, Key = 62, Len = 2 }); p.Playlist[2, 5] = 1; p.Channels[1].Pan = -0.25f;
+            ch.Insert = 6; p.Mixer[6].Vol = 0.5f; p.Mixer[6].Slots[2] = new Effect("Filter"); p.Mixer[6].Slots[2].P[1] = 0.75f;
+            p.Mixer[1].SendTo = 5; p.Mixer[1].SendLevel = 0.25f; p.Mixer[4].Sidechain = 1;
+            p.Save(f);
+            var q = Project.Load(f);
+            check(q.Bpm == 97 && q.Channels.Count == 5 && q.Channels[4].Sample != null && q.Channels[1].Pan == -0.25f
+                  && q.Patterns[0].For(4)[0].Key == 62 && q.Patterns[0].For(4)[0].Len == 2 && q.Playlist[2, 5] == 1 && q.Playlist[1, 3] == 1
+                  && q.Patterns[1].For(3).Count == 4, "project save/load round trip");
+            check(q.Channels[4].Insert == 6 && q.Channels[0].Insert == 1 && q.Mixer[6].Vol == 0.5f && q.Mixer[6].Slots[2].Type == "Filter"
+                  && q.Mixer[6].Slots[2].P[1] == 0.75f && q.Mixer[2].Slots[0].Type == "Reverb" && q.Mixer[3].Slots[0] == null
+                  && q.Mixer[1].SendTo == 5 && q.Mixer[1].SendLevel == 0.25f && q.Mixer[4].Sidechain == 1 && q.Mixer[2].SendTo == 0,
+                  "mixer routing, sends, sidechain and effects survive save/load");
+
+            File.WriteAllText(f, "garbage");
+            bool threw = false; try { Project.Load(f); } catch (InvalidDataException) { threw = true; }
+            check(threw, "rejects a non-project file");
+            File.WriteAllText(f, "MINIDAW\t1\npat\tP\nn\t7\t0\t60\t1\n");
+            threw = false; try { Project.Load(f); } catch (InvalidDataException) { threw = true; }
+            check(threw, "rejects a note on a missing channel");
+            File.WriteAllText(f, "MINIDAW\t1\nfx\t1\t0\tBogus\t0\t0\t0\n");
+            threw = false; try { Project.Load(f); } catch (InvalidDataException) { threw = true; }
+            check(threw, "rejects an unknown effect");
+            File.WriteAllText(f, "MINIDAW\t1\nins\t3\t1\t0\t0\t2\t0.5\t0\n");
+            threw = false; try { Project.Load(f); } catch (InvalidDataException) { threw = true; }
+            check(threw, "rejects a send to an earlier insert (that could make a loop)");
+            File.WriteAllText(f, "MINIDAW\t1\nins\t2\t0.5\t0\t0\n");   // line from a file saved before sends existed
+            var old = Project.Load(f);
+            check(old.Mixer[2].Vol == 0.5f && old.Mixer[2].SendTo == 0 && old.Mixer[2].Sidechain == 0, "older project files without sends still open");
+            File.Delete(f); File.Delete(wav);
+
+            // export: demo song is 6 bars at 128 BPM; reverb and delay ring past the end, then it stops
+            var dp = Project.Demo();
+            int body = (int)Math.Ceiling(6 * 16 * (60.0 / 128 / 4 * Engine.SR));
+            var b1 = Engine.Bounce(dp.ExportCopy(), true, 0);
+            int len = b1.Length / 2;
+            check(len > body && len < body + 5 * Engine.SR, "song export covers 6 bars plus a tail and stops (" + (len / (double)Engine.SR).ToString("0.00") + " s)");
+            check(b1.All(x => !float.IsNaN(x) && Math.Abs(x) <= 1) && b1.Take(2000).Max(x => Math.Abs(x)) > 0.1, "song export is audible from the first sample and within [-1, 1]");
+            var b2 = Engine.Bounce(dp.ExportCopy(), true, 0);
+            check(dp.Mixer[2].Slots[0] != dp.ExportCopy().Mixer[2].Slots[0] && b2.SequenceEqual(b1), "export copies effects, so two exports are identical");
+            var dry = Project.Demo(); dry.Mixer[2].Slots[0] = dry.Mixer[4].Slots[0] = null;
+            dry.Patterns[0].For(0).Clear(); dry.Patterns[0].For(1).Clear();   // only hats remain: short sounds, no tail past the pattern
+            int pbody = (int)Math.Ceiling(16 * (60.0 / 128 / 4 * Engine.SR));
+            check(Engine.Bounce(dry.ExportCopy(), false, 0).Length == 2 * pbody, "pattern export without effects is exactly one bar long");
+            File.WriteAllBytes(wav, Wav.Make16(b1, Engine.SR, 2));
+            var back = new Channel { Kind = "sample", Name = "Bounce" };
+            Wav.Load(wav, back);
+            int mid = len / 3;
+            check(back.Sample.Length == len && back.SampleR != null && back.SampleR.Length == len && back.SampleRate == Engine.SR
+                  && Math.Abs(back.Sample[mid] - b1[2 * mid]) < 1e-3 && Math.Abs(back.SampleR[mid] - b1[2 * mid + 1]) < 1e-3,
+                "exported stereo WAV reads back with the right length, rate and both sides");
+            // stereo samples: a WAV with a tone on the left and silence on the right plays exactly that way; a mono WAV plays the same on both sides
+            Func<float[], int, float[]> playSample = (data, chans) =>
+            {
+                File.WriteAllBytes(wav, Wav.Make16(data, Engine.SR, chans));
+                var sp5 = new Project(); var sc = new Channel { Kind = "sample", Name = "S", Insert = 1 }; Wav.Load(wav, sc); sp5.Channels.Add(sc);
+                var spat = new Pattern { Name = "P" }; sp5.Patterns.Add(spat); spat.For(0).Add(new Note { Step = 0, Key = 60, Len = 1 });
+                return Engine.Bounce(sp5, false, 0);
+            };
+            var leftOnly = Enumerable.Range(0, Engine.SR).Select(k => k % 2 == 0 ? (float)(0.5 * Math.Sin(k * 0.05)) : 0f).ToArray();   // 0.5 s, interleaved
+            var stOut = playSample(leftOnly, 2);
+            var monoOut = playSample(Enumerable.Range(0, Engine.SR / 2).Select(k => (float)(0.5 * Math.Sin(k * 0.1))).ToArray(), 1);
+            check(stOut.Where((x, k) => k % 2 == 0).Max(x => Math.Abs(x)) > 0.2 && stOut.Where((x, k) => k % 2 == 1).All(x => x == 0)
+                  && Enumerable.Range(0, monoOut.Length / 2).All(k => monoOut[2 * k] == monoOut[2 * k + 1]) && monoOut.Max(x => Math.Abs(x)) > 0.2,
+                "a stereo sample keeps its sides (left tone, silent right stays silent); a mono sample plays equally on both sides");
+            File.Delete(wav);
+
+            // automation: a master-volume lane holds 0.8 for bar 1, then 0; a second lane sets insert 4's Delay mix to 0.9
+            var ap = Project.Demo();
+            var vol = new Lane { Ins = 0, Param = 0 };
+            for (int k = 0; k < vol.Values.Length; k++) vol.Values[k] = k < Project.Steps ? 0.8f : 0;
+            var mixLane = new Lane { Ins = 4, Slot = 0, Param = 2 };
+            for (int k = 0; k < mixLane.Values.Length; k++) mixLane.Values[k] = 0.9f;
+            ap.Automation.Add(vol); ap.Automation.Add(mixLane);
+            int sps128 = (int)(60.0 / 128 / 4 * Engine.SR);
+            var cp = ap.ExportCopy();
+            var ab = Engine.Bounce(cp, true, 0);
+            check(ab.Take(15 * sps128 * 2).Max(x => Math.Abs(x)) > 0.1 && ab.Skip(17 * sps128 * 2).Take(14 * sps128 * 2).All(x => x == 0),
+                "exported song follows the master volume lane: bar 1 plays, bar 2 is silent");
+            check(Math.Abs(cp.Mixer[4].Slots[0].P[2] - 0.9f) < 1e-6 && ap.Mixer[4].Slots[0].P[2] == 0.35f && ap.Mixer[0].Vol == 0.8f,
+                "lanes move the export copy's controls and leave the live project alone");
+            var pe = new Engine { Proj = ap, Playing = true };   // Pattern mode
+            pe.Render(buf, Engine.SR / 2);
+            check(buf.Take(Engine.SR).Max(x => Math.Abs(x)) > 0.1 && ap.Mixer[0].Vol == 0.8f, "automation doesn't play in Pattern mode");
+            var le = new Engine { Proj = ap, Playing = true, SongMode = true };
+            var lb = new float[2048];
+            for (int k = 0; k < 100; k++) le.Render(lb, 1024);   // 100 blocks of 1024 = 2.3 s, past the end of bar 1
+            check(ap.Mixer[0].Vol == 0 && ap.Mixer[4].Slots[0].P[2] == 0.9f, "during song playback the lanes move the mixer's fader and effect setting");
+            ap.Save(f);
+            var aq = Project.Load(f);
+            check(aq.Automation.Count == 2 && aq.Automation[0].Slot == -1 && aq.Automation[0].Values.SequenceEqual(vol.Values)
+                  && aq.Automation[1].Ins == 4 && aq.Automation[1].Slot == 0 && aq.Automation[1].Param == 2, "automation lanes survive save/load");
+            File.WriteAllText(f, "MINIDAW\t1\nauto\t1\t-1\t0\t0.5\n");
+            threw = false; try { Project.Load(f); } catch (InvalidDataException) { threw = true; }
+            check(threw, "rejects an automation lane with missing values");
+            File.Delete(f);
+
+            // MIDI keyboard: a note-on holds the synth until its note-off; controllers make no sound
+            var mp = Project.Demo(); mp.Mixer[4].Slots[0] = null;   // no delay echoes on the synth's insert
+            var me = new Engine { Proj = mp, MidiTarget = mp.Channels[3] };
+            var mb = new float[Engine.SR];   // 0.5 s of stereo per render
+            Func<double> lastFifth = () => mb.Skip(mb.Length - Engine.SR / 5).Max(x => Math.Abs(x));   // peak of the last 0.1 s
+            me.MidiIn.Enqueue(0xB0 | 7 << 8 | 100 << 16);   // volume controller
+            me.Render(mb, Engine.SR / 2);
+            bool ccSilent = mb.All(x => x == 0);
+            me.MidiIn.Enqueue(0x90 | 60 << 8 | 100 << 16);
+            me.Render(mb, Engine.SR / 2);
+            double heldLvl = lastFifth();
+            me.MidiIn.Enqueue(0x80 | 60 << 8);
+            me.Render(mb, Engine.SR / 2);
+            double offLvl = lastFifth();
+            me.MidiIn.Enqueue(0x90 | 64 << 8 | 90 << 16); me.Render(mb, Engine.SR / 2);
+            double held2 = lastFifth();
+            me.MidiIn.Enqueue(0x90 | 64 << 8);   // note-on with velocity 0 = note-off
+            me.Render(mb, Engine.SR / 2);
+            check(ccSilent && heldLvl > 0.05 && held2 > 0.05 && offLvl == 0 && lastFifth() == 0,
+                "MIDI note holds the synth (" + heldLvl.ToString("0.00") + " after 0.5 s) until note-off; velocity-0 note-on also ends it; controllers are silent");
+            // sustain pedal: a key let go while the pedal is down keeps sounding until the pedal comes up (value 63 counts as up)
+            var sp3 = Project.Demo(); sp3.Mixer[4].Slots[0] = null;
+            var pe2 = new Engine { Proj = sp3, MidiTarget = sp3.Channels[3] };
+            pe2.MidiIn.Enqueue(0xB0 | 64 << 8 | 127 << 16); pe2.MidiIn.Enqueue(0x90 | 60 << 8 | 100 << 16); pe2.MidiIn.Enqueue(0x80 | 60 << 8);
+            pe2.Render(mb, Engine.SR / 2);
+            double pedalHeld = lastFifth();
+            pe2.MidiIn.Enqueue(0xB0 | 64 << 8 | 63 << 16);
+            pe2.Render(mb, Engine.SR / 2);
+            check(pedalHeld > 0.05 && lastFifth() == 0, "sustain pedal keeps a released key sounding (" + pedalHeld.ToString("0.00") + " after 0.5 s) until the pedal comes up");
+            var mr = new Engine { Proj = Project.Demo(), Playing = true, MidiTarget = mp.Channels[3] };
+            var blk = new float[2048];
+            for (int k = 0; k < 40; k++) mr.Render(blk, 1024);
+            mr.MidiIn.Enqueue(0x90 | 60 << 8 | 100 << 16);
+            mr.Render(blk, 1024);
+            double spsD = 60.0 / 128 / 4 * Engine.SR, heard = (40 - 4.5) * 1024 / spsD;   // engine position minus the output buffers still to be heard
+            KeyValuePair<int, double> rec;
+            check(mr.MidiRec.TryDequeue(out rec) && rec.Key == (0x90 | 60 << 8 | 100 << 16) && Math.Abs(rec.Value - heard) < 1e-6,
+                "a key pressed while the pattern plays is placed where it was heard: step " + rec.Value.ToString("0.00") + " (rounds to " + Math.Round(rec.Value) + ")");
+            // velocity: a held synth note at velocity 50 plays at half the level of 100, both from the pattern and live from a key
+            Func<int, bool, double> synthAt = (vel, live) =>
+            {
+                var vp = Project.Demo(); vp.Mixer[4].Slots[0] = null;   // no delay on the synth's insert
+                foreach (var pt in vp.Patterns) for (int c = 0; c < 4; c++) pt.For(c).Clear();
+                var ve = new Engine { Proj = vp, Playing = !live, MidiTarget = vp.Channels[3] };
+                if (live) ve.MidiIn.Enqueue(0x90 | 60 << 8 | vel << 16);
+                else vp.Patterns[0].For(3).Add(new Note { Step = 0, Key = 60, Len = 4, Vel = vel });
+                var vb = new float[Engine.SR / 5 * 2];
+                ve.Render(vb, Engine.SR / 5);
+                return vb.Max(x => Math.Abs(x));
+            };
+            double v100 = synthAt(100, false), v50 = synthAt(50, false), v127 = synthAt(127, false), k50 = synthAt(50, true) / synthAt(100, true);
+            check(Math.Abs(v50 / v100 - 0.5) < 0.03 && v127 > v100 * 1.2 && Math.Abs(k50 - 0.5) < 0.03,
+                "velocity sets the level: 50 plays at " + (v50 / v100).ToString("0.00") + "x of 100 from the pattern, " + k50.ToString("0.00") + "x live; 127 is louder");
+            var vs = Project.Demo(); vs.Patterns[0].For(0)[0].Vel = 37; vs.Save(f);
+            var vq = Project.Load(f);
+            File.WriteAllText(f, "MINIDAW\t1\nch\tsynth\t0.8\t0\t0\tS\t\t1\npat\tP\nn\t0\t0\t60\t1\n");   // a note line from before velocity existed
+            var vo = Project.Load(f); File.Delete(f);
+            check(vq.Patterns[0].For(0)[0].Vel == 37 && vo.Patterns[0].For(0)[0].Vel == 100, "velocity survives save/load; older notes without one get 100");
+            var pr = new Engine { Proj = Project.Demo(), Playing = true, MidiTarget = sp3.Channels[3] };
+            for (int k = 0; k < 10; k++) pr.Render(blk, 1024);
+            pr.MidiIn.Enqueue(0xB0 | 64 << 8 | 127 << 16); pr.MidiIn.Enqueue(0x90 | 62 << 8 | 90 << 16); pr.MidiIn.Enqueue(0x80 | 62 << 8);
+            pr.Render(blk, 1024);
+            int beforeUp = pr.MidiRec.Count;
+            pr.MidiIn.Enqueue(0xB0 | 64 << 8);
+            pr.Render(blk, 1024);
+            var recd = pr.MidiRec.ToArray();
+            check(beforeUp == 1 && recd.Length == 2 && (recd[1].Key & 0xF0) == 0x80 && (recd[1].Key >> 8 & 0x7F) == 62 && recd[1].Value > recd[0].Value,
+                "while recording, the pedal holds the note open: its note-off is placed when the pedal comes up");
+            check(MidiInput.Devices() != null, "MIDI device list works (" + MidiInput.Devices().Count + " input(s) on this computer)");
+            var ph = Enumerable.Repeat(-1, PianoKeys.Length).ToArray();
+            int zOn = PianoMsg(Keys.Z, true, ph, 0), zRepeat = PianoMsg(Keys.Z, true, ph, 0), zOff = PianoMsg(Keys.Z, false, ph, 0);
+            Func<Keys, int, int> noteAt = (k, oct) => { int n = (PianoMsg(k, true, ph, oct) >> 8) & 0x7F; PianoMsg(k, false, ph, oct); return n; };
+            check(zOn == (0x90 | 48 << 8 | 100 << 16) && zRepeat == 0 && zOff == (0x80 | 48 << 8)
+                  && noteAt(Keys.M, 0) == 59 && noteAt(Keys.Q, 0) == 60 && noteAt(Keys.D2, 0) == 61 && noteAt(Keys.I, 0) == 72 && PianoMsg(Keys.A, true, ph, 0) == 0,
+                "computer keyboard: Z = C4, M = B4, Q = C5, 2 = C#5, I = C6; auto-repeat ignored; other keys aren't notes");
+            int heldOn = PianoMsg(Keys.Z, true, ph, 0), heldOff = PianoMsg(Keys.Z, false, ph, 1);   // the octave moves while Z is held
+            check(noteAt(Keys.Z, 1) == 60 && noteAt(Keys.Z, -3) == 12 && noteAt(Keys.I, 3) == 108 && heldOff == (0x80 | 48 << 8) && (heldOn >> 8 & 0x7F) == 48
+                  && NoteName(48) == "C4" && NoteName(73) == "C#6",
+                "octave shift: Z plays C5 one octave up, C1 three down, I reaches C9 three up; a key held across a shift releases the note it started");
+
+            // undo/redo history: steps only for gestures that changed something; a new edit clears redo; capped at 100
+            var h = new History(); string cur = "a";
+            Func<string> snapCur = () => cur;
+            h.Begin(snapCur); h.End(snapCur);                    // click that changed nothing
+            bool noStep = h.Undo(snapCur) == null;
+            h.Begin(snapCur); cur = "b"; h.End(snapCur);
+            h.Begin(snapCur); cur = "c"; h.End(snapCur);
+            string u1 = h.Undo(snapCur); cur = u1; string u2 = h.Undo(snapCur); cur = u2; string u3 = h.Undo(snapCur);
+            string r1 = h.Redo(snapCur); cur = r1; string r2 = h.Redo(snapCur); cur = r2; string r3 = h.Redo(snapCur);
+            cur = h.Undo(snapCur);                                // back to "b"
+            h.Begin(snapCur); cur = "d"; h.End(snapCur);          // new edit after undo
+            bool redoCleared = h.Redo(snapCur) == null;
+            check(noStep && u1 == "b" && u2 == "a" && u3 == null && r1 == "b" && r2 == "c" && r3 == null && redoCleared,
+                "undo history: no-op clicks leave no step; undo b->a, redo a->b->c; a new edit clears redo");
+            h.Clear(); cur = "0";
+            for (int k = 1; k <= 150; k++) { h.Begin(snapCur); cur = k.ToString(); h.End(snapCur); }
+            int undos = 0; string prev; while ((prev = h.Undo(snapCur)) != null) { cur = prev; undos++; }
+            check(undos == 100 && cur == "50", "undo history keeps the last 100 steps");
+            var sp2 = Project.Demo(); sp2.Channels.Add(new Channel { Kind = "sample", Name = "Mem", SamplePath = @"C:\no\such\file.wav", Sample = new float[] { 0.5f, -0.5f }, SampleRate = 22050 });
+            var rp = Project.Parse(sp2.Lines().ToArray(), sp2);
+            check(string.Join("\n", rp.Lines()) == string.Join("\n", sp2.Lines()) && rp.Warnings.Count == 0 && rp.Channels[4].Sample == sp2.Channels[4].Sample
+                  && rp.Mixer[2].Slots[0] != sp2.Mixer[2].Slots[0], "undo snapshot restores the project exactly, reuses samples in memory, and gives effects fresh state");
+
+            // deleting a channel shifts later channels' notes down; deleting a pattern fixes the playlist
+            var dc = Project.Demo(); dc.RemoveChannel(1);   // snare
+            var dcBack = Project.Parse(dc.Lines().ToArray(), null);
+            check(dc.Channels.Count == 3 && dc.Channels[1].Name == "Hat" && dc.Patterns[0].For(1).Count == 4 && dc.Patterns[0].For(1)[0].Step == 2
+                  && dc.Patterns[1].For(2).Count == 4 && dcBack.Channels.Count == 3, "deleting the Snare keeps Hat and Synth notes on the right channels, and the project still saves and loads");
+            var dpat = Project.Demo(); dpat.RemovePattern(0);
+            check(dpat.Patterns.Count == 1 && dpat.Patterns[0].Name == "Pattern 2" && dpat.Playlist[0, 0] == -1 && dpat.Playlist[0, 3] == -1
+                  && dpat.Playlist[1, 2] == 0 && dpat.Playlist[1, 5] == 0 && dpat.SongBars() == 6, "deleting Pattern 1 clears its playlist cells and renumbers Pattern 2's");
+
+            // longer patterns: Pattern 1 made 2 bars long with a single kick on step 25 (bar 2), placed at bar 1 of the song
+            Func<Project> twoBar = () =>
+            {
+                var tp = Project.Demo();
+                foreach (var pt in tp.Patterns) for (int c = 0; c < 4; c++) pt.For(c).Clear();
+                tp.Mixer[2].Slots[0] = tp.Mixer[4].Slots[0] = null;
+                tp.Patterns[0].SetBars(2);
+                tp.Patterns[0].For(0).Add(new Note { Step = 24, Key = 60, Len = 1 });
+                for (int t = 0; t < Project.Tracks; t++) for (int b = 0; b < Project.Bars; b++) tp.Playlist[t, b] = -1;
+                tp.Playlist[0, 0] = 0;
+                return tp;
+            };
+            double sp16 = 60.0 / 128 / 4 * Engine.SR;
+            Func<float[], int, int, double> peakIn = (a, from, to) => a.Skip((int)(from * sp16) * 2).Take((int)((to - from) * sp16) * 2).Max(x => Math.Abs(x));
+            var pb = Engine.Bounce(twoBar().ExportCopy(), false, 0);
+            var sb = Engine.Bounce(twoBar().ExportCopy(), true, 0);
+            check(pb.Length == 2 * (int)Math.Ceiling(32 * sp16) && peakIn(pb, 0, 23) == 0 && peakIn(pb, 24, 26) > 0.1,
+                "a 2-bar pattern exports as 2 bars and plays its bar-2 kick on step 25");
+            check(sb.SequenceEqual(pb), "placed at bar 1 of the song, the 2-bar pattern plays through bar 2 (same audio as the pattern)");
+            var cap = twoBar(); cap.Patterns[0].SetBars(4); cap.Playlist[0, 30] = 0;
+            check(cap.ClipAt(0, 1) == 0 && cap.ClipAt(0, 4) == -1 && cap.ClipAt(0, 31) == 30 && cap.SongBars() == 32,
+                "a clip covers as many bars as its pattern; a 4-bar clip at bar 31 is cut at the song's 32-bar end");
+            var sh = twoBar(); sh.Patterns[0].For(1).Add(new Note { Step = 12, Key = 60, Len = 8 }); sh.Patterns[0].SetBars(1);
+            check(sh.Patterns[0].For(0).Count == 0 && sh.Patterns[0].For(1)[0].Len == 4, "shortening a pattern drops notes past its end and trims notes that run over");
+            twoBar().Save(f);
+            var lq = Project.Load(f);
+            File.WriteAllText(f, "MINIDAW\t1\nch\tkick\t0.8\t0\t0\tK\t\t1\npat\tP\t1\nn\t0\t20\t60\t1\n");
+            threw = false; try { Project.Load(f); } catch (InvalidDataException) { threw = true; }
+            File.Delete(f);
+            check(lq.Patterns[0].Length == 32 && lq.Patterns[0].For(0)[0].Step == 24 && lq.Patterns[1].Length == 16 && threw,
+                "pattern length survives save/load; a note past a 1-bar pattern's end is rejected");
+
+            // swing: a kick on an off-beat 16th (step 2) starts half a 16th later at full swing; an on-beat one (step 3) doesn't move
+            Func<int, float, int> onset = (step, swing) =>
+            {
+                var wp = twoBar(); wp.Patterns[0].For(0).Clear(); wp.Patterns[0].For(0).Add(new Note { Step = step, Key = 60, Len = 1 }); wp.Swing = swing;
+                var wb = Engine.Bounce(wp.ExportCopy(), false, 0);
+                for (int k = 0; k < wb.Length; k += 2) if (wb[k] != 0) return k / 2;
+                return -1;
+            };
+            int straightOff = onset(1, 0), swungOff = onset(1, 1), halfOff = onset(1, 0.5f), straightOn = onset(2, 0), swungOn = onset(2, 1);
+            check(swungOff - straightOff == (int)Math.Round(0.5 * sp16) && halfOff - straightOff == (int)Math.Round(0.25 * sp16) && swungOn == straightOn && straightOff > 0,
+                "swing 100% delays an off-beat 16th by " + (swungOff - straightOff) + " samples (half a 16th), 50% by a quarter; on-beat notes stay put");
+            var swp = Project.Demo(); swp.Swing = 0.4f; swp.Save(f);
+            float swBack = Project.Load(f).Swing; File.Delete(f);
+            check(swBack == 0.4f && Project.Demo().Swing == 0, "swing survives save/load; new projects start straight");
+
+            // paste and duplicate: the synth's 4 chord notes in Pattern 2, copied into a 2-bar pattern and duplicated into bar 2
+            var cpj = Project.Demo(); cpj.Patterns[0].SetBars(2);
+            var chord = cpj.Patterns[1].For(3);   // steps 0, 4, 8, 12; each 3 steps long; velocity 100
+            chord[1].Vel = 70;
+            var pasted = cpj.Patterns[0].Paste(3, chord, 0);
+            int dup = Pattern.DupOffset(pasted);
+            var duped = cpj.Patterns[0].Paste(3, pasted, dup);
+            var again = cpj.Patterns[0].Paste(3, duped, dup);   // a third copy would start at step 32: past the 2-bar end
+            var p0 = cpj.Patterns[0].For(3);
+            check(pasted.Count == 4 && dup == 16 && duped.Count == 4 && again.Count == 0 && p0.Count == 8 && p0.Count(n => n.Step == 20 && n.Vel == 70) == 1
+                  && chord.Count == 4 && !p0.Intersect(chord).Any(),
+                "pasting copies the 4 notes (velocity too), Ctrl+B puts the next copy 16 steps later, copies past the end are dropped, the source is untouched");
+            cpj.Patterns[0].Paste(3, new[] { new Note { Step = 4, Key = chord[1].Key, Len = 2 } }, 0);
+            check(cpj.Patterns[0].For(3).Count(n => n.Step == 4 && n.Key == chord[1].Key) == 1 && cpj.Patterns[0].For(3).First(n => n.Step == 4).Len == 2
+                  && Pattern.DupOffset(new[] { new Note { Step = 2, Len = 3 } }) == 4, "a pasted note replaces one on the same step and key; a short selection duplicates one beat later");
+            var mvA = new Note { Step = 2, Key = 60, Len = 4 }; var mvB = new Note { Step = 10, Key = 125, Len = 2 };
+            var mvFrom = new Dictionary<Note, Point> { { mvA, new Point(2, 60) }, { mvB, new Point(10, 125) } };
+            check(Pattern.ClampMove(mvFrom, 16, 3, 1) == new Point(3, 1) && Pattern.ClampMove(mvFrom, 16, 9, 5) == new Point(4, 2) && Pattern.ClampMove(mvFrom, 16, -9, -70) == new Point(-2, -60),
+                "dragging two notes stops at the pattern's edges and the top/bottom of the MIDI range, keeping their spacing");
+
+            // every built-in sound plays, stays under full scale and ends after its note; the pitched ones play A4 in tune
+            var soundLog = new List<string>(); double worstTune = 1, worstHalf = -1;
+            Func<float[], int, double> match = (x, lag) =>   // normalised correlation of the left channel with itself shifted by lag, 0.1..0.3 s in
+            {
+                double num = 0, d1 = 0, d2 = 0;
+                for (int i = Engine.SR / 10; i < Engine.SR * 3 / 10; i++) { double x0 = x[2 * i], x1 = x[2 * (i + lag)]; num += x0 * x1; d1 += x0 * x0; d2 += x1 * x1; }
+                return num / Math.Sqrt(d1 * d2);
+            };
+            foreach (var kind in Channel.Sounds)
+            {
+                var sp4 = new Project(); sp4.Channels.Add(new Channel { Kind = kind, Name = kind, Insert = 1 });
+                var pat4 = new Pattern { Name = "P" }; sp4.Patterns.Add(pat4);
+                pat4.For(0).Add(new Note { Step = 0, Key = 69, Len = 16 });   // A4 = 440 Hz, held for the whole bar
+                var a4 = Engine.Bounce(sp4, false, 0);
+                double pk = a4.Max(x => Math.Abs(x));
+                bool ends = a4.Length / 2 < (int)Math.Ceiling(16 * sp16) + 3 * Engine.SR;
+                if (a4.Any(x => float.IsNaN(x)) || pk < 0.05 || pk > 0.9 || !ends) soundLog.Add(kind + " peak " + pk.ToString("0.00") + (ends ? "" : ", never ends"));
+                if (Array.IndexOf(new[] { "kick", "snare", "hat", "clap" }, kind) >= 0) continue;
+                int lag = (int)Math.Round(Engine.SR / (kind == "bass" ? 220.0 : 440.0));   // the bass adds a sine an octave down, so it repeats at 220 Hz
+                worstTune = Math.Min(worstTune, match(a4, lag));
+                worstHalf = Math.Max(worstHalf, match(a4, lag / 2));   // an octave too high would also repeat at half the period
+                soundLog.Add(kind + " " + match(a4, lag).ToString("0.00") + "/" + match(a4, lag / 2).ToString("0.00"));
+            }
+            string tuneInfo = string.Join(", ", soundLog.Where(l => !l.Contains("peak")));
+            soundLog.RemoveAll(l => !l.Contains("peak"));
+            check(soundLog.Count == 0, "all " + Channel.Sounds.Length + " built-in sounds play, stay under full scale and end after their note" + (soundLog.Count > 0 ? ": " + string.Join("; ", soundLog) : ""));
+            // pitch wheel: bends a keyboard note that's already sounding by up to ±2 semitones; pattern notes don't bend
+            Func<float[], int> periodOf = x => Enumerable.Range(60, 81).OrderByDescending(l => match(x, l)).First();   // best-repeating lag, 60..140 samples
+            Func<int, bool, int> bent = (wheel, fromPattern) =>
+            {
+                var bp = Project.Demo(); bp.Mixer[4].Slots[0] = null;
+                foreach (var pt in bp.Patterns) for (int c = 0; c < 4; c++) pt.For(c).Clear();
+                if (fromPattern) bp.Patterns[0].For(3).Add(new Note { Step = 0, Key = 69, Len = 16 });
+                var be = new Engine { Proj = bp, Playing = fromPattern, MidiTarget = bp.Channels[3] };
+                if (!fromPattern) be.MidiIn.Enqueue(0x90 | 69 << 8 | 100 << 16);
+                var bb = new float[Engine.SR];
+                be.Render(bb, Engine.SR / 10);   // the A4 is sounding before the wheel moves
+                be.MidiIn.Enqueue(0xE0 | (wheel & 0x7F) << 8 | (wheel >> 7) << 16);
+                be.Render(bb, Engine.SR / 2);
+                return periodOf(bb);
+            };
+            int pCentre = bent(8192, false), pUp = bent(16383, false), pDown = bent(0, false), pPattern = bent(16383, true);
+            check(pCentre == 100 && pUp == 89 && Math.Abs(pDown - 112.5) <= 1 && pPattern == 100,
+                "pitch wheel bends a sounding A4 (period " + pCentre + " samples) up 2 semitones to B4 (" + pUp + ") and down to G4 (" + pDown + "); a pattern note stays put (" + pPattern + ")");
+            // mod wheel: vibrato wobbles a live note's pitch around the same centre; with the wheel down, and for pattern notes, the pitch stays steady
+            Func<int, bool, float[]> modded = (wheel, fromPattern) =>
+            {
+                var vibP = Project.Demo(); vibP.Mixer[4].Slots[0] = null;
+                foreach (var pt in vibP.Patterns) for (int c = 0; c < 4; c++) pt.For(c).Clear();
+                if (fromPattern) vibP.Patterns[0].For(3).Add(new Note { Step = 0, Key = 69, Len = 16 });
+                var vibE = new Engine { Proj = vibP, Playing = fromPattern, MidiTarget = vibP.Channels[3] };
+                vibE.MidiIn.Enqueue(0xB0 | 1 << 8 | wheel << 16);
+                if (!fromPattern) vibE.MidiIn.Enqueue(0x90 | 69 << 8 | 100 << 16);
+                var vibB = new float[Engine.SR];
+                vibE.Render(vibB, Engine.SR / 2);
+                return vibB;
+            };
+            double steady = match(modded(0, false), 100), wobble = match(modded(127, false), 100), patSteady = match(modded(127, true), 100);
+            int wobbleCentre = periodOf(modded(127, false));
+            check(steady > 0.995 && wobble < 0.985 && patSteady > 0.995 && Math.Abs(wobbleCentre - 100) <= 1,   // steady is just under 1: A4's true period is 100.23 samples
+                "mod wheel adds vibrato to a live A4 (how exactly it repeats every 100 samples falls from " + steady.ToString("0.000") + " to " + wobble.ToString("0.000")
+                + "; it still centres on " + wobbleCentre + "); a pattern note stays steady (" + patSteady.ToString("0.000") + ")");
+            // sound settings: the built-in knob positions give exactly the old sounds; each knob does what its label says
+            var ksyn = new Channel { Kind = "synth" }; var kpad = new Channel { Kind = "pad" }; var kpl = new Channel { Kind = "pluck" };
+            check(ksyn.AttackSamples() == 220 && ksyn.ReleaseSamples() == 3500 && kpad.AttackSamples() == Engine.SR * 3 / 10 && kpad.ReleaseSamples() == Engine.SR * 6 / 10
+                  && kpl.AttackSamples() == 1 && kpl.ReleaseSamples() == 2500 && ksyn.Bright() == 1 && ksyn.Semitones() == 0,
+                "built-in knob positions give the original envelopes (saw 220/3500 samples, pad 0.3/0.6 s, pluck 1/2500), tone 1x, pitch 0");
+            Func<string, float[], float[]> playWith = (kind, knob) =>   // one channel holding A4 for a bar, with these knob values
+            {
+                var kp = new Project(); kp.Channels.Add(new Channel { Kind = kind, Name = kind, Insert = 1, Knob = knob });
+                var kpt = new Pattern { Name = "P" }; kp.Patterns.Add(kpt);
+                kpt.For(0).Add(new Note { Step = 0, Key = 69, Len = 16 });
+                return Engine.Bounce(kp, false, 0);
+            };
+            Func<string, int, float, float[]> knobAt = (kind, which, val) => { var kv2 = (float[])Channel.BuiltIn(kind).Clone(); kv2[which] = val; return kv2; };
+            Func<float[], double> hf = x =>   // share of high-frequency energy, 0.1..0.3 s in
+            {
+                double hdiff = 0, hsum = 0;
+                for (int i = Engine.SR / 10; i < Engine.SR * 3 / 10; i++) { double hv0 = x[2 * i], hv1 = x[2 * i - 2]; hdiff += (hv0 - hv1) * (hv0 - hv1); hsum += hv0 * hv0; }
+                return hdiff / hsum;
+            };
+            int pitched = periodOf(playWith("synth", knobAt("synth", Channel.KPitch, 0.5f + 3 / 48f)));
+            double dark = hf(playWith("synth", knobAt("synth", Channel.KTone, 0))), midTone = hf(playWith("synth", null)), bright = hf(playWith("synth", knobAt("synth", Channel.KTone, 1)));
+            float[] slowA = playWith("synth", knobAt("synth", Channel.KAttack, 1)), normal = playWith("synth", null);
+            double slowAt = slowA.Skip(Engine.SR / 10 * 2).Take(400).Max(x => Math.Abs(x)), normalAt = normal.Skip(Engine.SR / 10 * 2).Take(400).Max(x => Math.Abs(x));
+            int body16 = (int)Math.Ceiling(16 * sp16);
+            int longRel = playWith("synth", knobAt("synth", Channel.KRelease, 1)).Length / 2 - body16, normRel = normal.Length / 2 - body16;
+            check(pitched == 84 && dark < midTone && midTone < bright && slowAt < normalAt * 0.2 && longRel > 2 * Engine.SR && normRel < Engine.SR / 10,
+                "knobs work: Pitch +3 plays C5 (period " + pitched + " samples); Tone darkens and brightens (high-frequency share " + dark.ToString("0.0000") + " < " + midTone.ToString("0.0000")
+                + " < " + bright.ToString("0.0000") + "); a 2 s Attack is still quiet at 0.1 s; a 3 s Release rings " + (longRel / (double)Engine.SR).ToString("0.0") + " s past the note");
+            int kickNorm = playWith("kick", null).Length, kickLong = playWith("kick", knobAt("kick", Channel.KTone, 1)).Length;
+            var ksv = Project.Demo(); ksv.Channels[3].Knob = knobAt("synth", Channel.KTone, 0.8f); ksv.Save(f);
+            var ksq = Project.Load(f); File.Delete(f);
+            check(kickLong > kickNorm && ksq.Channels[3].K(Channel.KTone) == 0.8f && ksq.Channels[0].K(Channel.KAttack) == Channel.BuiltIn("kick")[0],
+                "drum Decay lengthens the kick; sound settings survive save/load");
+            // automating a sound setting: a Tone lane that is dark in bar 1 and bright in bar 2; exporting only changes the export's copy
+            var tp2 = new Project(); tp2.Channels.Add(new Channel { Kind = "synth", Name = "S", Insert = 1 });
+            var tpat = new Pattern { Name = "P" }; tp2.Patterns.Add(tpat); tpat.For(0).Add(new Note { Step = 0, Key = 69, Len = 16 });
+            tp2.Playlist[0, 0] = tp2.Playlist[0, 1] = 0;
+            var toneLane = new Lane { Ch = 0, Param = Channel.KTone };
+            for (int k = 0; k < toneLane.Values.Length; k++) toneLane.Values[k] = k < Project.Steps ? 0.1f : 0.9f;
+            tp2.Automation.Add(toneLane);
+            var tb = Engine.Bounce(tp2.ExportCopy(), true, 0);
+            Func<int, double> hfFrom = frame =>   // high-frequency share over 0.2 s from this frame
+            {
+                double hd2 = 0, hs2 = 0;
+                for (int i = frame; i < frame + Engine.SR / 5; i++) { double q0 = tb[2 * i], q1 = tb[2 * i - 2]; hd2 += (q0 - q1) * (q0 - q1); hs2 += q0 * q0; }
+                return hd2 / hs2;
+            };
+            double bar1 = hfFrom(Engine.SR / 10), bar2 = hfFrom(body16 + Engine.SR / 10);
+            check(bar2 > bar1 * 3 && tp2.Channels[0].Knob == null && toneLane.Name(tp2) == "S · Tone",
+                "a Tone lane makes bar 2 brighter than bar 1 in the export (high-frequency share " + bar1.ToString("0.0000") + " -> " + bar2.ToString("0.0000") + ") and leaves the live channel alone");
+            var dl = Project.Demo();
+            dl.Automation.Add(new Lane { Ch = 1, Param = Channel.KTone }); dl.Automation.Add(new Lane { Ch = 3, Param = Channel.KPitch }); dl.Automation[1].Values[5] = 0.7f;
+            dl.Save(f);
+            var dlq = Project.Load(f); File.Delete(f);
+            dl.RemoveChannel(1);
+            check(dlq.Automation.Count == 2 && dlq.Automation[1].Ch == 3 && dlq.Automation[1].Param == Channel.KPitch && dlq.Automation[1].Values[5] == 0.7f
+                  && dl.Automation.Count == 1 && dl.Automation[0].Ch == 2,
+                "sound-setting lanes survive save/load; deleting a channel drops its lanes and renumbers later channels' lanes");
+            // rack volume and pan lanes, on the demo's Kick playing alone
+            Func<int, float, float[]> rackLane = (param, first) =>   // lane value "first" for bar 1, 0 afterwards
+            {
+                var rl = Project.Demo();
+                foreach (var pt in rl.Patterns) for (int c = 1; c < 4; c++) pt.For(c).Clear();
+                var lane = new Lane { Ch = 0, Param = param };
+                for (int k = 0; k < lane.Values.Length; k++) lane.Values[k] = k < Project.Steps ? first : 0;
+                rl.Automation.Add(lane);
+                return Engine.Bounce(rl.ExportCopy(), true, 0);
+            };
+            var volOut = rackLane(Channel.LaneVol, 0.8f); var panOut = rackLane(Channel.LanePan, 0);   // pan lane 0 = hard left throughout
+            var rlive = Project.Demo(); var rlane = new Lane { Ch = 0, Param = Channel.LaneVol }; rlive.Automation.Add(rlane);
+            Engine.Bounce(rlive.ExportCopy(), true, 0);
+            var rs = Project.Demo(); rs.Automation.Add(new Lane { Ch = 2, Param = Channel.LanePan }); rs.Save(f);
+            var rsq = Project.Load(f); File.Delete(f);
+            check(volOut.Take(15 * sps128 * 2).Max(x => Math.Abs(x)) > 0.1 && volOut.Skip(17 * sps128 * 2).Take(14 * sps128 * 2).All(x => x == 0)
+                  && panOut.Where((x, i) => i % 2 == 1).All(x => x == 0) && panOut.Where((x, i) => i % 2 == 0).Max(x => Math.Abs(x)) > 0.1
+                  && rlive.Channels[0].Vol == 0.8f && rlane.Name(rlive) == "Kick · Volume" && rsq.Automation[0].Name(rsq) == "Hat · Pan",
+                "rack lanes: the Kick's volume lane silences bar 2, its pan lane at hard left leaves the right speaker silent; exports leave the live rack alone; they save and load");
+            // tempo lane: the demo kick for 2 bars, bar 1 at 120 BPM (2 s) and bar 2 at 60 BPM (4 s)
+            var tpo = Project.Demo();
+            foreach (var pt in tpo.Patterns) for (int c = 1; c < 4; c++) pt.For(c).Clear();
+            for (int t = 0; t < Project.Tracks; t++) for (int b = 0; b < Project.Bars; b++) tpo.Playlist[t, b] = -1;
+            tpo.Playlist[0, 0] = tpo.Playlist[0, 1] = 0;
+            var tl = new Lane { Tempo = true };
+            for (int k = 0; k < tl.Values.Length; k++) tl.Values[k] = ((k < Project.Steps ? 120 : 60) - Project.MinBpm) / (float)(Project.MaxBpm - Project.MinBpm);
+            tpo.Automation.Add(tl);
+            double tsec = Engine.Bounce(tpo.ExportCopy(), true, 0).Length / 2.0 / Engine.SR;
+            tpo.Save(f);
+            var tpq = Project.Load(f); File.Delete(f);
+            check(tsec > 5.9 && tsec < 6.3 && tpo.Bpm == 128 && tl.Name(tpo) == "Tempo (BPM)" && tpq.Automation[0].Tempo && tpq.Automation[0].Values.SequenceEqual(tl.Values),
+                "a tempo lane (120 BPM, then 60) stretches the 2-bar export to " + tsec.ToString("0.00") + " s (2 s + 4 s); the live BPM stays 128; it saves and loads");
+            // 8 effect slots: a 40 Hz low-pass in the last slot of the synth's insert still filters, and that slot saves and loads
+            var e8 = Project.Demo();
+            foreach (var pt in e8.Patterns) for (int c = 0; c < 4; c++) pt.For(c).Clear();
+            e8.Patterns[0].For(3).Add(new Note { Step = 0, Key = 81, Len = 16 });   // A5 on the synth, insert 4
+            e8.Mixer[4].Slots[0] = null;
+            var lp8 = new Effect("Filter"); lp8.P[0] = 0; lp8.P[1] = 0; lp8.P[2] = 0;
+            e8.Mixer[4].Slots[Insert.SlotCount - 1] = lp8;
+            double filtered = Engine.Bounce(e8.ExportCopy(), false, 0).Max(x => Math.Abs(x));
+            e8.Mixer[4].Slots[Insert.SlotCount - 1] = null;
+            double unfiltered = Engine.Bounce(e8.ExportCopy(), false, 0).Max(x => Math.Abs(x));
+            e8.Mixer[4].Slots[Insert.SlotCount - 1] = lp8; e8.Save(f);
+            var q8 = Project.Load(f); File.Delete(f);
+            check(Insert.SlotCount == 8 && filtered < unfiltered * 0.1 && q8.Mixer[4].Slots[7] != null && q8.Mixer[4].Slots[7].Type == "Filter",
+                "8 effect slots per insert: a 40 Hz low-pass in slot 8 cuts the synth to " + (filtered / unfiltered).ToString("0.000") + " of its level, and slot 8 saves and loads");
+            // bypass: the same low-pass switched off sounds exactly like no effect at all, keeps its settings, and the off state saves and loads
+            lp8.Bypass = true;
+            var dry8 = Engine.Bounce(e8.ExportCopy(), false, 0);
+            e8.Mixer[4].Slots[Insert.SlotCount - 1] = null;
+            bool sameAsEmpty = dry8.SequenceEqual(Engine.Bounce(e8.ExportCopy(), false, 0));
+            e8.Mixer[4].Slots[Insert.SlotCount - 1] = lp8; e8.Save(f);
+            var qb = Project.Load(f); File.Delete(f);
+            check(sameAsEmpty && lp8.P[0] == 0 && qb.Mixer[4].Slots[7].Bypass && !q8.Mixer[4].Slots[7].Bypass,
+                "a bypassed effect sounds exactly like an empty slot and keeps its settings; the on/off state saves and loads");
+            // reordering: low-pass then distortion sounds different from distortion then low-pass; moving the effect gives exactly the
+            // reversed chain, an automation lane follows its effect, and empty slots shift along with the rest
+            Func<bool, Project> twoFx = reversed =>
+            {
+                var fxp = Project.Demo();
+                foreach (var pt in fxp.Patterns) for (int c = 0; c < 4; c++) pt.For(c).Clear();
+                fxp.Patterns[0].For(3).Add(new Note { Step = 0, Key = 69, Len = 16 });
+                var lpf = new Effect("Filter"); lpf.P[0] = 0; lpf.P[1] = 0; lpf.P[2] = 0;
+                var dst = new Effect("Distortion"); dst.P[0] = 1; dst.P[1] = 1; dst.P[2] = 1;
+                fxp.Mixer[4].Slots[0] = reversed ? dst : lpf; fxp.Mixer[4].Slots[1] = reversed ? lpf : dst;
+                return fxp;
+            };
+            var mv = twoFx(false); var drive = new Lane { Ins = 4, Slot = 1, Param = 0 }; mv.Automation.Add(drive);
+            var beforeMove = Engine.Bounce(mv.ExportCopy(), false, 0);
+            mv.MoveEffect(4, 1, 0);
+            var afterMove = Engine.Bounce(mv.ExportCopy(), false, 0);
+            var gp = Project.Demo(); Effect ea = new Effect("EQ"), eb = new Effect("Delay"), ec = new Effect("Reverb");
+            gp.Mixer[3].Slots = new[] { ea, eb, null, ec, null, null, null, null };
+            gp.MoveEffect(3, 0, 5);
+            check(!afterMove.SequenceEqual(beforeMove) && afterMove.SequenceEqual(Engine.Bounce(twoFx(true).ExportCopy(), false, 0)) && mv.Mixer[4].Slots[0].Type == "Distortion"
+                  && drive.Slot == 0 && gp.Mixer[3].Slots[0] == eb && gp.Mixer[3].Slots[1] == null && gp.Mixer[3].Slots[2] == ec && gp.Mixer[3].Slots[5] == ea,
+                "moving Distortion above the low-pass gives exactly the reversed chain's sound; its automation lane follows it; moving slot 1 to slot 6 shifts the rest up");
+            // wet/dry mix: 0 leaves the sound untouched (in the full export too), 50% lands exactly halfway between dry and fully processed
+            var sig = Enumerable.Range(0, Engine.SR).Select(k => (float)(0.05 * Math.Sin(2 * Math.PI * 100 * (k / 2) / Engine.SR))).ToArray();   // a quiet stereo tone
+            Func<float, float[]> distAt = mixv =>
+            {
+                var dd = new Effect("Distortion"); dd.P[0] = 1; dd.P[1] = 1; dd.P[2] = 1; dd.Mix = mixv;
+                var xs2 = (float[])sig.Clone(); float[] scratch = null;
+                dd.Run(xs2, xs2.Length, null, ref scratch);
+                return xs2;
+            };
+            float[] wetOut = distAt(1), halfOut = distAt(0.5f), dryOut = distAt(0);
+            bool halfway = Enumerable.Range(0, sig.Length).All(k => Math.Abs(halfOut[k] - (sig[k] + wetOut[k]) / 2) < 1e-5);
+            lp8.Bypass = false; lp8.Mix = 0; e8.Mixer[4].Slots[Insert.SlotCount - 1] = lp8;
+            bool zeroIsEmpty = Engine.Bounce(e8.ExportCopy(), false, 0).SequenceEqual(dry8);
+            lp8.Mix = 0.3f; var wetLane = new Lane { Ins = 4, Slot = Insert.SlotCount - 1, Param = Lane.FxMix }; e8.Automation.Add(wetLane); e8.Save(f);
+            var qm = Project.Load(f); File.Delete(f);
+            check(halfway && dryOut.SequenceEqual(sig) && !wetOut.SequenceEqual(sig) && zeroIsEmpty && qm.Mixer[4].Slots[7].Mix == 0.3f
+                  && qm.Automation.Last().Param == Lane.FxMix && wetLane.Name(e8) == "Insert 4 · Filter Wet/dry",
+                "effect mix: 0% leaves the sound exactly untouched, even in an export; 50% is exactly halfway between dry and processed; mix and its lane save and load");
+            // recent projects: newest first, at most 8, no repeats (ignoring case); tested on a temp file, never the user's real list
+            string realRecent = Recent.FilePath;
+            Recent.FilePath = Path.Combine(Path.GetTempPath(), "minidaw_recent_test.txt");
+            try
+            {
+                File.Delete(Recent.FilePath);
+                for (int k = 1; k <= 10; k++) Recent.Add(Path.Combine(Path.GetTempPath(), "song" + k + ".mdaw"));
+                Recent.Add(Path.Combine(Path.GetTempPath(), "SONG5.mdaw"));   // already listed: moves to the top instead of repeating
+                var rl2 = Recent.Load();
+                Recent.Remove(rl2[1]);
+                var rl3 = Recent.Load();
+                check(rl2.Count == 8 && rl2[0].EndsWith("SONG5.mdaw") && rl2[1].EndsWith("song10.mdaw") && rl2.Count(x => x.ToLowerInvariant().EndsWith("song5.mdaw")) == 1
+                      && !rl2.Any(x => x.EndsWith("song1.mdaw") || x.EndsWith("song2.mdaw")) && rl3.Count == 7 && rl3[1].EndsWith("song9.mdaw"),
+                    "recent projects: newest first, at most 8; opening one again moves it to the top without repeating it; a removed one disappears");
+            }
+            finally { File.Delete(Recent.FilePath); Recent.FilePath = realRecent; }
+            // autosave file = the project's own lines plus an "origin" line; it must read back as exactly the same project
+            var orig = Project.Demo(); orig.Bpm = 111; orig.Patterns[0].For(3).Add(new Note { Step = 5, Key = 70, Len = 2, Vel = 64 });
+            var withOrigin = orig.Lines(); withOrigin.Add("origin\tC:\\Music\\My song.mdaw");
+            check(string.Join("\n", Project.Parse(withOrigin.ToArray(), null).Lines()) == string.Join("\n", orig.Lines()),
+                "an autosave (the project plus where it came from) reads back as exactly the same project");
+            check(Droppable(new[] { @"C:\x\Kick.WAV" }) && Droppable(new[] { "notes.txt", "song.mdaw" }) && !Droppable(new[] { "notes.txt", "photo.jpg" }) && !Droppable(null),
+                "drag-and-drop accepts WAV and project files (any case) and refuses a drop with neither");
+            var mc = Project.Demo();   // track 1: Pattern 1 on bars 1-4; track 2: Pattern 2 on bars 3-6
+            mc.MoveClip(1, 5, 4, 10, false); mc.MoveClip(0, 0, 0, 20, true); mc.MoveClip(2, 2, 3, 3, false);   // the last one: nothing there
+            check(mc.Playlist[1, 5] == -1 && mc.Playlist[4, 10] == 1 && mc.Playlist[0, 0] == 0 && mc.Playlist[0, 20] == 0 && mc.Playlist[3, 3] == -1 && mc.SongBars() == 21,
+                "moving a playlist clip empties its old place; copying keeps it; the song grows to reach the moved clip");
+            // logo: a yellow banana on a transparent square, and a well-formed .ico with 5 sizes
+            using (var logo = Logo.Draw(64))
+            {
+                var ico = Logo.Ico();
+                int yellow = 0; for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) { var px = logo.GetPixel(x, y); if (px.A > 200 && px.R > 200 && px.G > 150 && px.B < 140) yellow++; }
+                check(logo.GetPixel(0, 0).A == 0 && logo.GetPixel(63, 63).A == 0 && yellow > 250 && BitConverter.ToInt16(ico, 2) == 1 && BitConverter.ToInt16(ico, 4) == 5 && ico[6] == 16
+                      && ico[6 + 16 * 4] == 0 && BitConverter.ToInt32(ico, 6 + 16 * 4 + 12) + BitConverter.ToInt32(ico, 6 + 16 * 4 + 8) == ico.Length,
+                    "logo: " + yellow + " yellow pixels of 64x64 with transparent corners; the .ico holds 16..256 px images and its last image ends at the end of the file");
+            }
+            check(worstTune > 0.8 && worstHalf < 0.5, "the pitched sounds play A4 in tune: each repeats every 1/440 s (bass 1/220 s) and not every half of that (match full/half: " + tuneInfo + ")");
+
+            // mixer routing: only the kick plays, and it feeds insert 1
+            var r = Project.Demo();
+            foreach (var pat in r.Patterns) for (int c = 1; c < 4; c++) pat.For(c).Clear();
+            r.Mixer[1].Mute = true;
+            var rb = new float[Engine.SR];
+            new Engine { Proj = r, Playing = true }.Render(rb, Engine.SR / 2);
+            check(rb.All(v => v == 0), "muting insert 1 silences the kick routed to it");
+            r.Mixer[1].Mute = false;
+            var re = new Engine { Proj = r, Playing = true };
+            re.Render(rb, Engine.SR / 2);
+            check(rb.Max(v => Math.Abs(v)) > 0.1 && re.Peaks[1] > 0.1 && re.Peaks[3] == 0, "insert 1 passes the kick and meters it; insert 3 stays silent");
+            check(re.Peaks[5] == 0, "with no send, insert 5 stays silent");
+            r.Mixer[1].SendTo = 5; r.Mixer[1].SendLevel = 1;
+            var se = new Engine { Proj = r, Playing = true };
+            se.Render(rb, Engine.SR / 2);
+            check(se.Peaks[5] > 0.1 && Math.Abs(se.Peaks[5] - se.Peaks[1]) < 1e-4, "send copies insert 1 into insert 5 at full level");
+
+            // sidechain: the kick on insert 1 drives the Compressor on insert 4, which holds one long synth note
+            Func<bool, double> synthPeak = withKick =>
+            {
+                var sp = Project.Demo();
+                foreach (var pt in sp.Patterns) for (int c = 0; c < 4; c++) pt.For(c).Clear();
+                if (withKick) sp.Patterns[0].For(0).Add(new Note { Step = 0, Key = 60, Len = 1 });
+                sp.Patterns[0].For(3).Add(new Note { Step = 0, Key = 60, Len = 16 });
+                var cm = new Effect("Compressor"); cm.P[0] = 1; cm.P[1] = 1; cm.P[2] = 0;   // -48 dB, 20:1, no make-up
+                sp.Mixer[4].Slots[0] = cm; sp.Mixer[4].Sidechain = 1;
+                var en = new Engine { Proj = sp, Playing = true };
+                en.Render(new float[Engine.SR / 5 * 2], Engine.SR / 5);
+                return en.Peaks[4];
+            };
+            double ducked = synthPeak(true), open = synthPeak(false);
+            check(open > 0.1 && ducked < 0.3 * open, "sidechain: kick ducks the synth to " + ducked.ToString("0.00") + "; without the kick the synth stays at " + open.ToString("0.00"));
+
+            // effects: stable at parameter extremes, and each one does its job
+            foreach (var type in Effect.Types)
+                foreach (var val in new[] { 0f, 1f })
+                {
+                    var fx = new Effect(type);
+                    for (int j = 0; j < 3; j++) fx.P[j] = val;
+                    var xs = new float[Engine.SR * 2];   // 1 s stereo: 0.1 s noise burst, then silence
+                    var rnd = new Random(1);
+                    for (int k = 0; k < 4410 * 2; k++) xs[k] = (float)(rnd.NextDouble() * 2 - 1);
+                    fx.Process(xs, xs.Length);
+                    check(xs.All(v => !float.IsNaN(v) && !float.IsInfinity(v) && Math.Abs(v) < 100), type + " stays stable with every setting at " + val);
+                }
+            var dly = new Effect("Delay"); dly.P[0] = 0.5f; dly.P[1] = 0; dly.P[2] = 1;
+            var imp = new float[Engine.SR * 2]; imp[0] = imp[1] = 1;
+            dly.Process(imp, imp.Length);
+            int dSamples = (int)((0.02 + 0.5 * 0.98) * Engine.SR);
+            check(Math.Abs(imp[2 * dSamples] - 1) < 1e-6 && Math.Abs(imp[2 * dSamples + 1] - 1) < 1e-6, "delay echo lands at " + dly.Label(0));
+            var rev = new Effect("Reverb");
+            var tail = new float[Engine.SR * 2]; tail[0] = tail[1] = 1;
+            rev.Process(tail, tail.Length);
+            check(tail.Skip(Engine.SR).Max(v => Math.Abs(v)) > 1e-4, "reverb still rings 0.5 s after a click");
+            var lp = new Effect("Filter"); lp.P[0] = 0; lp.P[1] = 0; lp.P[2] = 0;   // 40 Hz low-pass
+            var sine = Enumerable.Range(0, Engine.SR).Select(k => (float)Math.Sin(2 * Math.PI * 5000 * (k / 2) / Engine.SR)).ToArray();
+            lp.Process(sine, sine.Length);
+            check(sine.Skip(Engine.SR / 2).Max(v => Math.Abs(v)) < 0.01, "40 Hz low-pass removes a 5 kHz tone");
+            var dist = new Effect("Distortion"); dist.P[0] = 1; dist.P[1] = 1; dist.P[2] = 1;
+            var quiet = Enumerable.Range(0, Engine.SR).Select(k => (float)(0.05 * Math.Sin(2 * Math.PI * 100 * (k / 2) / Engine.SR))).ToArray();
+            dist.Process(quiet, quiet.Length);
+            check(quiet.Skip(Engine.SR / 2).Max(v => Math.Abs(v)) > 0.3, "distortion drive boosts a quiet tone");
+
+            // EQ and compressor: tone(hz, amp) = 1 s of stereo sine; settled() = peak of its second half after processing
+            Func<double, double, float[]> toneOf = (hz, amp) => Enumerable.Range(0, Engine.SR * 2).Select(k => (float)(amp * Math.Sin(2 * Math.PI * hz * (k / 2) / Engine.SR))).ToArray();
+            Func<Effect, float[], double> settled = (fx, x) => { fx.Process(x, x.Length); return x.Skip(Engine.SR).Max(v => Math.Abs(v)); };
+            var noise = new float[Engine.SR * 2]; var rn = new Random(2);
+            for (int k = 0; k < noise.Length; k++) noise[k] = (float)(rn.NextDouble() * 2 - 1);
+            var flat = (float[])noise.Clone();
+            new Effect("EQ").Process(flat, flat.Length);
+            check(flat.Zip(noise, (x, y) => Math.Abs(x - y)).Max() < 1e-5, "EQ with all bands at 0 dB leaves the sound unchanged");
+            var eq = new Effect("EQ"); eq.P[0] = 0;
+            double lo = settled(eq, toneOf(50, 1));
+            check(lo < 0.4, "EQ low band at " + eq.Label(0) + " cuts a 50 Hz tone to " + lo.ToString("0.00"));
+            eq = new Effect("EQ"); eq.P[2] = 1;
+            double hi = settled(eq, toneOf(10000, 1));
+            check(hi > 2.5, "EQ high band at " + eq.Label(2) + " boosts a 10 kHz tone to " + hi.ToString("0.00"));
+            var comp = new Effect("Compressor"); comp.P[0] = 0.25f; comp.P[1] = 1; comp.P[2] = 0;
+            double loud = settled(comp, toneOf(1000, 1));
+            check(loud > 0.2 && loud < 0.35, "compressor (" + comp.Label(0) + ", " + comp.Label(1) + ") squashes a full-scale tone to " + loud.ToString("0.00"));
+            comp = new Effect("Compressor"); comp.P[0] = 0.25f; comp.P[1] = 1;
+            double soft = settled(comp, toneOf(1000, 0.1));
+            check(Math.Abs(soft / 0.1 - 1.995) < 0.04, "compressor leaves a tone under the threshold alone and adds " + comp.Label(2) + " (0.10 -> " + soft.ToString("0.00") + ")");
+
+            check(Updates.Newer("v1.2", "1.1") && Updates.Newer("1.10", "1.9") && Updates.Newer("v2.0.1", "2.0") && !Updates.Newer("v1.1.0", "1.1") && !Updates.Newer("v1.0", "1.1")
+                && !Updates.Newer("nightly", "1.1") && !Updates.Newer(null, "1.1"),
+                "update check: v1.2 > 1.1, 1.10 > 1.9, v2.0.1 > 2.0; v1.1.0 is the same as 1.1; an older or non-numeric tag is no update");
+            string asmVer = typeof(AboutForm).Assembly.GetName().Version.ToString();
+            check(!Updates.Newer(asmVer, AboutForm.Version) && !Updates.Newer(AboutForm.Version, asmVer), "the exe's own version (read by the installer) is " + asmVer + ", matching " + AboutForm.Version);
+        }
+        catch (Exception ex) { log.Add("FAIL exception: " + ex); ok = false; }
+        File.WriteAllLines(outPath, log);
+        return ok ? 0 : 1;
+    }
+}
