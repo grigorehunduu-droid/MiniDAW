@@ -8,7 +8,7 @@ All of it is one C# file, [MiniDAW.cs](MiniDAW.cs), with no dependencies. It use
 
 ## Download and install
 
-1. Open the [latest release](../../releases/latest) and download **MiniDAW-Setup.exe**.
+1. Open the [latest release](https://github.com/grigorehunduu-droid/MiniDAW/releases/latest) and download **MiniDAW-Setup.exe**.
 2. Run it and click **Install**. It installs for your Windows user only (no admin rights), into `%LOCALAPPDATA%\Programs\MiniDAW`, with a Start-menu shortcut and, if you leave the box ticked, a desktop one.
 3. The installer isn't code-signed, so Windows may say "Windows protected your PC". Click **More info → Run anyway**.
 
