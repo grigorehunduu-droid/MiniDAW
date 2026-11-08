@@ -3958,10 +3958,10 @@ class MainForm : Form
         var bars = new List<double>(); int barNo, beats, lastLabel = -100;
         for (int st = (int)Math.Floor(plFrom); st <= to; st++) if (P.BarAt(st, out barNo, out beats)) bars.Add(st);
         float barPx = (float)(16 * cw); int every = barPx >= 30 ? 1 : barPx >= 12 ? 4 : 16;
-        foreach (var st in bars)
+        foreach (var st in bars)   // bar numbers; a marker's flag takes the place of its bar's number
         {
             P.BarAt(st, out barNo, out beats);
-            if ((barNo - 1) % every == 0 && PlX(st) - lastLabel > 20 && !P.Markers.Any(mk => Math.Abs(PlX(mk.At) - PlX(st)) < 30)) {   // a marker's flag takes the place of its bar's number g.DrawString(barNo.ToString(), Small, barNo == 1 ? TxtB : DimB, PlX(st) + 2, 24); lastLabel = (int)PlX(st); }
+            if ((barNo - 1) % every == 0 && PlX(st) - lastLabel > 20 && !P.Markers.Any(mk => Math.Abs(PlX(mk.At) - PlX(st)) < 30)) { g.DrawString(barNo.ToString(), Small, barNo == 1 ? TxtB : DimB, PlX(st) + 2, 24); lastLabel = (int)PlX(st); }
         }
         foreach (var m in P.Markers)
         {
