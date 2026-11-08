@@ -199,11 +199,13 @@ class Lane   // automation clip: one value (0..1) per 16th across the whole play
 
 class Effect
 {
-    public static readonly string[] Types = { "Delay", "Reverb", "Filter", "Distortion", "EQ", "Compressor" };
+    public static readonly string[] Types = { "Delay", "Reverb", "Filter", "Distortion", "EQ", "Compressor", "Limiter", "Chorus", "Flanger", "Phaser" };
     static readonly string[][] Names = { new[] { "Time", "Feedback", "Mix" }, new[] { "Size", "Damp", "Mix" }, new[] { "Cutoff", "Reso", "Mode" }, new[] { "Drive", "Tone", "Mix" },
-        new[] { "Low", "Mid", "High" }, new[] { "Threshold", "Ratio", "Gain" } };
+        new[] { "Low", "Mid", "High" }, new[] { "Threshold", "Ratio", "Gain" }, new[] { "Ceiling", "Release", "Gain" },
+        new[] { "Depth", "Rate", "Mix" }, new[] { "Depth", "Rate", "Feedback" }, new[] { "Depth", "Rate", "Feedback" } };
     static readonly float[][] Defaults = { new[] { 0.35f, 0.4f, 0.35f }, new[] { 0.6f, 0.4f, 0.3f }, new[] { 0.6f, 0.2f, 0f }, new[] { 0.4f, 0.6f, 1f },
-        new[] { 0.5f, 0.5f, 0.5f }, new[] { 0.25f, 3f / 19, 0.25f } };   // EQ flat; compressor -12 dB, 4:1, +6 dB
+        new[] { 0.5f, 0.5f, 0.5f }, new[] { 0.25f, 3f / 19, 0.25f },   // EQ flat; compressor -12 dB, 4:1, +6 dB
+        new[] { 0.025f, 0.35f, 0f }, new[] { 0.5f, 0.45f, 1f }, new[] { 0.6f, 0.3f, 0.5f }, new[] { 0.6f, 0.35f, 0.4f } };   // limiter -0.3 dB, ~40 ms, +0 dB
     static readonly int[] CombLen = { 1116, 1188, 1277, 1356 }, ApLen = { 556, 441 };   // Freeverb tunings at 44.1 kHz
 
     public readonly string Type;
@@ -226,6 +228,8 @@ class Effect
     float[] dl; int wp;
     float[][] comb, ap; readonly float[] store = new float[8]; readonly int[] ci = new int[8], ai = new int[4];
     readonly double[] s1 = new double[2], s2 = new double[2];
+    double lfo; float[] peaks;   // modulation phase (chorus, flanger, phaser); the limiter's look-ahead window of peak levels
+    readonly double[] apx = new double[12], apy = new double[12];   // phaser: 6 all-pass stages per side
 
     public Effect(string type)
     {
@@ -246,6 +250,10 @@ class Effect
         else if (t == 5 && i == 0) v = ThreshDb().ToString("0", CultureInfo.InvariantCulture) + " dB";
         else if (t == 5 && i == 1) v = Ratio().ToString("0.0", CultureInfo.InvariantCulture) + ":1";
         else if (t == 5) v = "+" + MakeupDb().ToString("0.0", CultureInfo.InvariantCulture) + " dB";
+        else if (t == 6 && i == 0) v = CeilingDb().ToString("0.0", CultureInfo.InvariantCulture) + " dB";
+        else if (t == 6 && i == 1) v = (int)Math.Round(ReleaseMs()) + " ms";
+        else if (t == 6) v = "+" + LimitGainDb().ToString("0.0", CultureInfo.InvariantCulture) + " dB";
+        else if (t >= 7 && i == 1) v = RateHz().ToString("0.00", CultureInfo.InvariantCulture) + " Hz";
         else v = (int)Math.Round(P[i] * 100) + "%";
         return Names[t][i] + "  " + v;
     }
@@ -257,6 +265,10 @@ class Effect
     double ThreshDb() { return -48 * P[0]; }                  // 0 .. -48 dB: drag right to compress more
     double Ratio() { return 1 + P[1] * 19; }                  // 1:1 .. 20:1
     double MakeupDb() { return P[2] * 24; }                   // 0 .. +24 dB (the faders can't boost, this can)
+    double CeilingDb() { return -12 * P[0]; }                 // limiter: 0 .. -12 dB
+    double ReleaseMs() { return 10 * Math.Pow(50, P[1]); }    // 10 .. 500 ms
+    double LimitGainDb() { return P[2] * 24; }                // drive into the ceiling: 0 .. +24 dB
+    double RateHz() { return 0.05 * Math.Pow(100, P[1]); }    // modulation: 0.05 .. 5 Hz
 
     public void Process(float[] b, int n2, float[] key = null)   // b = interleaved stereo, n2 = float count; key = sidechain input (Compressor only)
     {
@@ -267,7 +279,91 @@ class Effect
             case 2: Filter(b, n2); break;
             case 3: Distort(b, n2); break;
             case 4: Eq(b, n2); break;
-            default: Compress(b, n2, key ?? b); break;
+            case 5: Compress(b, n2, key ?? b); break;
+            case 6: Limit(b, n2); break;
+            case 7: Chorus(b, n2); break;
+            case 8: Flange(b, n2); break;
+            default: Phase(b, n2); break;
+        }
+    }
+
+    // Look-ahead brickwall limiter: the output runs 5 ms behind the input, so the gain is already down when a peak arrives.
+    // Gain = ceiling / the loudest sample in that 5 ms window, falling fast and recovering over Release; a final clamp
+    // catches whatever the smoothing leaves.
+    void Limit(float[] b, int n2)
+    {
+        int look = (int)(0.005 * Engine.SR), len = look + 1;
+        if (dl == null) { dl = new float[len * 2]; peaks = new float[len]; s1[0] = 1; }
+        double ceil = Math.Pow(10, CeilingDb() / 20), drive = Math.Pow(10, LimitGainDb() / 20);
+        double att = Math.Exp(-5.0 / look), rel = Math.Exp(-1 / (ReleaseMs() * 0.001 * Engine.SR));
+        for (int k = 0; k < n2; k += 2)
+        {
+            float l = (float)(b[k] * drive), r = (float)(b[k + 1] * drive);
+            dl[2 * wp] = l; dl[2 * wp + 1] = r; peaks[wp] = Math.Max(Math.Abs(l), Math.Abs(r));
+            float max = 0; foreach (var pk in peaks) max = Math.Max(max, pk);   // the window: every sample between the one going out and the newest
+            double want = max > ceil ? ceil / max : 1;
+            s1[0] = want < s1[0] ? want + att * (s1[0] - want) : want + rel * (s1[0] - want);
+            int rp = (wp + 1) % len;   // the oldest sample: 5 ms ago
+            b[k] = (float)Math.Max(-ceil, Math.Min(ceil, dl[2 * rp] * s1[0]));
+            b[k + 1] = (float)Math.Max(-ceil, Math.Min(ceil, dl[2 * rp + 1] * s1[0]));
+            wp = rp;
+        }
+    }
+
+    float Tap(int side, double delay, int len)   // the delay line `delay` samples back, linearly interpolated
+    {
+        double rp = wp - delay; while (rp < 0) rp += len;
+        int i0 = (int)rp % len, i1 = (i0 + 1) % len; double f = rp - Math.Floor(rp);
+        return (float)(dl[2 * i0 + side] * (1 - f) + dl[2 * i1 + side] * f);
+    }
+
+    void Chorus(float[] b, int n2)   // two copies 8-22 ms late, swaying a quarter-cycle apart left and right: a wider, thicker sound
+    {
+        int len = (int)(0.05 * Engine.SR);
+        if (dl == null) dl = new float[len * 2];
+        double step = 2 * Math.PI * RateHz() / Engine.SR, centre = 0.015 * Engine.SR, depth = P[0] * 0.007 * Engine.SR; float mix = P[2] * 0.5f;
+        for (int k = 0; k < n2; k += 2)
+        {
+            dl[2 * wp] = b[k]; dl[2 * wp + 1] = b[k + 1];
+            for (int sd = 0; sd < 2; sd++) b[k + sd] += (Tap(sd, centre + depth * Math.Sin(lfo + sd * Math.PI / 2), len) - b[k + sd]) * mix;
+            lfo += step; if (lfo > 2 * Math.PI) lfo -= 2 * Math.PI;
+            wp = (wp + 1) % len;
+        }
+    }
+
+    void Flange(float[] b, int n2)   // a 0.5-4.5 ms swept delay fed back into itself, mixed 50/50: the jet-plane comb sweep
+    {
+        int len = (int)(0.01 * Engine.SR);
+        if (dl == null) dl = new float[len * 2];
+        double step = 2 * Math.PI * RateHz() / Engine.SR, centre = 0.0025 * Engine.SR, depth = P[0] * 0.002 * Engine.SR; float fb = P[2] * 0.9f;
+        for (int k = 0; k < n2; k += 2)
+        {
+            for (int sd = 0; sd < 2; sd++)
+            {
+                float wet = Tap(sd, Math.Max(1, centre + depth * Math.Sin(lfo + sd * Math.PI / 2)), len);
+                dl[2 * wp + sd] = b[k + sd] + wet * fb;
+                b[k + sd] = (b[k + sd] + wet) * 0.5f;
+            }
+            lfo += step; if (lfo > 2 * Math.PI) lfo -= 2 * Math.PI;
+            wp = (wp + 1) % len;
+        }
+    }
+
+    void Phase(float[] b, int n2)   // six first-order all-passes swept between 300 Hz and up to 4.8 kHz, with feedback, mixed 50/50
+    {
+        double step = 2 * Math.PI * RateHz() / Engine.SR, fb = P[2] * 0.85, span = P[0] * 4;
+        for (int k = 0; k < n2; k += 2)
+        {
+            for (int sd = 0; sd < 2; sd++)
+            {
+                double f = 300 * Math.Pow(2, span * (0.5 + 0.5 * Math.Sin(lfo + sd * Math.PI / 2)));
+                double tn = Math.Tan(Math.PI * f / Engine.SR), a = (tn - 1) / (tn + 1);
+                double x = b[k + sd] + fb * s2[sd];
+                for (int st = sd * 6; st < sd * 6 + 6; st++) { double y = a * x + apx[st] - a * apy[st]; apx[st] = x; apy[st] = y; x = y; }
+                s2[sd] = x;
+                b[k + sd] = (float)((b[k + sd] + x) * 0.5);
+            }
+            lfo += step; if (lfo > 2 * Math.PI) lfo -= 2 * Math.PI;
         }
     }
 
@@ -4194,6 +4290,27 @@ class MainForm : Form
                 try { Midi.Import(new Project(), mbytes.Take(mbytes.Length / 2).ToArray(), "cut"); } catch (InvalidDataException) { refusedCut = true; }
                 try { Midi.Import(new Project(), Encoding.ASCII.GetBytes("RIFF this is a wav, not midi"), "junk"); } catch (InvalidDataException) { refusedJunk = true; }
                 check(refusedCut && refusedJunk, "MIDI: a cut-off file and a non-MIDI file are refused with a message, not a crash");
+            }
+
+            {   // limiter: nothing past the ceiling, quiet sound untouched (just 5 ms late); chorus, flanger, phaser change the sound, not its level
+                int sr = Engine.SR, half = sr / 2, look = (int)(0.005 * sr);
+                var x = new float[sr * 2];
+                for (int k = 0; k < sr; k++) { float v = (float)Math.Sin(2 * Math.PI * 220 * k / sr) * (k < half ? 0.1f : 2f); x[2 * k] = v; x[2 * k + 1] = v; }
+                var lim = new Effect("Limiter"); lim.P[0] = 0.5f; var y = (float[])x.Clone();   // -6 dB ceiling
+                for (int at = 0; at < y.Length; at += 2048) { var blkL = new float[Math.Min(2048, y.Length - at)]; Array.Copy(y, at, blkL, 0, blkL.Length); lim.Process(blkL, blkL.Length); Array.Copy(blkL, 0, y, at, blkL.Length); }
+                double ceilAmp = Math.Pow(10, -6 / 20.0), over = y.Max(v => Math.Abs(v)), loudPeak = y.Skip(2 * (half + look + 2000)).Max(v => Math.Abs(v)), quietErr = 0;
+                for (int k = look; k < half - 10; k++) quietErr = Math.Max(quietErr, Math.Abs(y[2 * k] - x[2 * (k - look)]));
+                check(over <= ceilAmp + 1e-6 && loudPeak > 0.9 * ceilAmp && quietErr < 1e-4, "limiter (" + lim.Label(0) + "): a tone 6 dB over full scale peaks at " + over.ToString("0.000") + " (ceiling " + ceilAmp.ToString("0.000") + "); a quiet tone passes unchanged, 5 ms late");
+                var src = Engine.Bounce(Project.Demo().ExportCopy(), false, 0); double rmsIn = Math.Sqrt(src.Average(v => (double)v * v)); string fxInfo = ""; bool fxOk = true;
+                foreach (var name in new[] { "Chorus", "Flanger", "Phaser" })
+                {
+                    var fx = new Effect(name); var o = (float[])src.Clone();
+                    for (int at = 0; at < o.Length; at += 2048) { var blkF = new float[Math.Min(2048, o.Length - at)]; Array.Copy(o, at, blkF, 0, blkF.Length); fx.Process(blkF, blkF.Length); Array.Copy(blkF, 0, o, at, blkF.Length); }
+                    double rmsOut = Math.Sqrt(o.Average(v => (double)v * v)), diff = o.Zip(src, (u, w) => Math.Abs(u - w)).Max();
+                    bool good = o.All(v => !float.IsNaN(v) && Math.Abs(v) < 4) && rmsOut > 0.5 * rmsIn && rmsOut < 1.5 * rmsIn && diff > 0.01;
+                    fxOk &= good; fxInfo += name + " " + (20 * Math.Log10(rmsOut / rmsIn)).ToString("+0.0;-0.0") + " dB" + (good ? "" : " (bad)") + ", ";
+                }
+                check(fxOk, "chorus, flanger, phaser: audibly change the demo pattern while keeping its level (" + fxInfo.TrimEnd(' ', ',') + ")");
             }
 
             {   // export formats: WAV read back by MiniDAW, FLAC and MP3 decoded by Windows' own decoders (a reader that isn't ours)

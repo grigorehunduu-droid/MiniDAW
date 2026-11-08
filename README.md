@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 104 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 114 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -109,6 +109,10 @@ Each insert has:
 | Distortion | Drive, Tone, Mix |
 | EQ | Low / Mid / High, each ±12 dB (the middle of the bar = no change) |
 | Compressor | Threshold (0 to −48 dB), Ratio (1:1–20:1), Gain (make-up, up to +24 dB) |
+| Limiter | Ceiling (0 to −12 dB), Release (10–500 ms), Gain (drive into the ceiling, up to +24 dB). It looks 5 ms ahead, so no peak ever gets past the ceiling: put it last on the Master for a loud, safe mix |
+| Chorus | Depth, Rate (0.05–5 Hz), Mix. Two slightly delayed copies sway a quarter-cycle apart left and right: wider and thicker |
+| Flanger | Depth, Rate, Feedback. A very short swept delay fed back into itself: the classic jet-plane sweep |
+| Phaser | Depth, Rate, Feedback. Six swept all-pass stages: a softer, swirling sweep |
 
 - **Send:** copies an insert's sound into a *later* insert, with an adjustable level. The insert still plays through Master too, so this is how to share one reverb between tracks.
 - **Sidechain:** an *earlier* insert's sound drives this insert's **Compressor**. For example, set Insert 4 (Synth) to sidechain from Insert 1 (Kick) and drag Threshold right: the synth ducks on every kick.
