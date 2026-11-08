@@ -727,6 +727,7 @@ class Engine
 
     public volatile Project Proj;
     public volatile bool Playing, SongMode;
+    public volatile bool Metronome, CountIn;   // click on every beat; one bar of clicks before playback starts (set while recording)
     public volatile int CurPattern, PlayStep = -1;
     public volatile string LastError;
     public int StepLimit = int.MaxValue;   // offline export: no notes start at or after this step, so the song doesn't loop
@@ -747,6 +748,8 @@ class Engine
 
     readonly List<Voice> voices = new List<Voice>();
     double toNext; int step; bool wasPlaying; uint rng = 2463534242;
+    int countLeft;                    // 16ths of count-in still to go; the song waits until it reaches 0
+    int clickAge = -1; double clickHz; float[] clickBuf;   // the metronome's current click (-1 = none), mixed in after the master fader
     IntPtr hwo; Thread thread; volatile bool running;
 
     // Render interleaved stereo floats. Runs on the audio thread (or the self-test).
@@ -755,7 +758,7 @@ class Engine
         var proj = Proj;
         Voice pv; while (Preview.TryDequeue(out pv)) AddVoice(pv);
         bool playing = Playing;
-        if (playing && !wasPlaying) { step = 0; toNext = 0; }
+        if (playing && !wasPlaying) { step = 0; toNext = 0; countLeft = CountIn ? Project.Steps : 0; }
         if (!playing && wasPlaying) PlayStep = -1;
         wasPlaying = playing;
         double sps = 60.0 / proj.Bpm / 4 * SR;   // samples per 16th
@@ -764,13 +767,26 @@ class Engine
         int n2 = frames * 2;
         for (int i = 0; i < ib.Length; i++)
             if (ib[i] == null || ib[i].Length < n2) ib[i] = new float[n2]; else Array.Clear(ib[i], 0, n2);
+        if (clickBuf == null || clickBuf.Length < n2) clickBuf = new float[n2]; else Array.Clear(clickBuf, 0, n2);
         for (int f = 0; f < frames; f++)
         {
-            if (playing)
+            if (playing && countLeft > 0)   // count-in: a bar of beats, accent first, then the song starts on the next 16th
+            {
+                if (toNext <= 0) { if (countLeft % 4 == 0) Click(countLeft == Project.Steps); countLeft--; toNext += sps; }
+                toNext--;
+            }
+            else if (playing)
             {
                 if (toNext <= 0 && step < StepLimit) { Trigger(proj, step++, sps); toNext += sps; }
                 else if (toNext <= 0 && songEnd < 0) songEnd = rendered + f;   // export: the moment the step after the last would have started
                 toNext--;
+            }
+            if (clickAge >= 0)   // a short sine blip: 1.6 kHz on the bar, 1 kHz on other beats
+            {
+                double ct = clickAge++ / (double)SR;
+                float c = (float)(Math.Sin(2 * Math.PI * clickHz * ct) * 0.45 * Math.Exp(-ct * 70));
+                clickBuf[2 * f] += c; clickBuf[2 * f + 1] += c;
+                if (ct > 0.08) clickAge = -1;
             }
             for (int i = voices.Count - 1; i >= 0; i--)
             {
@@ -793,7 +809,7 @@ class Engine
             if (Project.RouteOk(i, to)) { float lvl = ins.SendLevel; for (int k = 0; k < n2; k++) ib[to][k] += ib[i][k] * lvl; }
         }
         Strip(proj.Mixer[0], master, n2, 0, null);
-        for (int k = 0; k < n2; k++) lr[k] = (float)Math.Tanh(master[k]);   // soft clip instead of hard wrap-around
+        for (int k = 0; k < n2; k++) lr[k] = (float)Math.Tanh(master[k] + clickBuf[k]);   // soft clip instead of hard wrap-around; the click skips the master fader
         rendered += frames;
     }
 
@@ -869,7 +885,7 @@ class Engine
         if (held[key] != null) { held[key].Len = held[key].Age; held[key] = null; }   // release: the synth fades out from here
         var ch = MidiTarget;
         if (on && ch != null) { held[key] = new Voice { Ch = ch, Key = key, Len = int.MaxValue / 2, Gain = vel / 100f, Live = true }; AddVoice(held[key]); }
-        if (playing && !SongMode)   // tell the UI where in the pattern the player heard this, for recording
+        if (playing && !SongMode && countLeft == 0)   // tell the UI where in the pattern the player heard this, for recording (not during the count-in)
         {
             double pos = step == 0 ? 0 : step - 1 + Math.Max(0, Math.Min(1, (sps - toNext) / sps));
             pos -= (NBuf + 0.5) * Frames / sps;   // audio is heard about NBuf blocks after it is rendered (+ half a block of event wait)
@@ -879,6 +895,8 @@ class Engine
     }
 
     void AddVoice(Voice v) { if (voices.Count >= MaxVoices) voices.RemoveAt(0); voices.Add(v); }
+
+    void Click(bool bar) { clickAge = 0; clickHz = bar ? 1600 : 1000; }
 
     void Trigger(Project proj, int st, double sps)
     {
@@ -901,6 +919,7 @@ class Engine
                 PlayStep = st % cur.Length;
                 hits.Add(new KeyValuePair<Pattern, int>(cur, st % cur.Length));
             }
+            if (Metronome && PlayStep % 4 == 0) Click(PlayStep % Project.Steps == 0);   // every beat; the first of each bar higher
             foreach (var hit in hits)
                 for (int ch = 0, s = hit.Value; ch < Math.Min(hit.Key.Notes.Count, proj.Channels.Count); ch++)
                 {
@@ -1504,7 +1523,7 @@ class MainForm : Form
         playBtn.BackColor = playBtn.FlatAppearance.BorderColor = On; playBtn.ForeColor = Color.FromArgb(28, 22, 14); playBtn.Font = Bold; playBtn.MinimumSize = new Size(76, 28);
         playBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(255, 180, 100); playBtn.FlatAppearance.MouseDownBackColor = Color.FromArgb(230, 135, 40);
         modeBtn = Btn(bar, "Mode: Pattern", (s, e) => { eng.SongMode = !eng.SongMode; modeBtn.Text = eng.SongMode ? "Mode: Song" : "Mode: Pattern"; });
-        modeBtn.MinimumSize = new Size(104, 28);   // same width in both modes, so the toolbar doesn't shift
+        modeBtn.MinimumSize = new Size(98, 28);   // same width in both modes, so the toolbar doesn't shift
         bar.Controls.Add(Gap(Lbl("BPM"))); bar.Controls.Add(bpm);
         bpm.Margin = new Padding(3, 5, 3, 3);
         bpm.Controls[0].Visible = false;   // Windows draws the spin arrows light; the wheel and ↑/↓ still change the tempo
@@ -1525,7 +1544,7 @@ class MainForm : Form
         Button openBtn = null;
         openBtn = Btn(bar, "Open…", (s, e) => OpenProject(openBtn));
         Btn(bar, "Save…", (s, e) => SaveProject());
-        Btn(bar, "Export WAV…", (s, e) => ExportWav());
+        Btn(bar, "Export…", (s, e) => ExportWav());
         mixBtn = Gap(Btn(bar, "Mixer (F9)", (s, e) => ToggleMixer()));
         mixBtn.MinimumSize = new Size(108, 28);   // fits "Piano roll (F9)" too, so the toolbar doesn't shift
         midi = new MidiInput(eng.MidiIn);
@@ -1533,10 +1552,21 @@ class MainForm : Form
         midiBox.DropDown += (s, e) => FillMidi();   // re-list on open, so a keyboard plugged in later shows up
         midiBox.SelectedIndexChanged += (s, e) => OpenMidi();
         recBtn = Btn(bar, "● Rec", (s, e) => { EndEdit(); recording = !recording; recBtn.BackColor = recording ? Color.FromArgb(200, 52, 60) : Raised; });
+        metroBtn = Btn(bar, "", (s, e) => ToggleMetronome());   // an icon button: a metronome drawn in code
+        metroBtn.MinimumSize = new Size(30, 28); metroBtn.Paint += PaintMetronome;
+        new ToolTip().SetToolTip(metroBtn, "Metronome (Ctrl+M) · right-click: count-in before recording");
+        metroBtn.MouseUp += (s, e) =>
+        {
+            if (e.Button != MouseButtons.Right) return;
+            var m = new ContextMenuStrip();
+            var item = (ToolStripMenuItem)m.Items.Add("Count in one bar before recording", null, (s2, e2) => countIn = !countIn);
+            item.Checked = countIn;
+            m.Show(metroBtn, 0, metroBtn.Height);
+        };
         updateBtn = Gap(Btn(bar, "Update", (s, e) => InstallUpdate()));   // shown only when GitHub has a newer release
         updateBtn.BackColor = updateBtn.FlatAppearance.BorderColor = Color.FromArgb(46, 140, 82); updateBtn.Font = Bold; updateBtn.Visible = false;
         updateBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(60, 165, 100);
-        var about = new PictureBox { Image = Logo.Draw(24), Size = new Size(28, 28), SizeMode = PictureBoxSizeMode.CenterImage, Cursor = Cursors.Hand, Margin = new Padding(14, 2, 0, 0) };
+        var about = new PictureBox { Image = Logo.Draw(24), Size = new Size(28, 28), SizeMode = PictureBoxSizeMode.CenterImage, Cursor = Cursors.Hand, Margin = new Padding(8, 2, 0, 0) };
         about.Click += (s, e) => ShowAbout();   // the banana at the end of the toolbar
         new ToolTip().SetToolTip(about, "About MiniDAW (F1)");
         bar.Controls.Add(about);
@@ -1599,6 +1629,20 @@ class MainForm : Form
     }
 
     readonly Button updateBtn; string updateTag;
+    readonly Button metroBtn; bool countIn = true;   // count-in: on by default, as most DAWs do when recording
+
+    void ToggleMetronome() { eng.Metronome = !eng.Metronome; metroBtn.BackColor = eng.Metronome ? Sel : Raised; metroBtn.Invalidate(); }
+
+    void PaintMetronome(object sender, PaintEventArgs e)   // a pyramid body with its pendulum, lit orange when on
+    {
+        var g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
+        float cx = metroBtn.Width / 2f, top = 6, bot = metroBtn.Height - 6;
+        using (var pen = new Pen(eng.Metronome ? On : Dim, 1.6f))
+        {
+            g.DrawPolygon(pen, new[] { new PointF(cx - 3, top), new PointF(cx + 3, top), new PointF(cx + 7, bot), new PointF(cx - 7, bot) });
+            g.DrawLine(pen, cx, bot - 4, cx + 6, top + 1);
+        }
+    }
 
     void CheckForUpdate()   // once per start, in the background; offline or no release just means no Update button
     {
@@ -1740,6 +1784,7 @@ class MainForm : Form
         if (keyData == Keys.Space && !(ActiveControl is NumericUpDown)) { TogglePlay(); return true; }   // space = play/stop, like FL
         if (keyData == Keys.F9) { ToggleMixer(); return true; }
         if (keyData == Keys.F1) { ShowAbout(); return true; }
+        if (keyData == (Keys.Control | Keys.M)) { ToggleMetronome(); return true; }
         if (keyData == (Keys.Control | Keys.Z)) { UndoRedo(false); return true; }
         if (keyData == (Keys.Control | Keys.Y) || keyData == (Keys.Control | Keys.Shift | Keys.Z)) { UndoRedo(true); return true; }
         if (!(ActiveControl is NumericUpDown) && P.Channels.Count > 0)   // note editing; the BPM box keeps its own text keys
@@ -1752,7 +1797,12 @@ class MainForm : Form
         return base.ProcessCmdKey(ref msg, keyData);
     }
 
-    void TogglePlay() { EndEdit(); eng.Playing = !eng.Playing; playBtn.Text = eng.Playing ? "■ Stop" : "▶ Play"; }   // ends a recording take's undo step
+    void TogglePlay()   // ends a recording take's undo step
+    {
+        EndEdit();
+        eng.CountIn = countIn && recording && !eng.SongMode;   // read by the engine when playback starts
+        eng.Playing = !eng.Playing; playBtn.Text = eng.Playing ? "■ Stop" : "▶ Play";
+    }
 
     void ShowAbout() { using (var a = new AboutForm(false)) a.ShowDialog(this); }
 
@@ -3462,6 +3512,29 @@ class MainForm : Form
             comp = new Effect("Compressor"); comp.P[0] = 0.25f; comp.P[1] = 1;
             double soft = settled(comp, toneOf(1000, 0.1));
             check(Math.Abs(soft / 0.1 - 1.995) < 0.04, "compressor leaves a tone under the threshold alone and adds " + comp.Label(2) + " (0.10 -> " + soft.ToString("0.00") + ")");
+
+            {   // metronome: a blip at the start of every beat, silence between, nothing when off; count-in delays the song by one bar
+                var silentProj = Project.Demo(); foreach (var pt in silentProj.Patterns) foreach (var l in pt.Notes) l.Clear();
+                Func<Engine, int, float[]> run = (eng2, frames) => { var all = new float[frames * 2]; var mblk = new float[2048]; for (int at = 0; at < frames; at += 1024) { eng2.Render(mblk, 1024); Array.Copy(mblk, 0, all, at * 2, Math.Min(2048, (frames - at) * 2)); } return all; };
+                double sps16 = 60.0 / silentProj.Bpm / 4 * Engine.SR; int beat = (int)(4 * sps16);
+                Func<float[], int, int, float> peak = (x, a, b) => { float m = 0; for (int k = 2 * a; k < 2 * b && k < x.Length; k++) m = Math.Max(m, Math.Abs(x[k])); return m; };
+                var on = run(new Engine { Proj = silentProj, Playing = true, Metronome = true }, 4 * beat + 2048);
+                var off = run(new Engine { Proj = silentProj, Playing = true }, 4 * beat);
+                bool beatsClick = Enumerable.Range(0, 4).All(k => peak(on, k * beat, k * beat + 3000) > 0.2 && peak(on, k * beat + 6000, (k + 1) * beat - 50) < 0.001);
+                check(beatsClick && peak(off, 0, 4 * beat) == 0, "metronome: a click at each of the bar's 4 beats and silence between them; none when it's off");
+                var ci = new Engine { Proj = Project.Demo(), Playing = true, CountIn = true }; var blk1 = new float[2048];
+                int heardAt = -1, stepDuringCount = -2; bool recDuring = false;
+                for (int at = 0; at < 4 * beat + 8192 && heardAt < 0; at += 1024)
+                {
+                    if (at == 1024) ci.MidiIn.Enqueue(0x90 | 60 << 8 | 100 << 16);   // a key pressed during the count-in
+                    ci.Render(blk1, 1024);
+                    if (at + 1024 <= 4 * beat && at + 2048 > 4 * beat) stepDuringCount = ci.PlayStep;   // the last block wholly inside the count-in
+                    if (at == 1024) recDuring = ci.MidiRec.Count > 0;
+                    if (at >= 4 * beat - 1024 && blk1.Any(x => Math.Abs(x) > 0.5)) heardAt = at;
+                }
+                check(stepDuringCount == -1 && !recDuring && heardAt >= 4 * beat - 1024 && heardAt <= 4 * beat + 1024,
+                    "count-in: one bar (" + 4 * beat + " samples) of clicks, then the kick at sample ~" + heardAt + "; keys pressed meanwhile aren't recorded");
+            }
 
             check(Updates.Newer("v1.2", "1.1") && Updates.Newer("1.10", "1.9") && Updates.Newer("v2.0.1", "2.0") && !Updates.Newer("v1.1.0", "1.1") && !Updates.Newer("v1.0", "1.1")
                 && !Updates.Newer("nightly", "1.1") && !Updates.Newer(null, "1.1"),

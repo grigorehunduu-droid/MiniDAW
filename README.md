@@ -1,4 +1,4 @@
-# MiniDAW
+﻿# MiniDAW
 
 ![MiniDAW's banana logo](banana.png)
 
@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 96 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 98 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -38,7 +38,7 @@ Needs Windows 10 or 11.
 
 | Area | What it does | How to use it |
 |---|---|---|
-| **Toolbar** | Transport and files | Play / Stop · Mode (Pattern or Song) · BPM (type it, scroll the wheel over it, or press ↑/↓) · pattern list · + Pattern · + Sound · + Sample… · New · Open… · Save… · Export WAV… · Mixer (F9) · MIDI device · ● Rec · 🍌 About |
+| **Toolbar** | Transport and files | Play / Stop · Mode (Pattern or Song) · BPM (type it, scroll the wheel over it, or press ↑/↓) · pattern list · + Pattern · + Sound · + Sample… · New · Open… · Save… · Export… · Mixer (F9) · MIDI device · ● Rec · metronome · 🍌 About |
 | **Channel rack** | One row per sound | The dot mutes. Click a name to edit it in the piano roll; double-click it for **sound settings**; right-click it for **sound settings, a different sound, rename or delete**. Drag the volume and pan bars; right-click them to automate them. The number box picks the mixer insert (click = +1, right-click = −1). Click the 16 steps to add drum hits. |
 | **Piano roll** | Notes of the selected channel in the current pattern | Click an empty cell to add a note (drag right while adding to make it longer). Click a note to remove it. **Drag a note** to move it in time and pitch: if it's part of the selection, all selected notes move together, and you hear the new pitch while dragging. Moves stop at the pattern's edges, and a note dropped on another one replaces it. **Drag a note's right edge** to change its length. Drag in the **VEL** lane at the bottom to set **velocity** (how hard each note is played): 100 is the channel's normal level, 50 is half as loud, 127 is the loudest. A drag across several notes sets each one. |
 | **Mixer** (F9 swaps it with the piano roll) | Master + 8 inserts | See below. |
@@ -132,10 +132,13 @@ Each insert has:
   - **Q 2 W 3 E R 5 T 6 Y 7 U I** = C5 to C6
   - **−** and **=** shift the keyboard down or up an octave, up to 3 either way (from C1 up to C9). The piano roll's view moves along, so it always shows the 3 octaves you're playing; its header shows the current range, e.g. "keys Z–M, Q–I play C3–C5".
 - **Record:** turn on **● Rec**, use **Pattern** mode, and press Play. Notes go into the current pattern on the selected channel. They snap to 16ths, and the app allows for the audio delay so they land where you heard them. Stopping playback ends the take.
+  - **Count-in:** recording starts with one bar of metronome clicks, then the pattern begins. Keys you press during the count-in aren't recorded. Right-click the metronome button to turn the count-in off.
+  - **Loop recording:** the pattern keeps looping while you record, and every pass adds its notes on top of the earlier ones, so you can build a part up layer by layer.
+- **Metronome:** the button next to **● Rec** (or **Ctrl+M**) clicks on every beat, higher on the first beat of each bar. It's only for you: exports never include it, and the master fader doesn't change its volume.
 
 ## Export
 
-**Export WAV…** saves what Play would play, as a 44.1 kHz 16-bit stereo WAV:
+**Export…** saves what Play would play, as a 44.1 kHz 16-bit stereo WAV:
 - **Song mode:** the whole arrangement, plus the reverb/delay tail.
 - **Pattern mode:** the current pattern, once.
 
@@ -146,6 +149,7 @@ Each insert has:
 | Space | Play / Stop |
 | F9 | Mixer ↔ piano roll |
 | F1 | About MiniDAW |
+| Ctrl+M | Metronome on / off |
 | Ctrl+Z | Undo (each click or drag is one step, and a recording take is one step; up to 100 steps) |
 | Ctrl+Y or Ctrl+Shift+Z | Redo |
 | Right-drag in the piano roll | Select notes (right-click without dragging clears the selection) |
