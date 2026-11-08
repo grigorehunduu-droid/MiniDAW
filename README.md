@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 125 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 140 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -39,9 +39,9 @@ Needs Windows 10 or 11.
 | Area | What it does | How to use it |
 |---|---|---|
 | **Toolbar** | Transport and files | Play / Stop · Mode (Pattern or Song) · BPM (type it, scroll the wheel over it, or press ↑/↓) · pattern list · + Pattern · + Sound · + Sample… · New · Open… · Save… · Export… · Mixer (F9) · MIDI device · ● Rec · metronome · 🍌 About |
-| **Channel rack** | One row per sound | The dot mutes. Click a name to edit it in the piano roll; double-click it for **sound settings**; right-click it for **sound settings, a different sound, rename or delete**. Drag the volume and pan bars; right-click them to automate them. The number box picks the mixer insert (click = +1, right-click = −1). Click the 16 steps to add drum hits. |
+| **Channel rack** | One row per sound | The dot mutes. Click a name to edit it in the piano roll; double-click it for **sound settings**; right-click it for **sound settings, a different sound, rename or delete**. Drag the volume and pan bars; right-click them to automate them. The number box picks the mixer insert: click = +1, right-click = −1, or drag up / down to go straight to any of the 125. Click the 16 steps to add drum hits. |
 | **Piano roll** | Notes of the selected channel in the current pattern | Click an empty cell to add a note (drag right while adding to make it longer). Click a note to remove it. **Drag a note** to move it in time and pitch: if it's part of the selection, all selected notes move together, and you hear the new pitch while dragging. Moves stop at the pattern's edges, and a note dropped on another one replaces it. **Drag a note's right edge** to change its length. Drag in the **VEL** lane at the bottom to set **velocity** (how hard each note is played): 100 is the channel's normal level, 50 is half as loud, 127 is the loudest. A drag across several notes sets each one. |
-| **Mixer** (F9 swaps it with the piano roll) | Master + 8 inserts | See below. |
+| **Mixer** (F9 swaps it with the piano roll) | Master + 125 inserts | See below. |
 | **Playlist** | 500 tracks, songs up to 999 bars | Click an empty spot to place the selected pattern (drag to keep placing); right-click a clip to erase it. **Drag a clip** to move it (**Shift**: copy); **click** it to edit its pattern. More under **Playlist** below. Plays in **Song** mode. |
 
 **Graph editor:** click **graph** in the channel rack's header to open a strip under the rack for the selected channel. Click it again to cycle through **velocity → pan → pitch → off**; right-click goes backwards.
@@ -133,7 +133,7 @@ Needs Windows 10 or 11.
 
 ## Mixer
 
-Each insert has:
+The master stays on the left; the 125 inserts scroll beside it with the mouse wheel. Each insert has:
 - a fader, pan, a mute dot, a level meter, and a list of the channels feeding it
 - **8 effect slots**, processed top to bottom:
   - Click "+ effect" to add one.
@@ -156,10 +156,19 @@ Each insert has:
 | Flanger | Depth, Rate, Feedback. A very short swept delay fed back into itself: the classic jet-plane sweep |
 | Phaser | Depth, Rate, Feedback. Six swept all-pass stages: a softer, swirling sweep |
 
-- **Send:** copies an insert's sound into a *later* insert, with an adjustable level. The insert still plays through Master too, so this is how to share one reverb between tracks.
-- **Sidechain:** an *earlier* insert's sound drives this insert's **Compressor**. For example, set Insert 4 (Synth) to sidechain from Insert 1 (Kick) and drag Threshold right: the synth ducks on every kick.
-- Routes only go from lower to higher insert numbers, so feedback loops can't happen.
+- **Routing** (the **out** pill under the pan):
+  - **To the master** switches whether the insert plays into the master.
+  - Add any number of **sends** to other inserts, each with its own level. Sends go up or down the list, so this is how to share one reverb between tracks, or build a drum bus.
+  - The bar beside **sc** shows the first send's level: drag it, or right-click it to automate it.
+- **Sidechain** (**sc**): another insert's sound drives this insert's **Compressor** and **Vocoder**. For example, set Insert 4 (Synth) to sidechain from Insert 1 (Kick) and drag Threshold right: the synth ducks on every kick.
+- Any route that would loop back on itself is never offered. The mixer works out the right order to process the inserts.
 
+| More effects | Settings |
+|---|---|
+| Parametric EQ | 5 bands: low shelf, three peaks, high shelf. Its slot shows the curve; click it to open the editor. Drag a numbered handle for frequency (across) and gain (up and down), use the wheel over it for width (Q), and right-click it to flatten it. The curve is the EQ's true response. |
+| Multiband | Depth, Speed, Gain. Splits the sound at 200 Hz and 4 kHz and compresses each band on its own, like FL's Maximus: dense, even loudness. At zero depth it's perfectly transparent |
+| Beat FX | Mode (gate, stutter, half speed, reverse), Rate (1/4–1/32), Mix. Chops the sound in time with the song, after FL's Gross Beat. It only acts while the song plays |
+| Vocoder | Release, Bright, Mix. Put a synth on the insert and a voice (or any sound) on another insert, then set this insert's **sc** to that one: the synth "speaks". With no sidechain it does nothing |
 ## Automation
 
 1. In the mixer, **right-click** a fader, a pan bar, a send-level bar or any effect setting. In the channel rack, right-click a channel's **volume or pan bar**. Right-click the **BPM** box → **Automate tempo** for a tempo lane (40–300 BPM). Or, in a channel's **sound settings** window, right-click Attack, Release, Tone/Decay or Pitch. Either way, this creates a lane for it, shown over the playlist. A Tone lane is the classic filter sweep. Pitch changes take effect from the next note.
@@ -260,7 +269,7 @@ MiniDAW is open source under the [MIT License](LICENSE): use it, change it, shar
 - Velocity only changes loudness, not tone. The computer keyboard always plays at velocity 100.
 - Swing is one setting for the whole project, not per channel. Recording doesn't take swing into account when snapping notes.
 - The pitch wheel (±2 semitones) and the vibrato (5.5 Hz, ±½ semitone) can't be adjusted, and they don't affect Pluck or the drums. The computer keyboard has no sustain, pitch or mod controls.
-- One send per insert. Sidechain drives only the Compressor.
+- Sidechain drives the Compressor and the Vocoder. The Parametric EQ's settings can't be automated yet.
 - Mixer controls, rack volume/pan, sound settings and tempo can be automated. Lanes span the whole song and are drawn freehand.
 - No VST plugins. Export is 44.1 kHz only.
 - Audio uses the classic Windows `waveOut` output with about 0.1 s of delay. No ASIO.

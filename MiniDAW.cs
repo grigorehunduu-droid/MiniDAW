@@ -145,13 +145,19 @@ class Pattern
     }
 }
 
-class Insert   // one mixer track: effects run in slot order, then fader and pan; output goes to master (+ an optional send)
+class Route { public int To; public float Level = 0.5f; }   // a send: a post-fader copy of an insert's output into another insert, at a level
+
+class Insert   // one mixer track: effects run in slot order, then fader and pan; its output goes to the master (unless switched off) and to any sends
 {
     public const int SlotCount = 8;   // like FL's insert slots (FL has 10)
-    public float Vol = 1f, Pan = 0f, SendLevel = 0.5f;
-    public bool Mute;
-    public int SendTo, Sidechain;   // 0 = none. Send: post-fader copy into a later insert. Sidechain: an earlier insert's output drives this insert's Compressor
+    public float Vol = 1f, Pan = 0f;
+    public bool Mute, ToMaster = true;
+    public int Sidechain;             // 0 = none: another insert whose output drives this one's Compressor and Vocoder
+    public List<Route> Sends = new List<Route>();   // any number; the routing never loops back (Project.CanRoute)
     public Effect[] Slots = new Effect[SlotCount];
+    // The first send, as a single "send to N at level" (the mixer strip's send bar, its automation lane, older files)
+    public int SendTo { get { return Sends.Count > 0 ? Sends[0].To : 0; } set { if (value <= 0) { if (Sends.Count > 0) Sends.RemoveAt(0); } else if (Sends.Count > 0) Sends[0].To = value; else Sends.Add(new Route { To = value }); } }
+    public float SendLevel { get { return Sends.Count > 0 ? Sends[0].Level : 0.5f; } set { if (Sends.Count > 0) Sends[0].Level = value; } }
 }
 
 class Lane   // automation clip: one value (0..1) per 16th across the whole playlist, driving one control while the song plays
@@ -213,17 +219,23 @@ class Lane   // automation clip: one value (0..1) per 16th across the whole play
 
 class Effect
 {
-    public static readonly string[] Types = { "Delay", "Reverb", "Filter", "Distortion", "EQ", "Compressor", "Limiter", "Chorus", "Flanger", "Phaser" };
+    public static readonly string[] Types = { "Delay", "Reverb", "Filter", "Distortion", "EQ", "Compressor", "Limiter", "Chorus", "Flanger", "Phaser",
+        "Parametric EQ", "Multiband", "Beat FX", "Vocoder" };
+    static readonly string[] BandNames = { "Low shelf", "Low mid", "Mid", "High mid", "High shelf" };
     static readonly string[][] Names = { new[] { "Time", "Feedback", "Mix" }, new[] { "Size", "Damp", "Mix" }, new[] { "Cutoff", "Reso", "Mode" }, new[] { "Drive", "Tone", "Mix" },
         new[] { "Low", "Mid", "High" }, new[] { "Threshold", "Ratio", "Gain" }, new[] { "Ceiling", "Release", "Gain" },
-        new[] { "Depth", "Rate", "Mix" }, new[] { "Depth", "Rate", "Feedback" }, new[] { "Depth", "Rate", "Feedback" } };
+        new[] { "Depth", "Rate", "Mix" }, new[] { "Depth", "Rate", "Feedback" }, new[] { "Depth", "Rate", "Feedback" },
+        BandNames.SelectMany(n => new[] { n + " freq", n + " gain", n + " Q" }).ToArray(), new[] { "Depth", "Speed", "Gain" }, new[] { "Mode", "Rate", "Mix" }, new[] { "Release", "Bright", "Mix" } };
     static readonly float[][] Defaults = { new[] { 0.35f, 0.4f, 0.35f }, new[] { 0.6f, 0.4f, 0.3f }, new[] { 0.6f, 0.2f, 0f }, new[] { 0.4f, 0.6f, 1f },
         new[] { 0.5f, 0.5f, 0.5f }, new[] { 0.25f, 3f / 19, 0.25f },   // EQ flat; compressor -12 dB, 4:1, +6 dB
-        new[] { 0.025f, 0.35f, 0f }, new[] { 0.5f, 0.45f, 1f }, new[] { 0.6f, 0.3f, 0.5f }, new[] { 0.6f, 0.35f, 0.4f } };   // limiter -0.3 dB, ~40 ms, +0 dB
+        new[] { 0.025f, 0.35f, 0f }, new[] { 0.5f, 0.45f, 1f }, new[] { 0.6f, 0.3f, 0.5f }, new[] { 0.6f, 0.35f, 0.4f },   // limiter -0.3 dB, ~40 ms, +0 dB
+        new[] { 0.159f, 0.5f, 0.245f, 0.366f, 0.5f, 0.347f, 0.566f, 0.5f, 0.347f, 0.767f, 0.5f, 0.347f, 0.926f, 0.5f, 0.245f },   // flat; 60 Hz, 250 Hz, 1 kHz, 4 kHz, 12 kHz
+        new[] { 0.4f, 0.5f, 0.2f }, new[] { 0f, 0.5f, 1f }, new[] { 0.3f, 0.3f, 1f } };
     static readonly int[] CombLen = { 1116, 1188, 1277, 1356 }, ApLen = { 556, 441 };   // Freeverb tunings at 44.1 kHz
 
     public readonly string Type;
-    public readonly float[] P;   // 3 parameters, all 0..1; the UI writes them while audio reads (float writes are atomic)
+    public readonly float[] P;   // its settings, all 0..1 (3 for most effects, 15 for the Parametric EQ); the UI writes them while audio reads (float writes are atomic)
+    public double Sps, Pos; public bool Playing;   // set before each block: samples per 16th, song position (16ths), playing; Beat FX follows them
     public bool Bypass;          // switched off: skipped in the chain, settings kept (the on/off dot on its mixer slot)
     public float Mix = 1;        // wet/dry: 1 = fully processed, 0 = untouched (the small bar on its mixer slot, like FL's slot mix knob)
 
@@ -267,7 +279,12 @@ class Effect
         else if (t == 6 && i == 0) v = CeilingDb().ToString("0.0", CultureInfo.InvariantCulture) + " dB";
         else if (t == 6 && i == 1) v = (int)Math.Round(ReleaseMs()) + " ms";
         else if (t == 6) v = "+" + LimitGainDb().ToString("0.0", CultureInfo.InvariantCulture) + " dB";
-        else if (t >= 7 && i == 1) v = RateHz().ToString("0.00", CultureInfo.InvariantCulture) + " Hz";
+        else if (t >= 7 && t <= 9 && i == 1) v = RateHz().ToString("0.00", CultureInfo.InvariantCulture) + " Hz";
+        else if (t == 10) v = i % 3 == 0 ? Hz(BandHz(P[i])) : i % 3 == 1 ? BandDb(P[i]).ToString("+0.0;-0.0;0.0", CultureInfo.InvariantCulture) + " dB" : "Q " + BandQ(P[i]).ToString("0.0", CultureInfo.InvariantCulture);
+        else if (t == 11 && i == 2) v = "+" + (P[2] * 18).ToString("0.0", CultureInfo.InvariantCulture) + " dB";
+        else if (t == 12 && i == 0) v = BeatModes[BeatMode()];
+        else if (t == 12 && i == 1) v = new[] { "1/4", "1/8", "1/16", "1/32" }[Math.Min(3, (int)(P[1] * 4))];
+        else if (t == 13 && i == 0) v = (int)Math.Round(10 + 190 * P[0]) + " ms";
         else v = (int)Math.Round(P[i] * 100) + "%";
         return Names[t][i] + "  " + v;
     }
@@ -283,6 +300,145 @@ class Effect
     double ReleaseMs() { return 10 * Math.Pow(50, P[1]); }    // 10 .. 500 ms
     double LimitGainDb() { return P[2] * 24; }                // drive into the ceiling: 0 .. +24 dB
     double RateHz() { return 0.05 * Math.Pow(100, P[1]); }    // modulation: 0.05 .. 5 Hz
+    static string Hz(double f) { return f >= 1000 ? (f / 1000).ToString("0.0#", CultureInfo.InvariantCulture) + " kHz" : (int)Math.Round(f) + " Hz"; }
+    public static readonly string[] BeatModes = { "Gate", "Stutter", "Half speed", "Reverse" };
+    int BeatMode() { return Math.Min(3, (int)(P[0] * 4)); }
+
+    // ---- Parametric EQ: 5 bands (low shelf, 3 peaks, high shelf), RBJ biquads; its window draws the true curve from ResponseDb
+    public const int Bands = 5;
+    public static double BandHz(float v) { return 20 * Math.Pow(1000, v); }   // 20 Hz .. 20 kHz
+    public static double BandDb(float v) { return (v - 0.5) * 36; }           // ±18 dB, middle = flat
+    public static double BandQ(float v) { return 0.3 * Math.Pow(32, v); }     // 0.3 .. 9.6
+    readonly double[] bq = new double[Bands * 4];                              // per band and side: two state values
+
+    double[] Coefs(int band)   // b0, b1, b2, a1, a2, normalised
+    {
+        double f = Math.Min(BandHz(P[band * 3]), 0.45 * Engine.SR), A = Math.Pow(10, BandDb(P[band * 3 + 1]) / 40), w = 2 * Math.PI * f / Engine.SR;
+        double cs = Math.Cos(w), al = Math.Sin(w) / (2 * BandQ(P[band * 3 + 2])), sq = 2 * Math.Sqrt(A) * al, b0, b1, b2, a0, a1, a2;
+        if (band == 0) { b0 = A * ((A + 1) - (A - 1) * cs + sq); b1 = 2 * A * ((A - 1) - (A + 1) * cs); b2 = A * ((A + 1) - (A - 1) * cs - sq); a0 = (A + 1) + (A - 1) * cs + sq; a1 = -2 * ((A - 1) + (A + 1) * cs); a2 = (A + 1) + (A - 1) * cs - sq; }
+        else if (band == Bands - 1) { b0 = A * ((A + 1) + (A - 1) * cs + sq); b1 = -2 * A * ((A - 1) + (A + 1) * cs); b2 = A * ((A + 1) + (A - 1) * cs - sq); a0 = (A + 1) - (A - 1) * cs + sq; a1 = 2 * ((A - 1) - (A + 1) * cs); a2 = (A + 1) - (A - 1) * cs - sq; }
+        else { b0 = 1 + al * A; b1 = -2 * cs; b2 = 1 - al * A; a0 = 1 + al / A; a1 = -2 * cs; a2 = 1 - al / A; }
+        return new[] { b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0 };
+    }
+
+    public double ResponseDb(double hz)   // the curve: every band's gain at this frequency, added
+    {
+        double w = 2 * Math.PI * hz / Engine.SR, db = 0;
+        for (int band = 0; band < Bands; band++)
+        {
+            var c = Coefs(band);
+            double nr = c[0] + c[1] * Math.Cos(w) + c[2] * Math.Cos(2 * w), ni = -(c[1] * Math.Sin(w) + c[2] * Math.Sin(2 * w));
+            double dr = 1 + c[3] * Math.Cos(w) + c[4] * Math.Cos(2 * w), di = -(c[3] * Math.Sin(w) + c[4] * Math.Sin(2 * w));
+            db += 10 * Math.Log10((nr * nr + ni * ni) / (dr * dr + di * di));
+        }
+        return db;
+    }
+
+    void Peq(float[] b, int n2)
+    {
+        for (int band = 0; band < Bands; band++)
+        {
+            if (Math.Abs(BandDb(P[band * 3 + 1])) < 0.05) continue;   // flat: skip
+            var c = Coefs(band);
+            for (int i = 0; i < n2; i++)   // transposed direct form II
+            {
+                int z = (band * 2 + (i & 1)) * 2; double x = b[i], y = c[0] * x + bq[z];
+                bq[z] = c[1] * x - c[3] * y + bq[z + 1]; bq[z + 1] = c[2] * x - c[4] * y;
+                b[i] = (float)y;
+            }
+        }
+    }
+
+    // ---- Multiband: three bands (split at 200 Hz and 4 kHz, summing back exactly), each compressed on its own, then made up
+    readonly double[] mbEnv = new double[3], mbX = new double[6];
+    void Multi(float[] b, int n2)
+    {
+        double a1 = 1 - Math.Exp(-2 * Math.PI * 200 / Engine.SR), a2 = 1 - Math.Exp(-2 * Math.PI * 4000 / Engine.SR);
+        double thr = -30 * P[0], slope = 1 - 1 / (1 + 7 * P[0]), makeup = P[2] * 18;
+        double att = Math.Exp(-1 / ((0.03 - 0.029 * P[1]) * Engine.SR)), rel = Math.Exp(-1 / ((0.5 - 0.45 * P[1]) * Engine.SR));
+        for (int k = 0; k < n2; k += 2)
+        {
+            for (int sd = 0; sd < 2; sd++)
+            {
+                s1[sd] += a1 * (b[k + sd] - s1[sd]); s2[sd] += a2 * (b[k + sd] - s2[sd]);
+                mbX[sd] = s1[sd]; mbX[2 + sd] = s2[sd] - s1[sd]; mbX[4 + sd] = b[k + sd] - s2[sd];   // low, mid, high (no allocation: this runs per sample)
+            }
+            double outL = 0, outR = 0;
+            for (int band = 0; band < 3; band++)
+            {
+                double xl = mbX[band * 2], xr = mbX[band * 2 + 1];
+                double peak = Math.Max(Math.Abs(xl), Math.Abs(xr)), want = Math.Max(0, 20 * Math.Log10(Math.Max(peak, 1e-6)) - thr) * slope;
+                mbEnv[band] = want + (want > mbEnv[band] ? att : rel) * (mbEnv[band] - want);
+                double g = Math.Pow(10, -mbEnv[band] / 20);
+                outL += xl * g; outR += xr * g;
+            }
+            double mk = Math.Pow(10, makeup / 20);
+            b[k] = (float)(outL * mk); b[k + 1] = (float)(outR * mk);
+        }
+    }
+
+    // ---- Beat FX, after Gross Beat: chops locked to the song's tempo. Gate: the first half of each slice; Stutter: each beat's
+    // first slice repeated; Half speed: each beat played at half speed; Reverse: each slice plays the one before it backwards.
+    float[] bfBuf; int bfLen;
+    void Beat(float[] b, int n2)
+    {
+        if (!Playing || Sps <= 0) return;   // only while the song plays: stopped, the sound passes untouched
+        if (bfBuf == null) { bfLen = Engine.SR * 4; bfBuf = new float[bfLen * 2]; }
+        int mode = BeatMode(); double slice = new[] { 4, 2, 1, 0.5 }[Math.Min(3, (int)(P[1] * 4))] * Sps, beat = 4 * Sps, ramp = 0.002 * Engine.SR;
+        float mix = P[2];
+        for (int k = 0; k < n2; k += 2)
+        {
+            double pos = Pos * Sps + k / 2;   // samples since the song started
+            bfBuf[2 * wp] = b[k]; bfBuf[2 * wp + 1] = b[k + 1];
+            double back = 0, gain = 1;   // how far back to read, and a gate
+            if (mode == 0) { double ph = pos % slice; gain = ph < slice / 2 ? Math.Min(1, Math.Min(ph, slice / 2 - ph) / ramp) : 0; }
+            else if (mode == 1) { double ph = pos % beat; back = ph - ph % slice; }
+            else if (mode == 2) back = (pos % beat) / 2;
+            else { double ph = pos % slice; back = 2 * ph + 1; }
+            int d = (int)Math.Min(bfLen - 1, back), rp = (wp - d + bfLen) % bfLen;
+            for (int sd = 0; sd < 2; sd++) { float o = (float)(bfBuf[2 * rp + sd] * gain); b[k + sd] += (o - b[k + sd]) * mix; }
+            wp = (wp + 1) % bfLen;
+        }
+    }
+
+    // ---- Vocoder: the insert's own sound (the carrier, e.g. a synth) shaped by its sidechain's (the voice): 16 bands from
+    // 120 Hz to 7 kHz, each carrier band as loud as the voice is in it. With no sidechain the sound passes untouched.
+    const int VocBands = 16;
+    double[] vocState, vocEnv, vocCoef;
+    void Vocode(float[] b, int n2, float[] key)
+    {
+        if (key == null || key == b) return;
+        if (vocState == null)
+        {
+            vocState = new double[VocBands * 3 * 2]; vocEnv = new double[VocBands]; vocCoef = new double[VocBands * 5];
+            for (int j = 0; j < VocBands; j++)
+            {
+                double f = 120 * Math.Pow(7000 / 120.0, j / (double)(VocBands - 1)), w = 2 * Math.PI * f / Engine.SR, al = Math.Sin(w) / (2 * 5), a0 = 1 + al;
+                vocCoef[j * 5] = al / a0; vocCoef[j * 5 + 1] = 0; vocCoef[j * 5 + 2] = -al / a0; vocCoef[j * 5 + 3] = -2 * Math.Cos(w) / a0; vocCoef[j * 5 + 4] = (1 - al) / a0;   // band-pass
+            }
+        }
+        double rel = Math.Exp(-1 / ((0.01 + 0.19 * P[0]) * Engine.SR)), att = Math.Exp(-1 / (0.003 * Engine.SR)); float mix = P[2];
+        for (int k = 0; k < n2; k += 2)
+        {
+            double m = (key[k] + key[k + 1]) * 0.5, outL = 0, outR = 0;
+            for (int j = 0; j < VocBands; j++)
+            {
+                double mb = Bp(j, 0, m), e = Math.Abs(mb);
+                vocEnv[j] = e + (e > vocEnv[j] ? att : rel) * (vocEnv[j] - e);
+                double g = vocEnv[j] * (1 + P[1] * 3 * j / (VocBands - 1.0)) * 6;
+                outL += Bp(j, 1, b[k]) * g; outR += Bp(j, 2, b[k + 1]) * g;
+            }
+            b[k] = (float)(b[k] * (1 - mix) + outL * mix); b[k + 1] = (float)(b[k + 1] * (1 - mix) + outR * mix);
+        }
+    }
+
+    double Bp(int band, int which, double x)   // one band-pass step: which = 0 the voice, 1 / 2 the carrier's left / right
+    {
+        int z = (band * 3 + which) * 2, c = band * 5;
+        double y = vocCoef[c] * x + vocState[z];
+        vocState[z] = vocCoef[c + 1] * x - vocCoef[c + 3] * y + vocState[z + 1]; vocState[z + 1] = vocCoef[c + 2] * x - vocCoef[c + 4] * y;
+        return y;
+    }
 
     public void Process(float[] b, int n2, float[] key = null)   // b = interleaved stereo, n2 = float count; key = sidechain input (Compressor only)
     {
@@ -297,7 +453,11 @@ class Effect
             case 6: Limit(b, n2); break;
             case 7: Chorus(b, n2); break;
             case 8: Flange(b, n2); break;
-            default: Phase(b, n2); break;
+            case 9: Phase(b, n2); break;
+            case 10: Peq(b, n2); break;
+            case 11: Multi(b, n2); break;
+            case 12: Beat(b, n2); break;
+            default: Vocode(b, n2, key); break;
         }
     }
 
@@ -518,7 +678,7 @@ class PlaylistGrid
 
 class Project
 {
-    public const int Steps = 16, Tracks = 500, Bars = 32, Inserts = 9;   // Steps = 16ths per bar; Bars: the span of automation lanes; insert 0 = master
+    public const int Steps = 16, Tracks = 500, Bars = 32, Inserts = 126;   // Steps = 16ths per bar; Bars: the span of automation lanes; insert 0 = master, then 125 like FL
     public const int MaxBars = 999;                                      // the longest song
     public const int MinBpm = 40, MaxBpm = 300;
     public int Bpm = 128;
@@ -605,16 +765,57 @@ class Project
         for (int i = 0; i < Inserts; i++)
         {
             Insert m = Mixer[i], c = p.Mixer[i];
-            c.Vol = m.Vol; c.Pan = m.Pan; c.Mute = m.Mute; c.SendTo = m.SendTo; c.SendLevel = m.SendLevel; c.Sidechain = m.Sidechain;
+            c.Vol = m.Vol; c.Pan = m.Pan; c.Mute = m.Mute; c.ToMaster = m.ToMaster; c.Sidechain = m.Sidechain;
+            c.Sends = m.Sends.Select(r => new Route { To = r.To, Level = r.Level }).ToList();   // own copies: send-level lanes drive the copy, not the live mixer
             for (int s = 0; s < Insert.SlotCount; s++)
                 if (m.Slots[s] != null) { c.Slots[s] = new Effect(m.Slots[s].Type); Array.Copy(m.Slots[s].P, c.Slots[s].P, c.Slots[s].P.Length); c.Slots[s].Bypass = m.Slots[s].Bypass; c.Slots[s].Mix = m.Slots[s].Mix; }
         }
         return p;
     }
 
-    // shortcut: sends and sidechains only run from a lower to a higher insert, so index order is a valid processing order
-    // and loops are impossible; switch Engine.Render to a topological sort if any-to-any routing is needed
-    public static bool RouteOk(int from, int to) { return from >= 1 && to > from && to < Inserts; }
+    // Routing: a send from -> to, or a sidechain (to listens to from), is allowed if it can't loop back: to must not already
+    // feed from. The master (0) only receives.
+    public bool CanRoute(int from, int to)
+    {
+        if (from < 1 || to < 0 || from == to || from >= Inserts || to >= Inserts) return false;
+        return to == 0 || !Feeds(to, from);
+    }
+
+    bool Feeds(int a, int b)   // does a's sound reach b through sends and sidechains?
+    {
+        var seen = new bool[Inserts]; var todo = new Stack<int>(); todo.Push(a);
+        while (todo.Count > 0)
+        {
+            int x = todo.Pop();
+            if (x == b) return true;
+            if (x <= 0 || seen[x]) continue;
+            seen[x] = true;
+            foreach (var r in Mixer[x].Sends) todo.Push(r.To);
+            for (int y = 1; y < Inserts; y++) if (Mixer[y].Sidechain == x) todo.Push(y);
+        }
+        return false;
+    }
+
+    // An order to process the inserts in: each after everything that sends to it or sidechains it (the master last).
+    public int[] ProcessOrder()
+    {
+        var indeg = new int[Inserts];
+        for (int i = 1; i < Inserts; i++)
+        {
+            foreach (var r in Mixer[i].Sends) if (r.To > 0 && r.To < Inserts && r.To != i) indeg[r.To]++;
+            int sc = Mixer[i].Sidechain; if (sc > 0 && sc < Inserts && sc != i) indeg[i]++;
+        }
+        var order = new List<int>(Inserts); var ready = new Queue<int>();
+        for (int i = 1; i < Inserts; i++) if (indeg[i] == 0) ready.Enqueue(i);
+        while (ready.Count > 0)
+        {
+            int i = ready.Dequeue(); order.Add(i);
+            foreach (var r in Mixer[i].Sends) if (r.To > 0 && r.To < Inserts && r.To != i && --indeg[r.To] == 0) ready.Enqueue(r.To);
+            for (int y = 1; y < Inserts; y++) if (Mixer[y].Sidechain == i && y != i && --indeg[y] == 0) ready.Enqueue(y);
+        }
+        for (int i = 1; i < Inserts; i++) if (!order.Contains(i)) order.Add(i);   // a loop in a damaged file: still play everything
+        return order.ToArray();
+    }
 
     public void RemoveChannel(int i)   // patterns and sound-setting lanes refer to channels by index, so later ones shift down with them
     {
@@ -676,9 +877,10 @@ class Project
         for (int i = 0; i < Inserts; i++)
         {
             var m = Mixer[i];
-            w.Add(string.Join("\t", "ins", i, m.Vol.ToString("R"), m.Pan.ToString("R"), m.Mute ? "1" : "0", m.SendTo, m.SendLevel.ToString("R"), m.Sidechain));
+            w.Add(string.Join("\t", "ins", i, m.Vol.ToString("R"), m.Pan.ToString("R"), m.Mute ? "1" : "0", m.SendTo, m.SendLevel.ToString("R"), m.Sidechain, m.ToMaster ? "1" : "0",
+                              string.Join(",", m.Sends.Skip(1).Select(r => r.To + ":" + r.Level.ToString("R")))));   // the first send in its old place; more sends after
             for (int s = 0; s < Insert.SlotCount; s++)
-                if (m.Slots[s] != null) w.Add(string.Join("\t", "fx", i, s, m.Slots[s].Type, string.Join("\t", m.Slots[s].P.Select(v => v.ToString("R"))), m.Slots[s].Bypass ? "1" : "0", m.Slots[s].Mix.ToString("R")));
+                if (m.Slots[s] != null) w.Add(string.Join("\t", "fx", i, s, m.Slots[s].Type, string.Join("\t", m.Slots[s].P.Select(v => v.ToString("R"))), m.Slots[s].Bypass ? "1" : "0", m.Slots[s].Mix.ToString("R")));   // as many settings as the effect has
         }
         foreach (var pat in Patterns)
         {
@@ -770,18 +972,28 @@ class Project
                 m.Vol = Num(f[2], 0, 1); m.Pan = Num(f[3], -1, 1); m.Mute = f[4] == "1";
                 if (f.Length > 7)   // older files stop at mute
                 {
-                    m.SendTo = Int(f[5], 0, Inserts - 1); m.SendLevel = Num(f[6], 0, 1); m.Sidechain = Int(f[7], 0, Inserts - 1);
-                    if (m.SendTo != 0 && !RouteOk(idx, m.SendTo) || m.Sidechain != 0 && !RouteOk(m.Sidechain, idx))
-                        throw new InvalidDataException("Send or sidechain must go from a lower to a higher insert (line " + (li + 1) + ")");
+                    int to = Int(f[5], 0, Inserts - 1), sc = Int(f[7], 0, Inserts - 1);
+                    if (to != 0 && !p.CanRoute(idx, to) || sc != 0 && !p.CanRoute(sc, idx))
+                        throw new InvalidDataException("A send or sidechain would loop back on itself (line " + (li + 1) + ")");
+                    m.SendTo = to; m.SendLevel = Num(f[6], 0, 1); m.Sidechain = sc;
                 }
+                if (f.Length > 8) m.ToMaster = f[8] != "0";
+                if (f.Length > 9 && f[9] != "")
+                    foreach (var part in f[9].Split(','))
+                    {
+                        var kv = part.Split(':'); int to = Int(kv[0], 1, Inserts - 1);
+                        if (kv.Length != 2 || !p.CanRoute(idx, to)) throw new InvalidDataException("Bad send on line " + (li + 1));
+                        m.Sends.Add(new Route { To = to, Level = Num(kv[1], 0, 1) });
+                    }
             }
             else if (f[0] == "fx")
             {
-                if (f.Length < 7) throw new InvalidDataException("Bad effect on line " + (li + 1));
-                var fx = new Effect(f[3]);
-                for (int j = 0; j < 3; j++) fx.P[j] = Num(f[4 + j], 0, 1);
-                fx.Bypass = f.Length > 7 && f[7] == "1";   // older files have no bypass field: on
-                fx.Mix = f.Length > 8 ? Num(f[8], 0, 1) : 1;  // ... and no mix field: fully wet
+                if (f.Length < 4) throw new InvalidDataException("Bad effect on line " + (li + 1));
+                var fx = new Effect(f[3]); int np = fx.P.Length;
+                if (f.Length < 4 + np) throw new InvalidDataException("Bad effect on line " + (li + 1));
+                for (int j = 0; j < np; j++) fx.P[j] = Num(f[4 + j], 0, 1);
+                fx.Bypass = f.Length > 4 + np && f[4 + np] == "1";   // older files have no bypass field: on
+                fx.Mix = f.Length > 5 + np ? Num(f[5 + np], 0, 1) : 1;  // ... and no mix field: fully wet
                 p.Mixer[Int(f[1], 0, Inserts - 1)].Slots[Int(f[2], 0, Insert.SlotCount - 1)] = fx;
             }
             else if (f[0] == "pat")   // older files have no length: one bar
@@ -1510,6 +1722,7 @@ class Engine
         if (playing && SongMode && proj.Automation.Count > 0) { Automate(proj, sps); sps = 60.0 / proj.Bpm / 4 * SR; }   // a tempo lane may have just changed the BPM
         int msg; while (MidiIn.TryDequeue(out msg)) MidiEvent(proj, msg, playing, sps);
         int n2 = frames * 2;
+        double blockPos = step == 0 ? 0 : step - 1 + Math.Max(0, Math.Min(1, (sps - toNext) / sps));   // where the block starts, in 16ths of the song or pattern
         for (int i = 0; i < ib.Length; i++)
             if (ib[i] == null || ib[i].Length < n2) ib[i] = new float[n2]; else Array.Clear(ib[i], 0, n2);
         if (clickBuf == null || clickBuf.Length < n2) clickBuf = new float[n2]; else Array.Clear(clickBuf, 0, n2);
@@ -1549,12 +1762,15 @@ class Engine
             }
         }
         var master = ib[0];
-        for (int i = 1; i < ib.Length; i++)   // index order works because routes only go upwards (Project.RouteOk)
+        blockSps = sps; blockPos0 = blockPos; blockPlaying = playing;   // tempo-synced effects (Beat FX) follow the song
+        int[] order; lock (proj) order = proj.ProcessOrder();
+        foreach (int i in order)   // each insert after everything that feeds it
         {
-            var ins = proj.Mixer[i]; int to = ins.SendTo, sc = ins.Sidechain;   // read once: the UI may change them mid-block
-            Strip(ins, ib[i], n2, i, Project.RouteOk(sc, i) ? ib[sc] : null);   // ib[sc] is already that insert's post-fader output
-            for (int k = 0; k < n2; k++) master[k] += ib[i][k];
-            if (Project.RouteOk(i, to)) { float lvl = ins.SendLevel; for (int k = 0; k < n2; k++) ib[to][k] += ib[i][k] * lvl; }
+            var ins = proj.Mixer[i]; int sc = ins.Sidechain;   // read once: the UI may change it mid-block
+            Strip(ins, ib[i], n2, i, sc > 0 && sc < ib.Length && sc != i ? ib[sc] : null);   // ib[sc] is already that insert's post-fader output
+            if (ins.ToMaster) for (int k = 0; k < n2; k++) master[k] += ib[i][k];
+            var sends = ins.Sends;
+            for (int r = 0; r < sends.Count; r++) { int to = sends[r].To; float lvl = sends[r].Level; if (to >= 0 && to < ib.Length && to != i) for (int k = 0; k < n2; k++) ib[to][k] += ib[i][k] * lvl; }
         }
         Strip(proj.Mixer[0], master, n2, 0, null);
         if (Tap > 0) Array.Copy(ib[Tap], lr, n2);   // a stem: the insert as it leaves for the master, unclipped
@@ -1599,9 +1815,11 @@ class Engine
         return outp;
     }
 
+    double blockSps, blockPos0; bool blockPlaying;   // this block's tempo and song position, for tempo-synced effects
+
     void Strip(Insert ins, float[] b, int n2, int idx, float[] key)
     {
-        foreach (var fx in ins.Slots) if (fx != null && !fx.Bypass) fx.Run(b, n2, key, ref dryBuf);
+        foreach (var fx in ins.Slots) if (fx != null && !fx.Bypass) { fx.Sps = blockSps; fx.Pos = blockPos0; fx.Playing = blockPlaying; fx.Run(b, n2, key, ref dryBuf); }
         float g = ins.Mute ? 0 : ins.Vol, gl = g * Math.Min(1, 1 - ins.Pan), gr = g * Math.Min(1, 1 + ins.Pan), pk = 0;
         for (int k = 0; k < n2; k += 2)
         {
@@ -2413,14 +2631,20 @@ class MainForm : Form
 
         // every click or drag is one undo step: the snapshot is taken before the panel's own MouseDown and closed after its own MouseUp
         foreach (var c in new[] { rack, roll, playlist, mixer }) c.MouseDown += (s, e) => BeginEdit();
-        rack.Paint += PaintRack; rack.MouseDown += RackDown; rack.MouseMove += RackMove; rack.MouseUp += (s, e) => dragMode = null;
+        rack.Paint += PaintRack; rack.MouseDown += RackDown; rack.MouseMove += RackMove;
+        rack.MouseUp += (s, e) =>
+        {
+            if (dragMode == "insert" && !insDragged && dragCh < P.Channels.Count)   // a click on the insert box: one up (right-click: one down), wrapping around
+            { var c = P.Channels[dragCh]; c.Insert = (c.Insert + insDir + Project.Inserts) % Project.Inserts; dirty = true; Changed(); }
+            dragMode = null;
+        };
         rack.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left && e.X >= 20 && e.X < 134 && RackRow(e.Y) >= 0) ShowSoundSettings(); };
         roll.Paint += PaintRoll; roll.MouseDown += RollDown; roll.MouseMove += RollMove;
         roll.MouseUp += (s, e) => { dragNotes = null; dragMode = null; if (boxFrom.HasValue) FinishBox(); if (moving != null) FinishMove(); };
         roll.MouseWheel += RollWheel;
         playlist.Paint += PaintPlaylist; playlist.MouseDown += PlaylistDown; playlist.MouseMove += PlaylistMouse; playlist.MouseUp += (s, e) => FinishClipDrag();
         playlist.MouseWheel += PlaylistWheel;
-        mixer.Paint += PaintMixer; mixer.MouseDown += MixerDown; mixer.MouseMove += MixerMove;
+        mixer.Paint += PaintMixer; mixer.MouseDown += MixerDown; mixer.MouseMove += MixerMove; mixer.MouseWheel += MixerWheel;
         mixer.MouseUp += (s, e) => { dragMode = null; dragFx = null; if (slotDragIns >= 0) FinishSlotDrag(e); };
         foreach (var c in new[] { rack, roll, playlist, mixer }) c.MouseUp += (s, e) => EndEdit();
 
@@ -3040,6 +3264,7 @@ class MainForm : Form
     // Rack extras: a graph editor for the selected channel's per-step velocity / pan / pitch (under the rows), and a group
     // filter that shows only one group's channels, like FL's channel groups.
     int graphMode; string groupFilter;
+    int insDownY, insDownVal, insDir; bool insDragged;   // the insert box being dragged
     const int GraphH = 74, GraphBoxW = 128, GroupBoxW = 140;
     static readonly string[] GraphNames = { "off", "velocity", "pan", "pitch" };
     static readonly Color[] Swatches = { Color.FromArgb(232, 84, 96), Color.FromArgb(242, 170, 60), Color.FromArgb(226, 212, 86), Color.FromArgb(140, 212, 92), Color.FromArgb(72, 192, 124),
@@ -3134,6 +3359,12 @@ class MainForm : Form
     {
         if (dragMode == "swing" && e.Button == MouseButtons.Left) { P.Swing = Clamp01((e.X - (rack.Width - SwingW - 10)) / (float)SwingW); Changed(); return; }
         if (dragMode == "graph" && e.Button != MouseButtons.None) { GraphSet(e); return; }
+        if (dragMode == "insert" && e.Button != MouseButtons.None && dragCh < P.Channels.Count)
+        {
+            int to = Math.Max(0, Math.Min(Project.Inserts - 1, insDownVal + (insDownY - e.Y) / 5));   // 5 pixels per insert
+            if (to != insDownVal || insDragged) { insDragged = true; if (P.Channels[dragCh].Insert != to) { P.Channels[dragCh].Insert = to; dirty = true; Changed(); } }
+            return;
+        }
         if (dragMode == null || e.Button != MouseButtons.Left || dragCh >= P.Channels.Count) return;
         var c = P.Channels[dragCh];
         if (dragMode == "vol") c.Vol = Math.Max(0, Math.Min(1, (e.X - 136) / 60f));
@@ -3164,10 +3395,10 @@ class MainForm : Form
         int i = RackRow(e.Y);
         if (i < 0) return;
         var c = P.Channels[i];
-        if (e.X >= 246 && e.X < RackX)   // insert box: left click +1, right click -1
+        if (e.X >= 246 && e.X < RackX)   // insert box: drag up / down to pick any insert; a click is +1, a right-click -1 (decided on mouse-up)
         {
-            c.Insert = (c.Insert + (e.Button == MouseButtons.Right ? -1 : 1) + Project.Inserts) % Project.Inserts;
-            Changed(); return;
+            dragMode = "insert"; dragCh = i; insDownY = e.Y; insDownVal = c.Insert; insDragged = false; insDir = e.Button == MouseButtons.Right ? -1 : 1;
+            return;
         }
         if (e.Button == MouseButtons.Right && e.X >= 20 && e.X < 134) { ChannelMenu(c, e.Location); return; }
         if (e.Button == MouseButtons.Right && e.X >= 134 && e.X < 246) { AutomateKnob(i, e.X < 198 ? Channel.LaneVol : Channel.LanePan); return; }   // volume / pan bar: a lane for it
@@ -3718,9 +3949,25 @@ class MainForm : Form
         g.DrawString(text, Small, on ? TxtB : DimB, new RectangleF(x + 5, y, w - 7, 14), Fit);
     }
 
+    // The mixer shows the master on the left and a window of the 125 inserts beside it, scrolled with the wheel.
+    int mixFrom = 1;   // the first insert shown after the master
+    int MixShown() { float sw, fy, fh, st; MixGeom(out sw, out fy, out fh, out st); return Math.Max(2, (int)((mixer.Width - 8) / sw)); }
+    float StripX(int i) { float sw, fy, fh, st; MixGeom(out sw, out fy, out fh, out st); return 4 + sw * (i == 0 ? 0 : i - mixFrom + 1); }
+    int StripAt(float x)   // the insert whose strip is at x, or -1
+    {
+        float sw, fy, fh, st; MixGeom(out sw, out fy, out fh, out st);
+        int k = (int)Math.Floor((x - 4) / sw), i = k == 0 ? 0 : mixFrom + k - 1;
+        return k < 0 || k >= MixShown() || i >= Project.Inserts ? -1 : i;
+    }
+    void MixerWheel(object sender, MouseEventArgs e)
+    {
+        int notches = e.Delta / 120; if (notches == 0) notches = Math.Sign(e.Delta);
+        mixFrom = Math.Max(1, Math.Min(Project.Inserts - MixShown() + 1, mixFrom - 2 * notches)); mixer.Invalidate();
+    }
+
     void MixGeom(out float sw, out float fy, out float fh, out float slotsTop)
     {
-        sw = (mixer.Width - 8) / (float)Project.Inserts;
+        sw = Math.Max(140, (mixer.Width - 8) / 9f);   // 9 strips across a 1380-pixel window, as before; narrower windows show fewer
         slotsTop = mixer.Height - Insert.SlotCount * HeadH - ParamsH - 4;
         fy = Top0 + StripHead;
         fh = Math.Max(30, slotsTop - fy - 22);   // leave room for the dB readout
@@ -3753,11 +4000,15 @@ class MainForm : Form
     {
         var g = e.Graphics;
         Header(g, mixer, "MIXER");
-        g.DrawString("slots: click to add or open an effect, drag to reorder, bar = wet/dry, dot = on/off, right-click to change or remove · drag faders, pan, settings · right-click a control: automate · dot = mute · send → later insert, sidechain ← earlier (drives its Compressor)", Small, DimB, 64, 5);
+        int shown = MixShown(), last = Math.Min(Project.Inserts - 1, mixFrom + shown - 2);
+        g.DrawString("inserts " + mixFrom + "–" + last + " of " + (Project.Inserts - 1) + " (wheel to scroll) · slots: click = add / open, drag = reorder, bar = wet/dry, dot = on/off · \"out\": master, sends and sidechain · right-click a control: automate",
+            Small, DimB, new RectangleF(64, 5, mixer.Width - 70, 14), Fit);
         float sw, fy, fh, st; MixGeom(out sw, out fy, out fh, out st);
-        for (int i = 0; i < Project.Inserts; i++)
+        for (int k = 0; k < shown; k++)
         {
-            var ins = P.Mixer[i]; float sx = 4 + i * sw, w = sw - 6;
+            int i = k == 0 ? 0 : mixFrom + k - 1;
+            if (i >= Project.Inserts) break;
+            var ins = P.Mixer[i]; float sx = 4 + k * sw, w = sw - 6;
             Round(g, i == 0 ? Color.FromArgb(36, 41, 50) : Color.FromArgb(32, 36, 44), sx, Top0 - 2, w, mixer.Height - Top0 - 2, 6);
             g.DrawString(i == 0 ? "Master" : "Insert " + i, Bold, i == 0 ? new SolidBrush(On) : TxtB, sx + 5, Top0);
             string from = string.Join(", ", P.Channels.Where(c => c.Insert == i).Select(c => c.Name));
@@ -3766,16 +4017,17 @@ class MainForm : Form
             float pw = w - 24, pan = 0.5f + ins.Pan / 2;
             ValueBar(g, sx + 20, Top0 + 38, pw, 6, Math.Min(0.5f, pan), Math.Max(0.5f, pan), Blue);
             using (var pen = new Pen(Dim)) g.DrawLine(pen, sx + 20 + pw / 2, Top0 + 35, sx + 20 + pw / 2, Top0 + 47);
-            if (i > 0)   // send row (target box + level bar) and sidechain row; master has neither
+            if (i > 0)   // routing: where it goes (master, sends) and its sidechain; the first send's level as a bar
             {
-                float ry = Top0 + 52, bx = sx + 66, bw = w - 70;
-                RouteBox(g, sx + 4, ry, 58, ins.SendTo > 0 ? "send → " + ins.SendTo : "send: off", ins.SendTo > 0);
-                if (ins.SendTo > 0)
+                float ry = Top0 + 52, half = (w - 8) / 2; int ns = ins.Sends.Count;
+                string outTo = ins.ToMaster ? (ns == 0 ? "out: master" : "out: master + " + ns + (ns == 1 ? " send" : " sends")) : ns == 0 ? "out: nowhere" : "out: " + ns + (ns == 1 ? " send" : " sends") + " only";
+                RouteBox(g, sx + 4, ry, w - 8, outTo + "  ▾", ns > 0 || !ins.ToMaster);
+                RouteBox(g, sx + 4, ry + 16, half - 2, ins.Sidechain > 0 ? "sc ← " + ins.Sidechain : "sc: off", ins.Sidechain > 0);
+                if (ns > 0)
                 {
-                    ValueBar(g, bx, ry, bw, 14, 0, ins.SendLevel, DeepBlue);
-                    g.DrawString((int)Math.Round(ins.SendLevel * 100) + "%", Small, TxtB, bx + 4, ry);
+                    ValueBar(g, sx + 4 + half + 2, ry + 16, half - 2, 14, 0, ins.SendLevel, DeepBlue);
+                    g.DrawString("→" + ins.SendTo + " " + (int)Math.Round(ins.SendLevel * 100) + "%", Small, TxtB, new RectangleF(sx + 8 + half, ry + 16, half - 6, 14), Fit);
                 }
-                RouteBox(g, sx + 4, ry + 16, w - 8, ins.Sidechain > 0 ? "sidechain ← " + ins.Sidechain : "sidechain: off", ins.Sidechain > 0);
             }
             // fader: dB ticks, a slim track lit below the handle, and the handle; the whole area still takes clicks
             float fw = w - 26, cx = sx + 4 + fw / 2, hy = fy + fh * (1 - ins.Vol);
@@ -3818,6 +4070,7 @@ class MainForm : Form
                 ValueBar(g, sx + w - 52, sy + 6, 30, 6, 0, fx.Mix, fx.Bypass ? Dim : Blue);   // wet/dry, left of the on/off dot
                 Led(g, sx + w - 16, sy + 4, 9, !fx.Bypass);
                 if (!open) continue;
+                if (fx.P.Length > 3) { PaintMiniEq(g, fx, new RectangleF(sx + 2, sy + HeadH + 1, w - 4, ParamsH - 3)); continue; }   // the Parametric EQ: its curve; a click opens the editor
                 for (int p = 0; p < 3; p++)
                 {
                     float py = sy + HeadH + 1 + p * 14;
@@ -3837,9 +4090,9 @@ class MainForm : Form
     void MixerDown(object sender, MouseEventArgs e)
     {
         float sw, fy, fh, st; MixGeom(out sw, out fy, out fh, out st);
-        int i = (int)Math.Floor((e.X - 4) / sw);
-        if (i < 0 || i >= Project.Inserts || e.Y < Top0) return;
-        var ins = P.Mixer[i]; float sx = 4 + i * sw, w = sw - 6;
+        int i = StripAt(e.X);
+        if (i < 0 || e.Y < Top0) return;
+        var ins = P.Mixer[i]; float sx = StripX(i), w = sw - 6;
         if (e.Y >= st)   // effect slots
         {
             for (int s = 0; s < Insert.SlotCount; s++)
@@ -3859,6 +4112,7 @@ class MainForm : Form
                 }
                 if (IsOpen(i, s) && e.Y >= sy + HeadH && e.Y < sy + HeadH + ParamsH)   // the open effect's settings
                 {
+                    if (fx.P.Length > 3) { if (e.Button == MouseButtons.Left) ShowEq(i, s); return; }   // the Parametric EQ's curve: open its editor
                     int p = (int)((e.Y - sy - HeadH - 1) / 14);
                     if (p < 0 || p > 2) return;
                     if (e.Button == MouseButtons.Right) { AutomateControl(i, s, p); return; }
@@ -3869,16 +4123,15 @@ class MainForm : Form
             }
             return;
         }
-        if (e.Y >= Top0 + 50 && e.Y < fy)   // send / sidechain rows: click = next option, right-click = previous
+        if (e.Y >= Top0 + 50 && e.Y < fy)   // routing rows: "out" opens the routing menu; "sc" the sidechain menu; the bar is the first send's level
         {
-            int dir = e.Button == MouseButtons.Right ? -1 : 1;
             if (i == 0) return;
-            if (e.Y >= Top0 + 67) ins.Sidechain = Next(Enumerable.Range(0, Project.Inserts).Where(t => t == 0 || Project.RouteOk(t, i)), ins.Sidechain, dir);
-            else if (e.X < sx + 64) ins.SendTo = Next(Enumerable.Range(0, Project.Inserts).Where(t => t == 0 || Project.RouteOk(i, t)), ins.SendTo, dir);
-            else if (ins.SendTo > 0 && e.Button == MouseButtons.Left) { dragCh = i; dragMode = "send"; MixerMove(sender, e); return; }
-            else if (ins.SendTo > 0 && e.Button == MouseButtons.Right) { AutomateControl(i, -1, 2); return; }
-            else return;
-            Changed(); return;
+            float half = (w - 8) / 2;
+            if (e.Y < Top0 + 67) RoutingMenu(i, new Point((int)sx + 4, Top0 + 66), false);
+            else if (e.X < sx + 4 + half) RoutingMenu(i, new Point((int)sx + 4, Top0 + 82), true);
+            else if (ins.Sends.Count > 0 && e.Button == MouseButtons.Left) { dragCh = i; dragMode = "send"; MixerMove(sender, e); }
+            else if (ins.Sends.Count > 0 && e.Button == MouseButtons.Right) AutomateControl(i, -1, 2);
+            return;
         }
         if (e.Button == MouseButtons.Right && e.Y >= Top0 + 34 && (e.Y >= fy || e.X >= sx + 18)) { AutomateControl(i, -1, e.Y >= fy ? 0 : 1); return; }   // fader or pan
         if (e.Button != MouseButtons.Left || e.Y < Top0 + 34) return;
@@ -3900,14 +4153,146 @@ class MainForm : Form
         if (dragFx != null && dragParam == Lane.FxMix) dragFx.Mix = Clamp01((e.X - dragX0) / dragW);
         else if (dragFx != null) dragFx.P[dragParam] = Clamp01((e.X - dragX0) / dragW);
         else if (dragMode == "mixvol") P.Mixer[dragCh].Vol = Clamp01(1 - (e.Y - fy) / fh);
-        else if (dragMode == "send") P.Mixer[dragCh].SendLevel = Clamp01((e.X - (4 + dragCh * sw + 66)) / (sw - 76));   // same bar as PaintMixer
+        else if (dragMode == "send") { float half = (sw - 14) / 2; P.Mixer[dragCh].SendLevel = Clamp01((e.X - (StripX(dragCh) + 6 + half)) / (half - 2)); }   // same bar as PaintMixer
         else if (dragMode == "mixpan")
         {
-            float x0 = 4 + dragCh * sw + 20, pw = sw - 30;
+            float x0 = StripX(dragCh) + 20, pw = sw - 30;
             P.Mixer[dragCh].Pan = Math.Max(-1, Math.Min(1, (e.X - x0) / pw * 2 - 1));
         }
         else return;
         Changed();
+    }
+
+    // The routing menu of insert i: master on / off, its sends (level, remove), add a send, and (sc) the sidechain source.
+    // Only routes that can't loop back are offered.
+    void RoutingMenu(int i, Point at, bool sidechain)
+    {
+        var m = new ContextMenuStrip(); var ins = P.Mixer[i];
+        Func<int, string> name = k => k == 0 ? "Master" : "Insert " + k + (P.Channels.Any(c => c.Insert == k) ? " (" + string.Join(", ", P.Channels.Where(c => c.Insert == k).Select(c => c.Name).Take(3)) + ")" : "");
+        if (sidechain)
+        {
+            ((ToolStripMenuItem)m.Items.Add("No sidechain", null, (s, e) => Edit(() => { P.Mixer[i].Sidechain = 0; dirty = true; Changed(); }))).Checked = ins.Sidechain == 0;
+            m.Items.Add(new ToolStripSeparator());
+            for (int k = 1; k < Project.Inserts; k++)
+            {
+                if (k != ins.Sidechain && !P.CanRoute(k, i)) continue;
+                int src = k; ((ToolStripMenuItem)m.Items.Add("Sidechain from " + name(k), null, (s, e) => Edit(() => { if (P.CanRoute(src, i)) P.Mixer[i].Sidechain = src; dirty = true; Changed(); }))).Checked = ins.Sidechain == k;
+            }
+            m.MaximumSize = new Size(400, 600); m.Show(mixer, at); return;
+        }
+        ((ToolStripMenuItem)m.Items.Add("To the master", null, (s, e) => Edit(() => { P.Mixer[i].ToMaster = !P.Mixer[i].ToMaster; dirty = true; Changed(); }))).Checked = ins.ToMaster;
+        if (ins.Sends.Count > 0) m.Items.Add(new ToolStripSeparator());
+        foreach (var r in ins.Sends.ToList())
+        {
+            var route = r; var item = new ToolStripMenuItem("Send to " + name(r.To) + "  —  " + (int)Math.Round(r.Level * 100) + "%");
+            for (int pct = 0; pct <= 100; pct += 10) { float lvl = pct / 100f; ((ToolStripMenuItem)item.DropDownItems.Add(pct + "%", null, (s, e) => Edit(() => { route.Level = lvl; dirty = true; Changed(); }))).Checked = Math.Abs(r.Level - lvl) < 0.001f; }
+            item.DropDownItems.Add(new ToolStripSeparator());
+            item.DropDownItems.Add("Remove this send", null, (s, e) => Edit(() => { P.Mixer[i].Sends.Remove(route); dirty = true; Changed(); }));
+            m.Items.Add(item);
+        }
+        var add = new ToolStripMenuItem("Add a send to");
+        for (int k = 1; k < Project.Inserts; k++)
+        {
+            if (!P.CanRoute(i, k) || ins.Sends.Any(x => x.To == k)) continue;   // would loop back, or already sends there
+            int to = k; add.DropDownItems.Add(name(k), null, (s, e) => Edit(() => { if (P.CanRoute(i, to)) P.Mixer[i].Sends.Add(new Route { To = to }); dirty = true; Changed(); }));
+        }
+        m.Items.Add(new ToolStripSeparator()); m.Items.Add(add);
+        m.Show(mixer, at);
+    }
+
+    static void PaintMiniEq(Graphics g, Effect fx, RectangleF r)   // the Parametric EQ's curve in its open slot
+    {
+        Round(g, Well, r.X, r.Y, r.Width, r.Height, 3);
+        using (var pen = new Pen(Color.FromArgb(44, 50, 60))) g.DrawLine(pen, r.X, r.Y + r.Height / 2, r.Right, r.Y + r.Height / 2);
+        var pts = new PointF[(int)r.Width];
+        for (int k = 0; k < pts.Length; k++) pts[k] = new PointF(r.X + k, r.Y + r.Height / 2 - (float)Math.Max(-18, Math.Min(18, fx.ResponseDb(20 * Math.Pow(1000, k / (double)pts.Length)))) / 36 * r.Height);
+        var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+        if (pts.Length > 1) using (var pen = new Pen(On, 1.5f)) g.DrawLines(pen, pts);
+        g.SmoothingMode = am;
+        g.DrawString("click to edit", Small, DimB, r.Right - 64, r.Bottom - 14);
+    }
+
+    EqWindow eqWin;
+    void ShowEq(int ins, int slot)   // one EQ editor at a time; it follows whichever slot opened it last
+    {
+        if (eqWin == null || eqWin.IsDisposed) eqWin = new EqWindow(this);
+        eqWin.Target(ins, slot);
+        if (!eqWin.Visible) eqWin.Show(this); else eqWin.Activate();
+    }
+
+    // The Parametric EQ's editor, like FL's Parametric EQ 2: the true response curve, and a handle per band to drag (frequency
+    // across, gain up and down); the wheel over a handle sets its Q; right-click flattens it. Each drag is one undo step.
+    internal class EqWindow : Form
+    {
+        readonly MainForm m; readonly Canvas view = new Canvas();
+        int ins, slot, drag = -1, hover = -1;
+        const int X0 = 44, Y0 = 14;
+        public EqWindow(MainForm main)
+        {
+            m = main; FormBorderStyle = FormBorderStyle.SizableToolWindow; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(620, 300); MinimumSize = new Size(380, 220); Font = main.Font;
+            view.Dock = DockStyle.Fill; Controls.Add(view); view.Paint += PaintView;
+            view.MouseDown += (s, e) =>
+            {
+                var fx = Fx(); int b = Near(e.Location); if (fx == null || b < 0) return;
+                if (e.Button == MouseButtons.Right) { m.Edit(() => { fx.P[b * 3 + 1] = 0.5f; m.dirty = true; }); view.Invalidate(); return; }
+                m.BeginEdit(); drag = b; DragTo(e);
+            };
+            view.MouseMove += (s, e) => { if (drag >= 0 && e.Button == MouseButtons.Left) DragTo(e); else { int h = Near(e.Location); if (h != hover) { hover = h; view.Invalidate(); } } };
+            view.MouseUp += (s, e) => { if (drag >= 0) { drag = -1; m.EndEdit(); } };
+            view.MouseWheel += (s, e) =>
+            {
+                var fx = Fx(); int b = hover >= 0 ? hover : Near(e.Location); if (fx == null || b < 0) return;
+                m.Edit(() => { fx.P[b * 3 + 2] = Clamp01(fx.P[b * 3 + 2] + Math.Sign(e.Delta) * 0.04f); m.dirty = true; }); view.Invalidate();
+            };
+            HandleCreated += (s, e) => DarkTitle(Handle);
+            KeyPreview = true; KeyDown += (s, e) => m.PianoKey(e, true); KeyUp += (s, e) => m.PianoKey(e, false);
+        }
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData) { return m.ProcessCmdKey(ref msg, keyData); }
+        public void Target(int i, int s) { ins = i; slot = s; view.Invalidate(); }
+        Effect Fx() { var fx = ins < Project.Inserts ? m.P.Mixer[ins].Slots[slot] : null; return fx != null && fx.P.Length > 3 ? fx : null; }   // looked up each time: undo may have replaced it
+        float W { get { return view.Width - X0 - 12; } }
+        float Hh { get { return view.Height - Y0 - 24; } }
+        float FX(double hz) { return X0 + W * (float)(Math.Log(hz / 20) / Math.Log(1000)); }
+        float DY(double db) { return Y0 + Hh * (0.5f - (float)db / 36); }
+        PointF BandPoint(Effect fx, int b) { return new PointF(FX(Effect.BandHz(fx.P[b * 3])), DY(Effect.BandDb(fx.P[b * 3 + 1]))); }
+        int Near(Point p) { var fx = Fx(); if (fx == null) return -1; int best = -1; double bd = 14; for (int b = 0; b < Effect.Bands; b++) { var h = BandPoint(fx, b); double d = Math.Sqrt((h.X - p.X) * (h.X - p.X) + (h.Y - p.Y) * (h.Y - p.Y)); if (d < bd) { bd = d; best = b; } } return best; }
+        void DragTo(MouseEventArgs e)
+        {
+            var fx = Fx(); if (fx == null) return;
+            fx.P[drag * 3] = Clamp01((e.X - X0) / W); fx.P[drag * 3 + 1] = Clamp01(1 - (e.Y - Y0) / Hh);   // across: frequency (log); up: gain
+            m.dirty = true; view.Invalidate();
+        }
+        void PaintView(object sender, PaintEventArgs e)
+        {
+            var g = e.Graphics; var fx = Fx();
+            Text = "Insert " + ins + " — Parametric EQ";
+            if (fx == null) { g.DrawString("This slot has no Parametric EQ any more.", Font, DimB, 16, 16); return; }
+            Round(g, Well, X0, Y0, W, Hh, 4);
+            using (var pen = new Pen(Color.FromArgb(40, 46, 56)))
+            {
+                foreach (var f in new[] { 50, 100, 200, 500, 1000, 2000, 5000, 10000 }) { g.DrawLine(pen, FX(f), Y0, FX(f), Y0 + Hh); g.DrawString(f >= 1000 ? f / 1000 + "k" : f.ToString(), Small, DimB, FX(f) - 8, Y0 + Hh + 4); }
+                foreach (var db in new[] { -12, -6, 0, 6, 12 }) { g.DrawLine(pen, X0, DY(db), X0 + W, DY(db)); g.DrawString((db > 0 ? "+" : "") + db, Small, DimB, 8, DY(db) - 7); }
+            }
+            var pts = new PointF[(int)W]; for (int k = 0; k < pts.Length; k++) pts[k] = new PointF(X0 + k, DY(Math.Max(-18, Math.Min(18, fx.ResponseDb(20 * Math.Pow(1000, k / (double)pts.Length))))));
+            var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+            if (pts.Length > 1)
+            {
+                var poly = new List<PointF>(pts) { new PointF(pts[pts.Length - 1].X, DY(0)), new PointF(pts[0].X, DY(0)) };
+                using (var b = new SolidBrush(Color.FromArgb(40, On))) g.FillPolygon(b, poly.ToArray());
+                using (var pen = new Pen(On, 2)) g.DrawLines(pen, pts);
+            }
+            for (int b = 0; b < Effect.Bands; b++)
+            {
+                var h = BandPoint(fx, b); bool hot = b == hover || b == drag;
+                using (var br = new SolidBrush(hot ? Color.White : Color.FromArgb(206, 211, 220))) g.FillEllipse(br, h.X - 7, h.Y - 7, 14, 14);
+                g.DrawString((b + 1).ToString(), Small, Brushes.Black, new RectangleF(h.X - 7, h.Y - 7, 14, 14), Mid);
+            }
+            g.SmoothingMode = am;
+            int show = drag >= 0 ? drag : hover;
+            g.DrawString(show >= 0 ? fx.Label(show * 3) + "   " + fx.Label(show * 3 + 1).Split(new[] { "  " }, StringSplitOptions.None).Last() + "   " + fx.Label(show * 3 + 2).Split(new[] { "  " }, StringSplitOptions.None).Last()
+                : "drag a handle: frequency and gain · wheel over it: Q (width) · right-click: flat", Small, show >= 0 ? TxtB : DimB, X0 + 6, Y0 + 4);
+        }
     }
 
     void ShowFxMenu(int i, int slot, Point at)   // the insert is looked up when an item is picked, in case undo replaced the project meanwhile
@@ -4296,9 +4681,11 @@ class MainForm : Form
             File.WriteAllText(f, "MINIDAW\t1\nfx\t1\t0\tBogus\t0\t0\t0\n");
             threw = false; try { Project.Load(f); } catch (InvalidDataException) { threw = true; }
             check(threw, "rejects an unknown effect");
-            File.WriteAllText(f, "MINIDAW\t1\nins\t3\t1\t0\t0\t2\t0.5\t0\n");
+            File.WriteAllText(f, "MINIDAW\t1\nins\t2\t1\t0\t0\t3\t0.5\t0\nins\t3\t1\t0\t0\t2\t0.5\t0\n");
             threw = false; try { Project.Load(f); } catch (InvalidDataException) { threw = true; }
-            check(threw, "rejects a send to an earlier insert (that could make a loop)");
+            File.WriteAllText(f, "MINIDAW\t1\nins\t3\t1\t0\t0\t2\t0.5\t0\n");
+            bool backOk = true; try { backOk = Project.Load(f).Mixer[3].SendTo == 2; } catch (InvalidDataException) { backOk = false; }
+            check(threw && backOk, "a send to an earlier insert is fine; one that would loop back (2 → 3 → 2) is refused");
             File.WriteAllText(f, "MINIDAW\t1\nins\t2\t0.5\t0\t0\n");   // line from a file saved before sends existed
             var old = Project.Load(f);
             check(old.Mixer[2].Vol == 0.5f && old.Mixer[2].SendTo == 0 && old.Mixer[2].Sidechain == 0, "older project files without sends still open");
@@ -5014,6 +5401,56 @@ class MainForm : Form
                 var fb = Project.Parse(fr.Lines().ToArray(), null); var fb2 = fb.Patterns[0].For(3).Last();
                 check(fb2.Step == fn.Step && fb2.Len == fn.Len && fb2.Slide && fb.Channels[3].Glide == 0.35f && !fb.Patterns[0].For(0)[0].Slide,
                     "saved and opened again: a triplet note's exact position and length, the slide flag, and the channel's glide");
+            }
+
+            {   // mixer: 125 inserts, free routing without loops, the new effects
+                var routeProj = Project.Demo();
+                routeProj.Mixer[3].SendTo = 5; routeProj.Mixer[5].SendTo = 7;
+                bool loopRefused = !routeProj.CanRoute(7, 3) && !routeProj.CanRoute(7, 5) && routeProj.CanRoute(7, 2) && routeProj.CanRoute(3, 7) && routeProj.CanRoute(9, 1);
+                routeProj.Mixer[3].Sidechain = 0; bool scRefused = !routeProj.CanRoute(7, 3);   // 3 can't listen to 7: 7 already hears 3
+                var order = routeProj.ProcessOrder(); bool ordered = Array.IndexOf(order, 3) < Array.IndexOf(order, 5) && Array.IndexOf(order, 5) < Array.IndexOf(order, 7);
+                check(loopRefused && scRefused && ordered && order.Length == Project.Inserts - 1, "routing: 3 → 5 → 7 is processed in that order; 7 → 3, 7 → 5 and a sidechain 7 → 3 are refused (they'd loop); 7 → 2 and 3 → 7 are fine");
+                var far = Project.Demo(); foreach (var pt in far.Patterns) for (int c = 1; c < 4; c++) pt.For(c).Clear();
+                far.Channels[0].Insert = 1; far.Mixer[1].ToMaster = false; far.Mixer[1].Sends.Add(new Route { To = 100, Level = 0.5f }); far.Mixer[1].Sends.Add(new Route { To = 120, Level = 0.5f });
+                float[] everF; var farOut = Engine.Bounce(far.ExportCopy(), false, 0, out everF);
+                var last = Project.Demo(); last.Channels[0].Insert = Project.Inserts - 1; float[] everL; Engine.Bounce(last.ExportCopy(), false, 0, out everL);
+                check(everF[100] > 0.05 && everF[120] > 0.05 && Math.Abs(everF[100] - everF[120]) < 1e-4 && farOut.Max(x => Math.Abs(x)) > 0.05 && everL[Project.Inserts - 1] > 0.05,
+                    "a kick on insert 1 with \"to master\" off, sending 50% to inserts 100 and 120, reaches the master through them; a channel on insert 125 plays");
+                var rt = Project.Demo(); rt.Mixer[2].ToMaster = false; rt.Mixer[2].SendTo = 9; rt.Mixer[2].SendLevel = 0.3f; rt.Mixer[2].Sends.Add(new Route { To = 110, Level = 0.7f });
+                var peq = new Effect("Parametric EQ"); peq.P[7] = 0.83f; rt.Mixer[110].Slots[2] = peq;
+                var rtb = Project.Parse(rt.Lines().ToArray(), null);
+                check(!rtb.Mixer[2].ToMaster && rtb.Mixer[2].Sends.Count == 2 && rtb.Mixer[2].Sends[0].To == 9 && rtb.Mixer[2].Sends[0].Level == 0.3f && rtb.Mixer[2].Sends[1].To == 110 && rtb.Mixer[2].Sends[1].Level == 0.7f
+                      && rtb.Mixer[1].ToMaster && rtb.Mixer[110].Slots[2].Type == "Parametric EQ" && rtb.Mixer[110].Slots[2].P.SequenceEqual(peq.P),
+                    "saved and opened again: \"to master\" off, two sends with their levels, and a Parametric EQ's 15 settings on insert 110");
+
+                Func<double, float[]> sineOf = hz => { var x = new float[Engine.SR]; for (int k = 0; k < x.Length / 2; k++) x[2 * k] = x[2 * k + 1] = (float)(0.1 * Math.Sin(2 * Math.PI * hz * k / Engine.SR)); return x; };
+                Func<Effect, float[], double> gainDb = (fx, x) => { var y = (float[])x.Clone(); for (int at = 0; at < y.Length; at += 2048) { var bk = new float[Math.Min(2048, y.Length - at)]; Array.Copy(y, at, bk, 0, bk.Length); fx.Process(bk, bk.Length); Array.Copy(bk, 0, y, at, bk.Length); }
+                    return 20 * Math.Log10(y.Skip(y.Length / 2).Max(v => Math.Abs(v)) / x.Skip(x.Length / 2).Max(v => Math.Abs(v))); };
+                var peq1k = new Effect("Parametric EQ"); peq1k.P[7] = (float)(0.5 + 12 / 36.0);   // band 3 (1 kHz) +12 dB
+                double at1k = gainDb(peq1k, sineOf(1000)), at100 = gainDb(new Effect("Parametric EQ") { }, sineOf(100)); var eq2 = new Effect("Parametric EQ"); eq2.P[7] = peq1k.P[7]; double at100b = gainDb(eq2, sineOf(100));
+                check(Math.Abs(at1k - 12) < 0.6 && Math.Abs(at100b) < 0.6 && Math.Abs(peq1k.ResponseDb(1000) - 12) < 0.3 && Math.Abs(at100) < 0.01,
+                    "Parametric EQ: +12 dB on the 1 kHz band boosts a 1 kHz tone by " + at1k.ToString("0.0") + " dB and leaves 100 Hz at " + at100b.ToString("+0.0;-0.0") + " dB; the drawn curve says " + peq1k.ResponseDb(1000).ToString("0.0") + " dB there");
+                var loudNoise = new float[Engine.SR]; var nr = new Random(3); for (int k = 0; k < loudNoise.Length; k++) loudNoise[k] = (float)(nr.NextDouble() * 2 - 1) * 0.9f;
+                var mb0 = new Effect("Multiband"); mb0.P[0] = 0; mb0.P[2] = 0; var mb1 = new Effect("Multiband"); mb1.P[0] = 1; mb1.P[2] = 0;
+                Func<Effect, float[], float[]> run3 = (fx, x) => { var y = (float[])x.Clone(); for (int at = 0; at < y.Length; at += 2048) { var bk = new float[Math.Min(2048, y.Length - at)]; Array.Copy(y, at, bk, 0, bk.Length); fx.Process(bk, bk.Length); Array.Copy(bk, 0, y, at, bk.Length); } return y; };
+                var flatOut = run3(mb0, loudNoise); var squashed = run3(mb1, loudNoise);
+                double rmsN = Math.Sqrt(loudNoise.Average(v => (double)v * v)), rmsS = Math.Sqrt(squashed.Skip(loudNoise.Length / 2).Average(v => (double)v * v));
+                check(flatOut.Zip(loudNoise, (u, w) => Math.Abs(u - w)).Max() < 1e-4 && 20 * Math.Log10(rmsN / rmsS) > 6,
+                    "Multiband: at zero depth it passes sound unchanged; at full depth it turns loud noise down by " + (20 * Math.Log10(rmsN / rmsS)).ToString("0.0") + " dB");
+                var gate = new Effect("Beat FX"); gate.P[1] = 0.6f; gate.Sps = 5000; gate.Playing = true;   // gate, 1/16 slices of 5000 samples
+                var gx = new float[40000]; for (int k = 0; k < gx.Length; k++) gx[k] = 0.5f; var gy = (float[])gx.Clone();
+                for (int at = 0; at < gy.Length; at += 2000) { var bk = new float[2000]; Array.Copy(gy, at, bk, 0, 2000); gate.Pos = at / 2 / 5000.0; gate.Process(bk, 2000); Array.Copy(bk, 0, gy, at, 2000); }
+                bool gated = Enumerable.Range(0, 4).All(sl => gy[2 * (sl * 5000 + 1200)] > 0.45f && gy[2 * (sl * 5000 + 3700)] == 0);
+                var stut = new Effect("Beat FX"); stut.P[0] = 0.3f; stut.P[1] = 0.6f; stut.Sps = 1000; stut.Playing = true;   // stutter: 1/16 = 1000 samples, beats of 4000
+                var sx2 = new float[16000]; for (int k = 0; k < sx2.Length / 2; k++) sx2[2 * k] = sx2[2 * k + 1] = k; var sy2 = (float[])sx2.Clone();
+                for (int at = 0; at < sy2.Length; at += 2000) { var bk = new float[2000]; Array.Copy(sy2, at, bk, 0, 2000); stut.Pos = at / 2 / 1000.0; stut.Process(bk, 2000); Array.Copy(bk, 0, sy2, at, 2000); }
+                bool stuttered = sy2[2 * 1500] == 500 && sy2[2 * 2500] == 500 && sy2[2 * 4200] == 4200 && sy2[2 * 5300] == 4300;   // each beat's first slice repeats
+                check(gated && stuttered, "Beat FX: the gate lets the first half of each 1/16 through and silences the second; the stutter repeats each beat's first 1/16");
+                var voc = new Effect("Vocoder"); var carrier = new float[Engine.SR]; for (int k = 0; k < carrier.Length / 2; k++) carrier[2 * k] = carrier[2 * k + 1] = (float)(((k * 110.0 / Engine.SR) % 1) * 2 - 1) * 0.5f;
+                var quietKey = new float[carrier.Length]; var talkKey = (float[])loudNoise.Clone();
+                Func<float[], float[], double> vrun = (key, car) => { var v2 = new Effect("Vocoder"); var y = (float[])car.Clone(); for (int at = 0; at < y.Length; at += 2048) { var bk = new float[Math.Min(2048, y.Length - at)]; var kk = new float[bk.Length]; Array.Copy(y, at, bk, 0, bk.Length); Array.Copy(key, at, kk, 0, kk.Length); v2.Process(bk, bk.Length, kk); Array.Copy(bk, 0, y, at, bk.Length); } return Math.Sqrt(y.Skip(y.Length / 2).Average(v => (double)v * v)); };
+                double silentOut = vrun(quietKey, carrier), talkOut = vrun(talkKey, carrier); var untouched = run3(voc, carrier);
+                check(silentOut < 1e-3 && talkOut > 0.05 && untouched.SequenceEqual(carrier), "Vocoder: a saw with a silent voice is silent (" + silentOut.ToString("0.0000") + "), with a noisy one it speaks (" + talkOut.ToString("0.000") + "); with no sidechain it leaves the sound alone");
             }
 
             {   // limiter: nothing past the ceiling, quiet sound untouched (just 5 ms late); chorus, flanger, phaser change the sound, not its level
