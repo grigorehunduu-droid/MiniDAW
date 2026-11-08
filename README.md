@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 118 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 122 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -58,6 +58,20 @@ Needs Windows 10 or 11.
 - It applies to the whole project, including exports, and is saved with it.
 - The demo beat only uses on-beat steps, so put some hats on steps 2, 4, 6… to hear it.
 
+**Piano roll:**
+- **Getting around:** the mouse wheel scrolls up and down through all 128 keys, **Ctrl+wheel** zooms the keys, **Shift+wheel** scrolls across and **Ctrl+Shift+wheel** zooms across. **−** / **=** still jump to the computer keyboard's octave.
+- **snap:** the grid that new notes, moves, lengths, recording and the tools use. Choices are beat, 1/8, 1/16, 1/32, 1/64, the 1/8, 1/16 and 1/32 triplets, or none (1/96 of a beat). New notes get the length of the last note you made or stretched.
+- **Ghost notes:** the other channels' notes in this pattern show faintly behind yours.
+- **scale:** pick a root and a scale (major, minor, harmonic minor, pentatonics, blues, dorian, mixolydian). Its notes light up, its root a little more, and the rest go dark.
+- **stamp:** with a chord chosen (major, minor, 7th, maj7, min7, sus2, sus4, dim, aug, power, octave), one click adds the whole chord.
+- **tools:** each works on the selected notes, or on all of them if none are selected:
+  - **quantize** (also **Ctrl+Q**), or quantize lengths too
+  - **chop** into snap-sized pieces
+  - **strum**: each higher note of a chord starts 1/64 later and ends with the others
+  - **arpeggiate** chords into a run at the snap
+  - **slide notes**: instead of starting a note, a slide note bends the note already sounding to its pitch over its own length. It shows an arrow, and isn't written to MIDI files.
+- **Bottom lane:** click its label to switch between **velocity**, **pan** and **fine pitch**. Drag to draw; right-click puts a value back to its default.
+- **Glide (portamento):** in the sound settings window. With it on, the channel plays one note at a time and slides from each note into the next over up to 0.5 s.
 **Pattern length:** right-click the **pattern list** in the toolbar to **rename / delete** a pattern or set its **length (1–4 bars)**.
 - The rack shows every step, with a gap between bars, and the piano roll widens to match.
 - Shortening a pattern drops notes past the new end, and you can undo that.
@@ -178,7 +192,7 @@ The export window remembers your choices until MiniDAW closes.
   - Every instrument in the file gets a new channel, with the closest built-in sound: drums by General MIDI drum note, everything else by its General MIDI instrument.
   - The notes go into new patterns of up to 4 bars, placed one after another on the first free playlist track.
   - A summary says what was added, and one Ctrl+Z takes it all back.
-  - Notes snap to 16ths, and a note that crosses a 4-bar boundary is cut there.
+  - Timing is kept to 1/96 of a beat, so triplets and swung playing survive. A note that crosses a 4-bar boundary is cut there.
   - The project keeps its own tempo; the summary tells you the file's.
 
 ## Shortcuts
@@ -197,6 +211,8 @@ The export window remembers your choices until MiniDAW closes.
 | Ctrl+V | Paste onto the selected channel and pattern, at the same steps. Notes that don't fit are dropped. If the copied notes start past a shorter pattern's end, they move back into bar 1. |
 | Ctrl+B | Duplicate the selection right after itself, rounded up to whole beats (one bar → the next bar). The new copy stays selected, so pressing Ctrl+B again keeps going. |
 | Delete | Delete the selected notes |
+| Ctrl+Q | Quantize the selected notes (or all) to the snap |
+| Wheel / Ctrl / Shift / Ctrl+Shift | Piano roll: scroll keys / zoom keys / scroll across / zoom across |
 
 ## Files
 
@@ -234,4 +250,4 @@ MiniDAW is open source under the [MIT License](LICENSE): use it, change it, shar
 - No VST plugins. Export is 44.1 kHz only.
 - Audio uses the classic Windows `waveOut` output with about 0.1 s of delay. No ASIO.
 - Recording works only in Pattern mode and only adds notes (overdub).
-- MIDI import snaps notes to 16ths; a song longer than the playlist only gets its first 32 bars placed (the rest of its patterns are still created).
+- MIDI import keeps timing to 1/96 of a beat; a song longer than the playlist only gets its first 32 bars placed (the rest of its patterns are still created).

@@ -22,11 +22,13 @@ using System.Windows.Forms;
 [assembly: System.Reflection.AssemblyFileVersion(AboutForm.Version)]
 
 // ---------------------------------------------------------------- model
-class Note   // Step/Len in 16th notes, Key = MIDI note (60 = C5 in FL naming), Vel 1..127 (100 = the channel's normal level)
+class Note   // Step/Len in 16th notes (fractions for triplets and finer snaps), Key = MIDI note (60 = C5 in FL naming), Vel 1..127 (100 = the channel's normal level)
 {
-    public int Step, Key, Len, Vel = 100;
+    public double Step, Len;
+    public int Key, Vel = 100;
     public float Pan;   // -1..1, added to the channel's pan (the rack's graph editor)
     public int Fine;    // -100..100 cents of fine pitch
+    public bool Slide;  // a slide note: bends the channel's sounding note to this pitch over its length instead of starting a new one
     public Note Clone() { return (Note)MemberwiseClone(); }
 }
 
@@ -39,6 +41,8 @@ class Channel
     public int Color;                         // ARGB of its colour in the rack and piano roll; 0 = the default orange
     public string Group;                      // rack filter group, like FL's channel groups; null = none
     public int ArpDir, ArpRange = 1, ArpTime = 1; public float ArpGate = 0.5f;   // arpeggiator: 0 off, 1 up, 2 down, 3 up & down, 4 random; octaves; ArpTimes index; note length
+    public float Glide;                                                           // portamento: 0 off, 1 = 500 ms; when on, the channel plays one note at a time and slides between them
+    public int GlideSamples() { return (int)(Glide * 0.5 * Engine.SR); }
     public static readonly double[] ArpTimes = { 0.5, 1, 2, 4 };                  // in 16ths: 1/32, 1/16, 1/8, 1/4
     public static readonly string[] ArpDirs = { "off", "up", "down", "up & down", "random" }, ArpTimeNames = { "1/32", "1/16", "1/8", "1/4" };
     public float[] Sample, SampleR; public int SampleRate = 44100;   // SampleR: the right side of a stereo sample (null = mono)
@@ -100,12 +104,12 @@ class Pattern
     public List<Note> For(int ch) { while (Notes.Count <= ch) Notes.Add(new List<Note>()); return Notes[ch]; }
 
     // Copies of notes land at step + offset on channel ch: ones past the end are dropped, ones on an existing note (same step and key) replace it.
-    public List<Note> Paste(int ch, IEnumerable<Note> notes, int offset)
+    public List<Note> Paste(int ch, IEnumerable<Note> notes, double offset)
     {
         var list = For(ch); var added = new List<Note>();
         foreach (var n in notes.ToList())   // snapshot: the source may be this very list
         {
-            int s = n.Step + offset;
+            double s = n.Step + offset;
             if (s < 0 || s >= Length) continue;
             list.RemoveAll(x => x.Step == s && x.Key == n.Key);
             var c = n.Clone(); c.Step = s; c.Len = Math.Min(n.Len, Length - s);
@@ -114,21 +118,20 @@ class Pattern
         return added;
     }
 
-    // How far a group of notes may move (dx steps, dy keys) and all still fit in a pattern this long; from = each note's start step/key
-    public static Point ClampMove(Dictionary<Note, Point> from, int length, int ds, int dk)
+    // How far a group of notes may move (ds steps, dk keys) and all still fit in a pattern this long; from = each note as it was before the drag
+    public static void ClampMove(Dictionary<Note, Note> from, int length, ref double ds, ref int dk)
     {
-        foreach (var kv in from)   // each clamp keeps the earlier ones satisfied, since every note's range contains 0
+        foreach (var o in from.Values)   // each clamp keeps the earlier ones satisfied, since every note's range contains 0
         {
-            ds = Math.Max(-kv.Value.X, Math.Min(length - kv.Key.Len - kv.Value.X, ds));
-            dk = Math.Max(-kv.Value.Y, Math.Min(127 - kv.Value.Y, dk));
+            ds = Math.Max(-o.Step, Math.Min(length - o.Len - o.Step, ds));
+            dk = Math.Max(-o.Key, Math.Min(127 - o.Key, dk));
         }
-        return new Point(ds, dk);
     }
 
-    public static int DupOffset(IEnumerable<Note> notes)   // Ctrl+B: the notes' span rounded up to whole beats, so the copy follows right after
+    public static double DupOffset(IEnumerable<Note> notes)   // Ctrl+B: the notes' span rounded up to whole beats, so the copy follows right after
     {
-        int a = notes.Min(n => n.Step), b = notes.Max(n => n.Step + n.Len);
-        return (b - a + 3) / 4 * 4;
+        double a = notes.Min(n => n.Step), b = notes.Max(n => n.Step + n.Len);
+        return Math.Ceiling((b - a) / 4 - 1e-9) * 4;
     }
 
     public void SetBars(int bars)   // shortening drops notes past the new end and trims ones that run over it
@@ -617,7 +620,7 @@ class Project
         var w = new List<string> { "MINIDAW\t1", "bpm\t" + Bpm, "swing\t" + Swing.ToString("R") };
         foreach (var c in Channels)
             w.Add(string.Join("\t", "ch", c.Kind, c.Vol.ToString("R"), c.Pan.ToString("R"), c.Mute ? "1" : "0", Clean(c.Name), c.SamplePath ?? "", c.Insert,
-                              string.Join("\t", Enumerable.Range(0, 4).Select(i => c.K(i).ToString("R"))), c.Color, Clean(c.Group ?? ""), c.ArpDir, c.ArpRange, c.ArpTime, c.ArpGate.ToString("R")));
+                              string.Join("\t", Enumerable.Range(0, 4).Select(i => c.K(i).ToString("R"))), c.Color, Clean(c.Group ?? ""), c.ArpDir, c.ArpRange, c.ArpTime, c.ArpGate.ToString("R"), c.Glide.ToString("R")));
         for (int i = 0; i < Inserts; i++)
         {
             var m = Mixer[i];
@@ -629,7 +632,7 @@ class Project
         {
             w.Add("pat\t" + Clean(pat.Name) + "\t" + pat.Bars);
             for (int ch = 0; ch < pat.Notes.Count; ch++)
-                foreach (var n in pat.Notes[ch]) w.Add(string.Join("\t", "n", ch, n.Step, n.Key, n.Len, n.Vel, n.Pan.ToString("R"), n.Fine));
+                foreach (var n in pat.Notes[ch]) w.Add(string.Join("\t", "n", ch, n.Step.ToString("R"), n.Key, n.Len.ToString("R"), n.Vel, n.Pan.ToString("R"), n.Fine, n.Slide ? "1" : "0"));
         }
         for (int t = 0; t < Tracks; t++) for (int b = 0; b < Bars; b++)
             if (Playlist[t, b] >= 0) w.Add(string.Join("\t", "pl", t, b, Playlist[t, b]));
@@ -646,6 +649,13 @@ class Project
     {
         int v = int.Parse(s, CultureInfo.InvariantCulture);
         if (v < lo || v > hi) throw new InvalidDataException("Value " + v + " out of range " + lo + ".." + hi);
+        return v;
+    }
+
+    static double Dbl(string s, double lo, double hi)   // a note position or length: out of range means a damaged file
+    {
+        double v = double.Parse(s, CultureInfo.InvariantCulture);
+        if (double.IsNaN(v) || v < lo || v > hi) throw new InvalidDataException("Value " + s + " out of range");
         return v;
     }
 
@@ -685,6 +695,7 @@ class Project
                     c.Color = int.Parse(f[12], CultureInfo.InvariantCulture); c.Group = f[13] == "" ? null : f[13];
                     c.ArpDir = Int(f[14], 0, Channel.ArpDirs.Length - 1); c.ArpRange = Int(f[15], 1, 4); c.ArpTime = Int(f[16], 0, Channel.ArpTimes.Length - 1); c.ArpGate = Num(f[17], 0.05f, 1);
                 }
+                if (f.Length > 18) c.Glide = Num(f[18], 0, 1);
                 var mem = c.Kind == "sample" && c.SamplePath != null && samplesFrom != null ? samplesFrom.Channels.Find(x => x.SamplePath == c.SamplePath && x.Sample != null) : null;
                 if (mem != null) { c.Sample = mem.Sample; c.SampleR = mem.SampleR; c.SampleRate = mem.SampleRate; }   // arrays are never modified, so sharing is safe
                 else if (c.Kind == "sample" && c.SamplePath != null)
@@ -723,10 +734,11 @@ class Project
             else if (f[0] == "n")
             {
                 if (cur == null || f.Length < 5) throw new InvalidDataException("Note outside a pattern on line " + (li + 1));
-                int step = Int(f[2], 0, cur.Length - 1);
-                cur.For(Int(f[1], 0, p.Channels.Count - 1)).Add(new Note { Step = step, Key = Int(f[3], 0, 127), Len = Int(f[4], 1, cur.Length - step),
+                double step = Dbl(f[2], 0, cur.Length - 1e-6);
+                cur.For(Int(f[1], 0, p.Channels.Count - 1)).Add(new Note { Step = step, Key = Int(f[3], 0, 127), Len = Dbl(f[4], 1e-6, cur.Length - step + 1e-6),
                                                                           Vel = f.Length > 5 ? Int(f[5], 1, 127) : 100,   // older files have no velocity,
-                                                                          Pan = f.Length > 7 ? Num(f[6], -1, 1) : 0, Fine = f.Length > 7 ? Int(f[7], -100, 100) : 0 });   // pan or fine pitch
+                                                                          Pan = f.Length > 7 ? Num(f[6], -1, 1) : 0, Fine = f.Length > 7 ? Int(f[7], -100, 100) : 0,   // pan or fine pitch,
+                                                                          Slide = f.Length > 8 && f[8] == "1" });                                                     // or slide flag
             }
             else if (f[0] == "pl")
             {
@@ -1156,7 +1168,7 @@ static class Midi
 
     public static byte[] Export(Project p, bool song, int pattern)
     {
-        var starts = new List<Tuple<int, int, Note>>();   // (song step, channel, note)
+        var starts = new List<Tuple<double, int, Note>>();   // (song position in 16ths, channel, note)
         var tempo = new List<Tuple<int, int, byte[]>>();
         lock (p)
         {
@@ -1173,7 +1185,7 @@ static class Midi
                         if (b0 < 0) continue;
                         var pat = p.Patterns[p.Playlist[t, b0]]; int s = (bar - b0) * Project.Steps + abs % Project.Steps;
                         for (int ch = 0; ch < Math.Min(pat.Notes.Count, p.Channels.Count); ch++)
-                            if (!p.Channels[ch].Mute) foreach (var n in pat.Notes[ch]) if (n.Step == s) starts.Add(Tuple.Create(abs, ch, n));
+                            if (!p.Channels[ch].Mute) foreach (var n in pat.Notes[ch]) if (!n.Slide && n.Step >= s && n.Step < s + 1) starts.Add(Tuple.Create(abs + n.Step - s, ch, n));
                     }
                     int bpm = lane == null ? p.Bpm : (int)Math.Round(Project.MinBpm + lane.Values[abs] * (Project.MaxBpm - Project.MinBpm));
                     if (bpm != last) { tempo.Add(Tuple.Create(abs * PerStep, 2, Tempo(bpm))); last = bpm; }   // a tempo lane: one change per 16th it moves
@@ -1183,7 +1195,7 @@ static class Midi
             {
                 var pat = p.Patterns[Math.Min(pattern, p.Patterns.Count - 1)];
                 for (int ch = 0; ch < Math.Min(pat.Notes.Count, p.Channels.Count); ch++)
-                    if (!p.Channels[ch].Mute) foreach (var n in pat.Notes[ch]) starts.Add(Tuple.Create(n.Step, ch, n));
+                    if (!p.Channels[ch].Mute) foreach (var n in pat.Notes[ch]) if (!n.Slide) starts.Add(Tuple.Create(n.Step, ch, n));   // slide notes are bends, not notes
                 tempo.Add(Tuple.Create(0, 2, Tempo(p.Bpm)));
             }
         }
@@ -1200,8 +1212,9 @@ static class Midi
             foreach (var x in group)
             {
                 int key = drum ? DrumNote[c.Kind] : Math.Max(0, Math.Min(127, x.Item3.Key)), vel = Math.Max(1, Math.Min(127, x.Item3.Vel));
-                ev.Add(Tuple.Create(x.Item1 * PerStep, 3, new byte[] { (byte)(0x90 | mc), (byte)key, (byte)vel }));
-                ev.Add(Tuple.Create((x.Item1 + Math.Max(1, x.Item3.Len)) * PerStep, 2, new byte[] { (byte)(0x80 | mc), (byte)key, 0 }));   // offs sort before ons at the same tick
+                int on = (int)Math.Round(x.Item1 * PerStep), off = Math.Max(on + 1, (int)Math.Round((x.Item1 + x.Item3.Len) * PerStep));
+                ev.Add(Tuple.Create(on, 3, new byte[] { (byte)(0x90 | mc), (byte)key, (byte)vel }));
+                ev.Add(Tuple.Create(off, 2, new byte[] { (byte)(0x80 | mc), (byte)key, 0 }));   // offs sort before ons at the same tick
             }
             tracks.Add(Chunk(ev));
         }
@@ -1306,9 +1319,9 @@ static class Midi
         }
         if (notes.Count == 0) throw new InvalidDataException("This MIDI file has no notes.");
 
-        Func<int, int> step = tk => (int)Math.Round(tk * 4.0 / div);   // shortcut: snaps to 16ths, the pattern grid
-        int span = Pattern.MaxBars * Project.Steps, endStep = notes.Max(n => Math.Max(step(n.On) + 1, step(n.Off)));
-        int patCount = (endStep + span - 1) / span, firstPat;
+        Func<int, double> step = tk => Math.Round(tk * 96.0 / div) / 24;   // to 16ths, kept to 1/96 of a beat: triplets and swung timing survive
+        int span = Pattern.MaxBars * Project.Steps; double endStep = notes.Max(n => Math.Max(step(n.On) + 0.25, step(n.Off)));
+        int patCount = (int)Math.Ceiling(endStep / span - 1e-9), firstPat;
         var made = new Dictionary<string, int>();   // group → new channel index
         lock (p)
         {
@@ -1316,7 +1329,7 @@ static class Midi
             for (int i = 0; i < patCount; i++)
             {
                 var pat = new Pattern { Name = patCount == 1 ? title : title + " " + (i + 1) };
-                pat.SetBars(Math.Max(1, Math.Min(Pattern.MaxBars, (endStep - i * span + Project.Steps - 1) / Project.Steps)));
+                pat.SetBars(Math.Max(1, Math.Min(Pattern.MaxBars, (int)Math.Ceiling((endStep - i * span) / Project.Steps - 1e-9))));
                 p.Patterns.Add(pat);
             }
             foreach (var n in notes.OrderBy(x => x.On))
@@ -1333,14 +1346,14 @@ static class Midi
                     p.Channels.Add(new Channel { Kind = kind, Name = free, Insert = Math.Min(p.Channels.Count + 1, Project.Inserts - 1) });
                     made[group] = p.Channels.Count - 1;
                 }
-                int s = step(n.On), pi = s / span; var pt = p.Patterns[firstPat + pi]; int at = s - pi * span;
+                double s = step(n.On); int pi = Math.Min(patCount - 1, (int)(s / span)); var pt = p.Patterns[firstPat + pi]; double at = s - pi * span;
                 if (at >= pt.Length) continue;
                 var list = pt.For(made[group]); int key = drum ? 60 : n.Key;
-                list.RemoveAll(x => x.Step == at && x.Key == key);   // two notes on one 16th: the later one wins, as in the piano roll
-                list.Add(new Note { Step = at, Key = key, Len = Math.Max(1, Math.Min(step(n.Off) - s, pt.Length - at)), Vel = Math.Max(1, Math.Min(127, n.Vel)) });
+                list.RemoveAll(x => x.Step == at && x.Key == key);   // two notes at the same moment and key: the later one wins, as in the piano roll
+                list.Add(new Note { Step = at, Key = key, Len = Math.Max(1 / 24.0, Math.Min(Math.Max(drum ? 1 : 0, step(n.Off) - s), pt.Length - at)), Vel = Math.Max(1, Math.Min(127, n.Vel)) });
             }
             // place the patterns in order on the first playlist track that's empty for the whole length
-            int bars = Math.Min(Project.Bars, (endStep + Project.Steps - 1) / Project.Steps), track = -1;
+            int bars = Math.Min(Project.Bars, (int)Math.Ceiling(endStep / Project.Steps - 1e-9)), track = -1;
             for (int t = 0; t < Project.Tracks && track < 0; t++)
                 if (Enumerable.Range(0, bars).All(b => p.ClipAt(t, b) < 0)) track = t;
             int placed = 0;
@@ -1369,7 +1382,7 @@ class Engine
     public const int SR = 44100;
     const int Frames = 1024, NBuf = 4, MaxVoices = 64;   // ~93 ms of buffered output
 
-    public class Voice { public Channel Ch; public int Key, Age, Len, Wait; public float Gain = 1, NotePan; public double Phase, Pos, Rate, Z1, Z2, Detune = 1; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; NotePan/Detune: the note's own pan and fine pitch; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)
+    public class Voice { public Channel Ch; public int Key, Age, Len, Wait, GlideAge, GlideLen; public float Gain = 1, NotePan; public double Phase, Pos, Rate, Z1, Z2, Detune = 1, Shift, ShiftFrom, ShiftTo; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Shift: semitones it's currently bent by (slides, glide), moving from ShiftFrom to ShiftTo over GlideLen samples   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; NotePan/Detune: the note's own pan and fine pitch; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)
 
     // Arpeggiator: a channel's held notes (from patterns, or keys held on a keyboard) play one at a time on a clock instead of together.
     class Held { public int Key, Vel, Fine; public float Pan; public long End; public bool Live; }
@@ -1577,6 +1590,34 @@ class Engine
 
     void Click(bool bar) { clickAge = 0; clickHz = bar ? 1600 : 1000; }
 
+    // A new note. With glide (portamento) on, the channel plays one note at a time: the one sounding is let go, and the new one
+    // starts at its pitch and slides to its own.
+    void Start(Voice v)
+    {
+        int glide = v.Ch.GlideSamples();
+        if (glide > 0)
+        {
+            Voice prev = null;
+            foreach (var o in voices) if (o.Ch == v.Ch && !o.Done && o.Age <= o.Len) prev = o;   // the newest one still held
+            if (prev != null)
+            {
+                v.ShiftFrom = v.Shift = prev.Key + prev.Shift - v.Key; v.ShiftTo = 0; v.GlideLen = glide; v.GlideAge = -v.Wait;
+                foreach (var o in voices) if (o.Ch == v.Ch && o.Age <= o.Len) o.Len = o.Age + v.Wait;   // release the others as this one starts
+            }
+        }
+        AddVoice(v);
+    }
+
+    void Bend(Channel c, int key, int delay, int samples)   // slide note: every held note on the channel slides to `key` over `samples`
+    {
+        foreach (var v in voices)
+            if (v.Ch == c && !v.Done && v.Age <= v.Len)
+            {
+                v.ShiftFrom = v.Shift; v.ShiftTo = key - v.Key; v.GlideLen = Math.Max(1, samples); v.GlideAge = delay;
+                v.Len = Math.Max(v.Len, v.Age - delay + samples);   // keep sounding at least to the slide's end
+            }
+    }
+
     void RunArps(double sps)   // once per sample: drop notes that ended, and start the next arpeggio note when its time comes
     {
         foreach (var kv in arps)
@@ -1629,9 +1670,13 @@ class Engine
                     var c = proj.Channels[ch];
                     if (c.Mute) continue;
                     foreach (var n in hit.Key.Notes[ch])
-                        if (n.Step == s && c.ArpDir != 0) ArpOf(c).Notes.Add(new Held { Key = n.Key, Vel = n.Vel, Pan = n.Pan, Fine = n.Fine, End = now + (long)(n.Len * sps) });   // the arpeggiator plays it
-                        else if (n.Step == s) AddVoice(new Voice { Ch = c, Key = n.Key, Len = (int)(n.Len * sps), Gain = n.Vel / 100f, NotePan = n.Pan, Detune = Math.Pow(2, n.Fine / 1200.0),
-                                                              Wait = s % 2 == 1 ? (int)Math.Round(proj.Swing * 0.5 * sps) : 0 });   // swing delays off-beat 16ths
+                    {
+                        if (n.Step < s || n.Step >= s + 1) continue;   // notes starting within this 16th; an off-grid one waits for its moment
+                        int wait = (int)Math.Round((n.Step - s) * sps) + (s % 2 == 1 ? (int)Math.Round(proj.Swing * 0.5 * sps) : 0);   // swing delays off-beat 16ths
+                        if (n.Slide) { Bend(c, n.Key, -wait, (int)(n.Len * sps)); continue; }   // a slide note bends what's sounding; it starts nothing
+                        if (c.ArpDir != 0) ArpOf(c).Notes.Add(new Held { Key = n.Key, Vel = n.Vel, Pan = n.Pan, Fine = n.Fine, End = now + wait + (long)(n.Len * sps) });   // the arpeggiator plays it
+                        else Start(new Voice { Ch = c, Key = n.Key, Len = Math.Max(1, (int)(n.Len * sps)), Gain = n.Vel / 100f, NotePan = n.Pan, Detune = Math.Pow(2, n.Fine / 1200.0), Wait = wait });
+                    }
                 }
         }
     }
@@ -1652,6 +1697,12 @@ class Engine
     {
         double t = v.Age / (double)SR, br = 1;   // br scales every oscillator's speed: pitch wheel and vibrato, for keyboard notes only
         if (v.Live) br = modDepth == 0 ? bendMul : bendMul * Math.Exp(modDepth * VibSemis * Math.Sin(2 * Math.PI * VibHz * t) * Math.Log(2) / 12);
+        if (v.GlideLen > 0)   // a slide or glide in progress
+        {
+            if (v.GlideAge >= 0) v.Shift = v.GlideAge >= v.GlideLen ? v.ShiftTo : v.ShiftFrom + (v.ShiftTo - v.ShiftFrom) * v.GlideAge / v.GlideLen;
+            if (v.GlideAge++ >= v.GlideLen) v.GlideLen = 0;
+        }
+        if (v.Shift != 0) br *= Math.Pow(2, v.Shift / 12);
         v.Age++;
         var c = v.Ch; double b = c.Bright();   // tone knob: filter brightness for synths, decay length for drums (1 = built-in)
         switch (c.Kind)
@@ -2131,12 +2182,12 @@ class MainForm : Form
     static bool screenshotMode;   // --screenshot: built off-screen, never activated; no recovery prompt, no MIDI device, the autosave left alone
     protected override bool ShowWithoutActivation { get { return screenshotMode; } }
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 33 };
-    int selCh = 3; Note dragNote; string dragMode; int dragCh; string filePath; bool dirty; int lastStep = -2;
+    int selCh = 3; string dragMode; int dragCh; string filePath; bool dirty; int lastStep = -2;
     Effect dragFx; int dragParam; float dragX0, dragW;
     int selLane = -1, autoK = -1; float autoV;   // automation lane shown in the playlist (-1 = editing patterns), last painted step
     List<Note> sel = new List<Note>(), clip = new List<Note>();   // piano roll selection, and the copy buffer
     Point? boxFrom, boxTo;                                        // right-drag selection box in the piano roll
-    List<Note> moving; Dictionary<Note, Point> moveFrom; Note moveHit; Point moveAt; bool moved, resizing;   // notes being dragged: start step/key of each, the grabbed one, the grab cell
+    List<Note> moving; Dictionary<Note, Note> moveFrom; Note moveHit; bool moved, resizing;   // notes being dragged: each one as it was before, and the grabbed one
 
     // Theme: one dark palette for every panel and window. Shapes keep the layout coordinates, so clicking works as before.
     internal static readonly Color Txt = Color.FromArgb(230, 233, 238), Dim = Color.FromArgb(138, 147, 163),
@@ -2293,7 +2344,8 @@ class MainForm : Form
         rack.Paint += PaintRack; rack.MouseDown += RackDown; rack.MouseMove += RackMove; rack.MouseUp += (s, e) => dragMode = null;
         rack.MouseDoubleClick += (s, e) => { if (e.Button == MouseButtons.Left && e.X >= 20 && e.X < 134 && RackRow(e.Y) >= 0) ShowSoundSettings(); };
         roll.Paint += PaintRoll; roll.MouseDown += RollDown; roll.MouseMove += RollMove;
-        roll.MouseUp += (s, e) => { dragNote = null; dragMode = null; if (boxFrom.HasValue) FinishBox(); if (moving != null) FinishMove(); };
+        roll.MouseUp += (s, e) => { dragNotes = null; dragMode = null; if (boxFrom.HasValue) FinishBox(); if (moving != null) FinishMove(); };
+        roll.MouseWheel += RollWheel;
         playlist.Paint += PaintPlaylist; playlist.MouseDown += PlaylistDown; playlist.MouseMove += PlaylistMouse; playlist.MouseUp += (s, e) => FinishClipDrag();
         mixer.Paint += PaintMixer; mixer.MouseDown += MixerDown; mixer.MouseMove += MixerMove;
         mixer.MouseUp += (s, e) => { dragMode = null; dragFx = null; if (slotDragIns >= 0) FinishSlotDrag(e); };
@@ -2416,12 +2468,12 @@ class MainForm : Form
         if (err != null) { Text = "MiniDAW — " + err; midiBox.SelectedIndex = 0; }
     }
 
-    // Rec on + playing in Pattern mode: keyboard notes land in the current pattern on the selected channel, snapped to the nearest 16th.
+    // Rec on + playing in Pattern mode: keyboard notes land in the current pattern on the selected channel, snapped to the piano roll's grid.
     void RecordMidi(int msg, double pos)
     {
-        int key = (msg >> 8) & 0x7F, step = (int)Math.Round(pos) % CurPat.Length;
+        int key = (msg >> 8) & 0x7F; double len = CurPat.Length, step = SnapNear(pos) % len;
         var open = recNotes[key]; recNotes[key] = null;
-        if (open != null) open.Len = Math.Max(1, Math.Min(CurPat.Length - open.Step, (step - open.Step + CurPat.Length) % CurPat.Length));   // note-off sets the length
+        if (open != null) open.Len = Math.Max(Grid(), Math.Min(len - open.Step, ((step - open.Step) % len + len) % len));   // note-off sets the length
         bool on = (msg & 0xF0) == 0x90 && (msg >> 16 & 0x7F) > 0;
         if (on && recording && selCh < P.Channels.Count)
         {
@@ -2430,8 +2482,8 @@ class MainForm : Form
             lock (P)
             {
                 var list = CurPat.For(selCh);
-                n = list.Find(x => x.Step == step && x.Key == key);
-                if (n == null) list.Add(n = new Note { Step = step, Key = key, Len = 1 });
+                n = list.Find(x => Math.Abs(x.Step - step) < 1e-6 && x.Key == key);
+                if (n == null) list.Add(n = new Note { Step = step, Key = key, Len = Grid() });
                 n.Vel = msg >> 16 & 0x7F;   // how hard the key was hit
             }
             recNotes[key] = n;
@@ -2456,8 +2508,6 @@ class MainForm : Form
     readonly int[] pianoHeld = Enumerable.Repeat(-1, PianoKeys.Length).ToArray();   // the note each held key started, -1 = up
     const int MinOctave = -3, MaxOctave = 3;
     int pianoOctave;   // - and = move the keyboard down and up; 0: Z = C4, Q = C5
-    int Lo { get { return 48 + 12 * pianoOctave; } }   // the piano roll shows 3 octaves from the keyboard's lowest note, so the view follows the octave shift
-    int Hi { get { return Lo + 36; } }
 
     static int PianoMsg(Keys k, bool down, int[] held, int octave)   // MIDI message for a key press/release, or 0
     {
@@ -2478,7 +2528,7 @@ class MainForm : Form
         e.SuppressKeyPress = true;   // stops a focused drop-down from jumping to an item that starts with this letter
         if (octaveKey)
         {
-            if (down) { pianoOctave = Math.Max(MinOctave, Math.Min(MaxOctave, pianoOctave + (e.KeyCode == Keys.Oemplus ? 1 : -1))); roll.Invalidate(); }
+            if (down) { pianoOctave = Math.Max(MinOctave, Math.Min(MaxOctave, pianoOctave + (e.KeyCode == Keys.Oemplus ? 1 : -1))); ShowKeys(48 + 12 * pianoOctave); roll.Invalidate(); }   // the roll scrolls to the keyboard's range
             return;
         }
         int m = PianoMsg(e.KeyCode, down, pianoHeld, pianoOctave);
@@ -2504,6 +2554,7 @@ class MainForm : Form
             if (keyData == (Keys.Control | Keys.C) || keyData == (Keys.Control | Keys.X)) { CopyNotes(keyData == (Keys.Control | Keys.X)); return true; }
             if (keyData == (Keys.Control | Keys.V) || keyData == (Keys.Control | Keys.B)) { PasteNotes(keyData == (Keys.Control | Keys.B)); return true; }
             if (keyData == Keys.Delete) { DeleteNotes(); return true; }
+            if (keyData == (Keys.Control | Keys.Q)) { Tool("quantize"); return true; }   // quick quantize, like FL
         }
         return base.ProcessCmdKey(ref msg, keyData);
     }
@@ -2598,7 +2649,7 @@ class MainForm : Form
 
     class SoundWindow : Form
     {
-        const int BarsTop = 30, RowH = 30, BarX = 12, BarW = 296, ArpTop = BarsTop + 4 * RowH + 26;
+        const int BarsTop = 30, RowH = 30, BarX = 12, BarW = 296, ArpTop = BarsTop + 4 * RowH + 26, PlayRows = 5;   // "playing" rows: glide, then the arpeggiator's four
         readonly MainForm m;
         public readonly Canvas view = new Canvas();
         int drag = -1, arpDrag = -1;   // the sound setting or arpeggiator row being dragged
@@ -2607,7 +2658,7 @@ class MainForm : Form
         {
             m = main;
             FormBorderStyle = FormBorderStyle.FixedToolWindow; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(BarX * 2 + BarW, ArpTop + 4 * RowH + 4); Font = main.Font;
+            ClientSize = new Size(BarX * 2 + BarW, ArpTop + PlayRows * RowH + 4); Font = main.Font;
             view.Dock = DockStyle.Fill; Controls.Add(view);
             view.Paint += PaintView;
             view.MouseDown += (s, e) =>
@@ -2616,7 +2667,7 @@ class MainForm : Form
                 if (e.Y >= ArpTop)   // arpeggiator rows (not for drums)
                 {
                     int ar = (e.Y - ArpTop) / RowH;
-                    if (c.IsDrum || ar > 3 || e.Button != MouseButtons.Left) return;
+                    if (c.IsDrum || ar >= PlayRows || e.Button != MouseButtons.Left) return;
                     m.BeginEdit(); arpDrag = ar; SetArp(e); return;
                 }
                 var shown = c.KnobsShown(); int r = (e.Y - BarsTop) / RowH;
@@ -2649,9 +2700,10 @@ class MainForm : Form
         {
             var c = Ch(); if (c == null) return;
             float v = Clamp01((e.X - BarX) / (float)BarW);
-            if (arpDrag == 0) c.ArpDir = (int)Math.Round(v * (Channel.ArpDirs.Length - 1));
-            else if (arpDrag == 1) c.ArpRange = 1 + (int)Math.Round(v * 3);
-            else if (arpDrag == 2) c.ArpTime = (int)Math.Round(v * (Channel.ArpTimes.Length - 1));
+            if (arpDrag == 0) c.Glide = v < 0.02f ? 0 : v;
+            else if (arpDrag == 1) c.ArpDir = (int)Math.Round(v * (Channel.ArpDirs.Length - 1));
+            else if (arpDrag == 2) c.ArpRange = 1 + (int)Math.Round(v * 3);
+            else if (arpDrag == 3) c.ArpTime = (int)Math.Round(v * (Channel.ArpTimes.Length - 1));
             else c.ArpGate = Math.Max(0.05f, v);
             m.dirty = true; view.Invalidate();
         }
@@ -2669,15 +2721,15 @@ class MainForm : Form
                 ValueBar(g, BarX, y, BarW, RowH - 8, 0, c.K(shown[r]), DeepBlue);
                 g.DrawString(c.KnobLabel(shown[r]), Font, TxtB, new RectangleF(BarX + 8, y, BarW - 12, RowH - 8), Fit);
             }
-            g.DrawString("ARPEGGIATOR  ·  plays held notes one at a time", Small, DimB, BarX, ArpTop - 19);
+            g.DrawString("PLAYING  ·  glide between notes, and the arpeggiator", Small, DimB, BarX, ArpTop - 19);
             if (c.IsDrum) { g.DrawString("Not for drums.", Font, DimB, BarX, ArpTop + 4); return; }
-            float[] vals = { c.ArpDir / (float)(Channel.ArpDirs.Length - 1), (c.ArpRange - 1) / 3f, c.ArpTime / (float)(Channel.ArpTimes.Length - 1), c.ArpGate };
-            string[] labels = { "Arpeggio  " + Channel.ArpDirs[c.ArpDir], "Range  " + c.ArpRange + (c.ArpRange == 1 ? " octave" : " octaves"),
-                                "Time  " + Channel.ArpTimeNames[c.ArpTime] + " notes", "Gate  " + (int)Math.Round(c.ArpGate * 100) + "% of each note" };
-            for (int r = 0; r < 4; r++)
+            float[] vals = { c.Glide, c.ArpDir / (float)(Channel.ArpDirs.Length - 1), (c.ArpRange - 1) / 3f, c.ArpTime / (float)(Channel.ArpTimes.Length - 1), c.ArpGate };
+            string[] labels = { "Glide  " + (c.Glide == 0 ? "off" : (int)Math.Round(c.Glide * 500) + " ms, one note at a time"), "Arpeggio  " + Channel.ArpDirs[c.ArpDir],
+                                "Range  " + c.ArpRange + (c.ArpRange == 1 ? " octave" : " octaves"), "Time  " + Channel.ArpTimeNames[c.ArpTime] + " notes", "Gate  " + (int)Math.Round(c.ArpGate * 100) + "% of each note" };
+            for (int r = 0; r < PlayRows; r++)
             {
-                float y = ArpTop + r * RowH; bool live = c.ArpDir != 0 || r == 0;   // the other rows matter only once it's on
-                ValueBar(g, BarX, y, BarW, RowH - 8, 0, vals[r], live ? Color.FromArgb(150, 104, 224) : Raised);
+                float y = ArpTop + r * RowH; bool live = r == 0 ? c.Glide > 0 : c.ArpDir != 0 || r == 1;   // the arpeggiator's other rows matter only once it's on
+                ValueBar(g, BarX, y, BarW, RowH - 8, 0, vals[r], !live ? Raised : r == 0 ? Color.FromArgb(46, 140, 120) : Color.FromArgb(150, 104, 224));
                 g.DrawString(labels[r], Font, live ? TxtB : DimB, new RectangleF(BarX + 8, y, BarW - 12, RowH - 8), Fit);
             }
         }
@@ -2957,7 +3009,7 @@ class MainForm : Form
             float sw = StepW();
             for (int s = 0; s < pat.Length; s++)
             {
-                bool on = notes.Any(n => n.Step == s), now = ps >= 0 && ps % pat.Length == s;
+                bool on = notes.Any(n => (int)n.Step == s), now = ps >= 0 && ps % pat.Length == s;
                 var col = on ? (now ? ControlPaint.Light(ChColor(c), 0.6f) : ChColor(c)) : now ? Color.FromArgb(84, 94, 112) : s / 4 % 2 == 0 ? Cell2 : Cell1;
                 float gap = s % Project.Steps == Project.Steps - 1 && s < pat.Length - 1 ? sw * 0.4f : Math.Max(2, sw * 0.15f);   // wider gap between bars
                 float px = RackX + s * sw, pw = sw - gap;
@@ -2980,7 +3032,7 @@ class MainForm : Form
         {
             float gap = s % Project.Steps == Project.Steps - 1 && s < CurPat.Length - 1 ? sw * 0.4f : Math.Max(2, sw * 0.15f), x = RackX + s * sw, pw = sw - gap;
             Round(g, Well, x, top, pw, gh, 2);
-            var n = notes.FirstOrDefault(nn => nn.Step == s);
+            var n = notes.FirstOrDefault(nn => (int)nn.Step == s);
             if (n == null) continue;   // only steps with a note have a value
             if (graphMode == 1) { float v = n.Vel / 127f; Round(g, col, x, top + gh * (1 - v), pw, gh * v, 2); continue; }
             float u = graphMode == 2 ? n.Pan : n.Fine / 100f, mid = top + gh / 2;
@@ -2994,7 +3046,7 @@ class MainForm : Form
         int s = (int)Math.Floor((e.X - RackX) / StepW());
         if (s < 0 || s >= CurPat.Length || selCh >= P.Channels.Count) return;
         float v = Clamp01(1 - (e.Y - GraphTop() - 4) / (GraphH - 16)); bool reset = e.Button == MouseButtons.Right;
-        foreach (var n in CurPat.For(selCh).Where(nn => nn.Step == s))
+        foreach (var n in CurPat.For(selCh).Where(nn => (int)nn.Step == s))
         {
             if (graphMode == 1) n.Vel = reset ? 100 : Math.Max(1, (int)Math.Round(v * 127));
             else if (graphMode == 2) n.Pan = reset || Math.Abs(v - 0.5f) < 0.03f ? 0 : v * 2 - 1;   // a small dead zone snaps to the centre
@@ -3058,7 +3110,7 @@ class MainForm : Form
             lock (P)
             {
                 var notes = CurPat.For(i);
-                if (notes.RemoveAll(n => n.Step == s) == 0) notes.Add(new Note { Step = s, Key = 60, Len = 1 });
+                if (notes.RemoveAll(n => (int)n.Step == s) == 0) notes.Add(new Note { Step = s, Key = 60, Len = 1 });
             }
         }
         Changed();
@@ -3180,57 +3232,136 @@ class MainForm : Form
     }
 
     // ---- piano roll for the selected channel
+    // ---- piano roll view: scrolled and zoomed on its own; − and = still bring the computer keyboard's range into view
+    int rollTop = 83, rollRows = 36;   // top key shown, and how many rows (12..128)
+    double rollFrom, rollSpan;          // first 16th shown, and how many (0 = the whole pattern)
+    double snap = 1, lastLen = 1;       // grid in 16ths (4 = a beat, 2/3 = 1/16 triplet, 0 = none); the length new notes get
+    int laneMode, scaleRoot = -1, scaleType, stamp;   // bottom lane: 0 velocity, 1 pan, 2 fine pitch; scale highlighting (root -1 = off); chord stamp (0 = off)
+    List<Note> dragNotes;               // notes just added, still being stretched by the drag
+    double moveAt; int moveKey;         // where a note drag grabbed (16ths, key)
+    const int SnapBoxX = 250, SnapBoxW = 118, ScaleBoxW = 136, StampBoxW = 108, ToolsBoxW = 64;
+    static readonly string[] SnapNames = { "beat", "1/8", "1/16", "1/32", "1/64", "1/8 triplet", "1/16 triplet", "1/32 triplet", "none" };
+    static readonly double[] SnapValues = { 4, 2, 1, 0.5, 0.25, 4 / 3.0, 2 / 3.0, 1 / 3.0, 0 };
+    static readonly string[] ScaleNames = { "major", "minor", "harmonic minor", "major pentatonic", "minor pentatonic", "blues", "dorian", "mixolydian" };
+    static readonly int[][] ScaleSteps = { new[] { 0, 2, 4, 5, 7, 9, 11 }, new[] { 0, 2, 3, 5, 7, 8, 10 }, new[] { 0, 2, 3, 5, 7, 8, 11 }, new[] { 0, 2, 4, 7, 9 },
+        new[] { 0, 3, 5, 7, 10 }, new[] { 0, 3, 5, 6, 7, 10 }, new[] { 0, 2, 3, 5, 7, 9, 10 }, new[] { 0, 2, 4, 5, 7, 9, 10 } };
+    static readonly string[] StampNames = { "off", "major", "minor", "7th", "maj7", "min7", "sus2", "sus4", "dim", "aug", "power", "octave" };
+    static readonly int[][] StampSteps = { new[] { 0 }, new[] { 0, 4, 7 }, new[] { 0, 3, 7 }, new[] { 0, 4, 7, 10 }, new[] { 0, 4, 7, 11 }, new[] { 0, 3, 7, 10 },
+        new[] { 0, 2, 7 }, new[] { 0, 5, 7 }, new[] { 0, 3, 6 }, new[] { 0, 4, 8 }, new[] { 0, 7 }, new[] { 0, 12 } };
+    static readonly string[] KeyNames = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+
+    int Lo { get { return rollTop - rollRows + 1; } }   // lowest key shown
+    int Hi { get { return rollTop + 1; } }              // one above the highest
+    double Span() { return rollSpan > 0 ? Math.Min(rollSpan, CurPat.Length) : CurPat.Length; }
+    double From() { return Math.Max(0, Math.Min(rollFrom, CurPat.Length - Span())); }
+    float RollCw() { return (float)((roll.Width - KeyW) / Span()); }
+    float RollRh() { return (roll.Height - Top0 - VelH) / (float)rollRows; }
+    float StepX(double s) { return (float)(KeyW + (s - From()) * RollCw()); }
+    double XStep(float x) { return From() + (x - KeyW) / RollCw(); }
+    float KeyY(int key) { return Top0 + (rollTop - key) * RollRh(); }
+    int YKey(float y) { return rollTop - (int)Math.Floor((y - Top0) / RollRh()); }
+    double Grid() { return snap > 0 ? snap : 1 / 24.0; }   // "none" still lands on 1/96 of a beat
+    double SnapDown(double s) { double q = Grid(); return Math.Floor(s / q + 1e-6) * q; }
+    double SnapNear(double s) { double q = Grid(); return Math.Round(s / q) * q; }
+    bool InScale(int key) { return scaleRoot < 0 || ScaleSteps[scaleType].Contains((key - scaleRoot + 120) % 12); }
+    void ShowKeys(int low) { rollTop = Math.Max(rollRows - 1, Math.Min(127, low + rollRows - 1)); }   // bring a key range into view from its bottom
+    float ScaleBoxX() { return SnapBoxX + SnapBoxW + 6; }
+    float StampBoxX() { return ScaleBoxX() + ScaleBoxW + 6; }
+    float ToolsBoxX() { return StampBoxX() + StampBoxW + 6; }
+
     void PaintRoll(object sender, PaintEventArgs e)
     {
         var g = e.Graphics;
         string name = P.Channels.Count > 0 ? P.Channels[selCh].Name : "";
         int nsel = P.Channels.Count > 0 ? Selected().Count : 0;
-        Header(g, roll, "PIANO ROLL — " + name + (nsel > 0 ? "  (" + nsel + " selected)" : ""));
-        g.DrawString("click: add / remove note · drag a note: move · drag its right edge: length · VEL lane: velocity · right-drag: select · Ctrl+A / C / X / V, Ctrl+B duplicate, Del",
-            Small, DimB, 300, 5);
+        Header(g, roll, "PIANO ROLL — " + name + (nsel > 0 ? "  (" + nsel + ")" : ""));
+        RouteBox(g, SnapBoxX, 4, SnapBoxW, "snap: " + SnapNames[Array.IndexOf(SnapValues, snap)], snap != 1);
+        RouteBox(g, ScaleBoxX(), 4, ScaleBoxW, "scale: " + (scaleRoot < 0 ? "off" : KeyNames[scaleRoot] + " " + ScaleNames[scaleType]), scaleRoot >= 0);
+        RouteBox(g, StampBoxX(), 4, StampBoxW, "stamp: " + StampNames[stamp], stamp > 0);
+        RouteBox(g, ToolsBoxX(), 4, ToolsBoxW, "tools ▾", false);
+        g.DrawString("click: add · drag: move · edge: length · right-drag: select · wheel: scroll · Ctrl+wheel: zoom · Shift: across",
+            Small, DimB, ToolsBoxX() + ToolsBoxW + 12, 5);
         int lowKey = 48 + 12 * pianoOctave;   // the computer keyboard's current range, right-aligned in the header
-        string keysHint = "keys Z–M, Q–I play " + NoteName(lowKey) + "–" + NoteName(lowKey + 24) + "  (− / = shift the octave and this view)";
+        string keysHint = "keys Z–M, Q–I play " + NoteName(lowKey) + "–" + NoteName(lowKey + 24) + "  (− / =)";
         g.DrawString(keysHint, Small, TxtB, roll.Width - g.MeasureString(keysHint, Small).Width - 8, 5);
         if (P.Channels.Count == 0) return;
-        float rh = (roll.Height - Top0 - VelH) / (float)(Hi - Lo), cw = (roll.Width - KeyW) / (float)CurPat.Length, vy = roll.Height - VelH;
+        float rh = RollRh(), cw = RollCw(), vy = roll.Height - VelH;
+        var clip0 = g.Clip; g.SetClip(new RectangleF(0, Top0, roll.Width, vy - Top0));
         using (var ivory = new SolidBrush(Color.FromArgb(222, 225, 231))) g.FillRectangle(ivory, 0, Top0, KeyW - 2, vy - Top0);   // white keys behind every row
         using (var seam = new Pen(Color.FromArgb(150, 156, 168)))
         using (var octave = new Pen(Color.FromArgb(48, 55, 67)))
-            for (int r = 0; r < Hi - Lo; r++)
+            for (int r = 0; r < rollRows; r++)
             {
-                int key = Hi - 1 - r; bool black = "010100101010"[key % 12] == '1';
+                int key = rollTop - r; bool black = "010100101010"[key % 12] == '1', inScale = InScale(key);
                 float y = Top0 + r * rh;
-                using (var b = new SolidBrush(black ? Color.FromArgb(24, 27, 33) : Color.FromArgb(31, 35, 42))) g.FillRectangle(b, KeyW, y, roll.Width, rh);
+                var row = scaleRoot < 0 ? (black ? Color.FromArgb(24, 27, 33) : Color.FromArgb(31, 35, 42))
+                    : !inScale ? Color.FromArgb(19, 21, 26) : (key - scaleRoot + 120) % 12 == 0 ? Color.FromArgb(44, 50, 62) : Color.FromArgb(34, 39, 47);   // scale: its notes lit, the root more
+                using (var b = new SolidBrush(row)) g.FillRectangle(b, KeyW, y, roll.Width, rh);
                 if (black) { g.DrawLine(seam, 0, y + rh / 2, KeyW - 2, y + rh / 2); Round(g, Color.FromArgb(26, 28, 33), 0, y, (KeyW - 2) * 0.62f, rh, 2); }   // a short black key over the seam of two white ones
                 else if (key % 12 == 0 || key % 12 == 5) g.DrawLine(seam, 0, y + rh, KeyW - 2, y + rh);   // B|C and E|F: white keys side by side
                 if (key % 12 == 0)
                 {
                     g.DrawLine(octave, KeyW, y + rh, roll.Width, y + rh);
-                    g.DrawString("C" + (key / 12), Small, Brushes.DimGray, new RectangleF(0, y + rh / 2 - 8, KeyW - 4, 16), new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center });   // FL naming: MIDI 60 = C5
+                    if (rh >= 5) g.DrawString("C" + (key / 12), Small, Brushes.DimGray, new RectangleF(0, y + rh / 2 - 8, KeyW - 4, 16), new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center });   // FL naming: MIDI 60 = C5
                 }
             }
-        using (var b = new SolidBrush(Color.FromArgb(22, 25, 30))) g.FillRectangle(b, 0, vy, roll.Width, VelH);   // velocity lane
+        g.Clip = clip0;
+        using (var b = new SolidBrush(Color.FromArgb(22, 25, 30))) g.FillRectangle(b, 0, vy, roll.Width, VelH);   // the bottom lane
         using (var pen = new Pen(AppBg)) g.DrawLine(pen, 0, vy, roll.Width, vy);
-        g.DrawString("VEL", Small, DimB, 6, vy + VelH / 2 - 7);
-        for (int s = 0; s <= CurPat.Length; s++)
-            using (var pen = new Pen(s % Project.Steps == 0 ? Color.FromArgb(78, 87, 103) : s % 4 == 0 ? Color.FromArgb(50, 57, 69) : Color.FromArgb(37, 42, 51)))
-                g.DrawLine(pen, KeyW + s * cw, Top0, KeyW + s * cw, roll.Height);
-        int ps = eng.PlayStep;
-        if (ps >= 0) using (var b = new SolidBrush(Color.FromArgb(34, On))) g.FillRectangle(b, KeyW + (ps % CurPat.Length) * cw, Top0, cw, roll.Height);
-        var keepAa = g.SmoothingMode;
-        foreach (var n in CurPat.For(selCh))
+        g.DrawString(new[] { "VEL", "PAN", "PITCH" }[laneMode] + " ▾", Small, DimB, 4, vy + VelH / 2 - 7);
+        // grid: snap lines faint, 16ths, beats, bars stronger (snap lines only when they're far enough apart to see)
+        double from = From(), to = from + Span(), q = Grid();
+        if (q * cw >= 5 && Math.Abs(q - Math.Round(q)) > 1e-6)
+            using (var pen = new Pen(Color.FromArgb(29, 33, 40)))
+                for (double sx = Math.Ceiling(from / q) * q; sx <= to; sx += q) g.DrawLine(pen, StepX(sx), Top0, StepX(sx), roll.Height);
+        for (int st = (int)Math.Ceiling(from); st <= to; st++)
         {
-            var col = Color.FromArgb(70 + 185 * n.Vel / 127, ChColor(P.Channels[selCh]));   // softer notes are drawn fainter
-            float bh = n.Vel / 127f * (VelH - 8), vx = KeyW + n.Step * cw + Math.Min(6, cw / 2);   // velocity: a stem with a knob on top
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (var pen = new Pen(col, 2)) g.DrawLine(pen, vx, roll.Height - 4, vx, roll.Height - 4 - bh);
-            using (var b = new SolidBrush(col)) g.FillEllipse(b, vx - 3.5f, roll.Height - 7.5f - bh, 7, 7);
-            g.SmoothingMode = keepAa;
+            if (cw < 4 && st % 4 != 0) continue;
+            using (var pen = new Pen(st % Project.Steps == 0 ? Color.FromArgb(78, 87, 103) : st % 4 == 0 ? Color.FromArgb(50, 57, 69) : Color.FromArgb(37, 42, 51)))
+                g.DrawLine(pen, StepX(st), Top0, StepX(st), roll.Height);
+        }
+        int ps = eng.PlayStep;
+        if (ps >= 0) using (var b = new SolidBrush(Color.FromArgb(34, On))) g.FillRectangle(b, StepX(ps % CurPat.Length), Top0, cw, roll.Height);
+        g.SetClip(new RectangleF(KeyW, Top0, roll.Width - KeyW, vy - Top0));
+        for (int ch = 0; ch < Math.Min(CurPat.Notes.Count, P.Channels.Count); ch++)   // ghost notes: the other channels in this pattern, faint
+        {
+            if (ch == selCh) continue;
+            var gc = ChColor(P.Channels[ch]);
+            foreach (var n in CurPat.Notes[ch])
+            {
+                if (n.Key < Lo || n.Key >= Hi) continue;
+                var rc = new RectangleF(StepX(n.Step) + 1, KeyY(n.Key) + 0.5f, (float)(n.Len * cw) - 2, rh - 1);
+                Round(g, Color.FromArgb(38, gc), rc.X, rc.Y, rc.Width, rc.Height, 2);
+                RoundEdge(g, Color.FromArgb(90, gc), 1, rc, 2);
+            }
+        }
+        var mine = CurPat.For(selCh); var ccol = ChColor(P.Channels[selCh]);
+        foreach (var n in mine)
+        {
             if (n.Key < Lo || n.Key >= Hi) continue;
-            var rc = new RectangleF(KeyW + n.Step * cw + 1, Top0 + (Hi - 1 - n.Key) * rh + 0.5f, n.Len * cw - 2, rh - 1);
+            var col = Color.FromArgb(70 + 185 * n.Vel / 127, ccol);   // softer notes are drawn fainter
+            var rc = new RectangleF(StepX(n.Step) + 1, KeyY(n.Key) + 0.5f, (float)(n.Len * cw) - 2, rh - 1);
             Round(g, col, rc.X, rc.Y, rc.Width, rc.Height, 2.5f);
             RoundEdge(g, sel.Contains(n) ? Color.White : Color.FromArgb(150, 120, 60, 10), sel.Contains(n) ? 1.5f : 1, rc, 2.5f);
+            if (n.Slide)   // a slide note: an arrow, since it bends the sounding note instead of starting one
+                using (var b = new SolidBrush(Color.FromArgb(220, 255, 255, 255)))
+                    g.FillPolygon(b, new[] { new PointF(rc.Right - 9, rc.Top + 2), new PointF(rc.Right - 2, rc.Top + rc.Height / 2), new PointF(rc.Right - 9, rc.Bottom - 2) });
         }
+        g.Clip = clip0;
+        var keepAa = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+        float laneMid = roll.Height - 4 - (VelH - 8) / 2f;
+        foreach (var n in mine)   // the lane: a stem with a knob per note (velocity up from the bottom; pan and pitch from the middle)
+        {
+            float vx = StepX(n.Step) + Math.Min(6, cw / 2);
+            if (vx < KeyW || vx > roll.Width) continue;
+            var col = Color.FromArgb(70 + 185 * n.Vel / 127, ccol);
+            float y0 = laneMode == 0 ? roll.Height - 4 : laneMid, y1 = laneMode == 0 ? roll.Height - 4 - n.Vel / 127f * (VelH - 8)
+                : laneMid - (laneMode == 1 ? n.Pan : n.Fine / 100f) * (VelH - 8) / 2;
+            using (var pen = new Pen(col, 2)) g.DrawLine(pen, vx, y0, vx, y1);
+            using (var b = new SolidBrush(col)) g.FillEllipse(b, vx - 3.5f, y1 - 3.5f, 7, 7);
+        }
+        if (laneMode > 0) using (var pen = new Pen(Color.FromArgb(60, 68, 82))) g.DrawLine(pen, KeyW, laneMid, roll.Width, laneMid);
+        g.SmoothingMode = keepAa;
         if (boxFrom.HasValue)
         {
             using (var b = new SolidBrush(Color.FromArgb(30, Blue))) g.FillRectangle(b, BoxRect());
@@ -3243,18 +3374,17 @@ class MainForm : Form
     void FinishBox()   // notes the box touches become the selection; a right-click without a drag clears it
     {
         RectangleF r = BoxRect(); boxFrom = boxTo = null;
-        float rh = (roll.Height - Top0 - VelH) / (float)(Hi - Lo), cw = (roll.Width - KeyW) / (float)CurPat.Length;
         sel = r.Width < 3 && r.Height < 3 ? new List<Note>()
-            : CurPat.For(selCh).Where(n => new RectangleF(KeyW + n.Step * cw, Top0 + (Hi - 1 - n.Key) * rh, n.Len * cw, rh).IntersectsWith(r)).ToList();
+            : CurPat.For(selCh).Where(n => new RectangleF(StepX(n.Step), KeyY(n.Key), (float)(n.Len * RollCw()), RollRh()).IntersectsWith(r)).ToList();
         roll.Invalidate();
     }
 
     List<Note> Selected() { var list = CurPat.For(selCh); return sel.Where(list.Contains).ToList(); }   // skips notes an undo or a pattern/channel switch left behind
+    List<Note> Targets() { var s = Selected(); return s.Count > 0 ? s : CurPat.For(selCh).ToList(); }   // tools work on the selection, or the whole channel
 
     void CopyNotes(bool cut)   // Ctrl+C / Ctrl+X: the selection, or the channel's whole pattern when nothing is selected
     {
-        var src = Selected();
-        if (src.Count == 0) src = CurPat.For(selCh).ToList();
+        var src = Targets();
         if (src.Count == 0) return;
         clip = src.Select(n => n.Clone()).ToList();
         if (cut) Edit(() => { lock (P) CurPat.For(selCh).RemoveAll(src.Contains); sel.Clear(); Changed(); });
@@ -3264,11 +3394,10 @@ class MainForm : Form
     // Ctrl+B: duplicate the selection (or the whole channel) right after itself.
     void PasteNotes(bool duplicate)
     {
-        var src = duplicate ? Selected() : clip;
-        if (duplicate && src.Count == 0) src = CurPat.For(selCh).ToList();
+        var src = duplicate ? Targets() : clip;
         if (src.Count == 0) return;
-        int first = src.Min(n => n.Step);
-        int off = duplicate ? Pattern.DupOffset(src) : first >= CurPat.Length ? -(first - first % Project.Steps) : 0;
+        double first = src.Min(n => n.Step);
+        double off = duplicate ? Pattern.DupOffset(src) : first >= CurPat.Length ? -(first - first % Project.Steps) : 0;
         List<Note> added = null;
         Edit(() => { lock (P) added = CurPat.Paste(selCh, src, off); Changed(); });
         sel = added;   // the pasted notes stay selected, so Ctrl+B again keeps extending
@@ -3280,80 +3409,167 @@ class MainForm : Form
         if (src.Count > 0) Edit(() => { lock (P) CurPat.For(selCh).RemoveAll(src.Contains); sel.Clear(); Changed(); });
     }
 
-    void SetVelocity(MouseEventArgs e)   // velocity lane: every note starting in the step under the mouse (a chord moves together)
+    void SetLane(MouseEventArgs e)   // bottom lane: every note starting in the snap cell under the mouse (a chord moves together)
     {
-        int s = (int)Math.Floor((e.X - KeyW) / ((roll.Width - KeyW) / (float)CurPat.Length));
-        int v = Math.Max(1, Math.Min(127, (int)Math.Round((roll.Height - 4 - e.Y) / (float)(VelH - 8) * 127)));
-        bool any = false;
-        lock (P) foreach (var n in CurPat.For(selCh)) if (n.Step == s && n.Vel != v) { n.Vel = v; any = true; }
-        if (any) Changed();
-    }
-
-    bool RollCell(MouseEventArgs e, out int step, out int key)
-    {
-        float rh = (roll.Height - Top0 - VelH) / (float)(Hi - Lo), cw = (roll.Width - KeyW) / (float)CurPat.Length;
-        step = (int)Math.Floor((e.X - KeyW) / cw);
-        int r = (int)Math.Floor((e.Y - Top0) / rh);
-        key = Hi - 1 - r;
-        return step >= 0 && step < CurPat.Length && r >= 0 && r < Hi - Lo;
+        double cell = SnapDown(XStep(e.X)), q = Grid();
+        float v = Clamp01((roll.Height - 4 - e.Y) / (float)(VelH - 8)); bool reset = e.Button == MouseButtons.Right, any = false;
+        lock (P)
+            foreach (var n in CurPat.For(selCh))
+            {
+                if (n.Step < cell - 1e-9 || n.Step >= cell + q - 1e-9) continue;
+                if (laneMode == 0) n.Vel = reset ? 100 : Math.Max(1, (int)Math.Round(v * 127));
+                else if (laneMode == 1) n.Pan = reset || Math.Abs(v - 0.5f) < 0.04f ? 0 : v * 2 - 1;
+                else n.Fine = reset || Math.Abs(v - 0.5f) < 0.04f ? 0 : (int)Math.Round((v * 2 - 1) * 100);
+                any = true;
+            }
+        if (any) { dirty = true; Changed(); }
     }
 
     void RollDown(object sender, MouseEventArgs e)
     {
-        int step, key;
-        if (e.Button == MouseButtons.Right && P.Channels.Count > 0 && e.Y < roll.Height - VelH) { boxFrom = boxTo = e.Location; roll.Invalidate(); return; }
-        if (e.Button != MouseButtons.Left || P.Channels.Count == 0) return;
-        if (e.Y >= roll.Height - VelH) { dragMode = "vel"; SetVelocity(e); return; }
-        if (!RollCell(e, out step, out key)) return;
+        if (e.Y < Top0) { RollHeader(e); return; }
+        if (P.Channels.Count == 0) return;
+        if (e.Y >= roll.Height - VelH)
+        {
+            if (e.X < KeyW) { laneMode = (laneMode + 1) % 3; roll.Invalidate(); return; }   // the lane's label switches velocity → pan → pitch
+            dragMode = "vel"; SetLane(e); return;
+        }
+        if (e.Button == MouseButtons.Right) { boxFrom = boxTo = e.Location; roll.Invalidate(); return; }
+        if (e.Button != MouseButtons.Left || e.X < KeyW) return;
+        double at = XStep(e.X); int key = YKey(e.Y);
+        if (at < 0 || at >= CurPat.Length || key < 0 || key > 127) return;
         lock (P)
         {
             var list = CurPat.For(selCh);
-            var hit = list.FirstOrDefault(n => n.Key == key && step >= n.Step && step < n.Step + n.Len);
-            float cw = (roll.Width - KeyW) / (float)CurPat.Length;
+            var hit = list.LastOrDefault(n => n.Key == key && at >= n.Step && at < n.Step + n.Len);
             if (hit != null)   // drag the body to move it (with the rest of the selection), the right edge to change its length; a click without a drag removes it
             {
-                resizing = e.X >= KeyW + (hit.Step + hit.Len) * cw - Math.Min(8, cw / 3);
+                resizing = e.X >= StepX(hit.Step + hit.Len) - Math.Min(8, RollCw() * hit.Len / 3);
                 moving = !resizing && sel.Contains(hit) ? Selected() : new List<Note> { hit };
-                moveFrom = moving.ToDictionary(n => n, n => new Point(n.Step, n.Key));
-                moveHit = hit; moveAt = new Point(step, key); moved = false;
+                moveFrom = moving.ToDictionary(n => n, n => n.Clone());
+                moveHit = hit; moveAt = at; moveKey = key; moved = false;
             }
-            else
+            else   // a new note, or a whole chord with the stamp on, as long as the last one made
             {
-                dragNote = new Note { Step = step, Key = key, Len = 1 };
-                list.Add(dragNote);
-                eng.Preview.Enqueue(new Engine.Voice { Ch = P.Channels[selCh], Key = key, Len = Engine.SR / 4 });
+                double start = SnapDown(at), len = Math.Min(Math.Max(Grid(), lastLen), CurPat.Length - start);
+                dragNotes = new List<Note>();
+                foreach (int iv in StampSteps[stamp])
+                {
+                    if (key + iv > 127) continue;
+                    var n = new Note { Step = start, Key = key + iv, Len = len };
+                    list.RemoveAll(x => x.Key == n.Key && Math.Abs(x.Step - start) < 1e-6);
+                    list.Add(n); dragNotes.Add(n);
+                    eng.Preview.Enqueue(new Engine.Voice { Ch = P.Channels[selCh], Key = n.Key, Len = Engine.SR / 4 });
+                }
             }
         }
         Changed();
     }
 
+    void RollHeader(MouseEventArgs e)   // the header's switches: snap, scale, stamp, tools
+    {
+        var m = new ContextMenuStrip(); float x = e.X;
+        if (x >= SnapBoxX && x < SnapBoxX + SnapBoxW)
+            for (int k = 0; k < SnapNames.Length; k++) { double v = SnapValues[k]; ((ToolStripMenuItem)m.Items.Add(SnapNames[k], null, (s, a) => { snap = v; roll.Invalidate(); })).Checked = snap == v; }
+        else if (x >= ScaleBoxX() && x < ScaleBoxX() + ScaleBoxW)
+        {
+            ((ToolStripMenuItem)m.Items.Add("off", null, (s, a) => { scaleRoot = -1; roll.Invalidate(); })).Checked = scaleRoot < 0;
+            for (int root = 0; root < 12; root++)
+            {
+                var item = new ToolStripMenuItem(KeyNames[root]) { Checked = scaleRoot == root };
+                for (int t = 0; t < ScaleNames.Length; t++) { int rr = root, tt = t; ((ToolStripMenuItem)item.DropDownItems.Add(KeyNames[root] + " " + ScaleNames[t], null, (s, a) => { scaleRoot = rr; scaleType = tt; roll.Invalidate(); })).Checked = scaleRoot == root && scaleType == t; }
+                m.Items.Add(item);
+            }
+        }
+        else if (x >= StampBoxX() && x < StampBoxX() + StampBoxW)
+            for (int k = 0; k < StampNames.Length; k++) { int v = k; ((ToolStripMenuItem)m.Items.Add(StampNames[k], null, (s, a) => { stamp = v; roll.Invalidate(); })).Checked = stamp == v; }
+        else if (x >= ToolsBoxX() && x < ToolsBoxX() + ToolsBoxW)
+        {
+            string on = Selected().Count > 0 ? " the selected notes" : " all notes";
+            m.Items.Add("Quantize" + on + " to the snap (Ctrl+Q)", null, (s, a) => Tool("quantize"));
+            m.Items.Add("Quantize starts and lengths", null, (s, a) => Tool("quantize both"));
+            m.Items.Add("Chop into snap-sized pieces", null, (s, a) => Tool("chop"));
+            m.Items.Add("Strum chords (each higher note a little later)", null, (s, a) => Tool("strum"));
+            m.Items.Add("Arpeggiate chords at the snap", null, (s, a) => Tool("arp"));
+            m.Items.Add(new ToolStripSeparator());
+            m.Items.Add("Make slide notes (they bend the sounding note)", null, (s, a) => Tool("slide"));
+            m.Items.Add("Make normal notes", null, (s, a) => Tool("unslide"));
+        }
+        else return;
+        m.Show(roll, (int)x, Top0 - 4);
+    }
+
+    // Piano roll tools, like FL's Tools menu: quantize, chop, strum, arpeggiate, slide. One undo step each; the results stay selected.
+    internal void Tool(string what)
+    {
+        if (P.Channels.Count == 0) return;
+        var src = Targets();
+        if (src.Count == 0) return;
+        Edit(() =>
+        {
+            lock (P)
+            {
+                var list = CurPat.For(selCh); double q = Grid(), len = CurPat.Length; var result = new List<Note>();
+                if (what.StartsWith("quantize"))
+                    foreach (var n in src)
+                    {
+                        n.Step = Math.Max(0, Math.Min(len - q, SnapNear(n.Step)));
+                        if (what == "quantize both") n.Len = Math.Max(q, SnapNear(n.Len));
+                        n.Len = Math.Min(n.Len, len - n.Step); result.Add(n);
+                    }
+                else if (what == "chop")
+                    foreach (var n in src)
+                    {
+                        if (n.Len <= q + 1e-9) { result.Add(n); continue; }
+                        list.Remove(n);
+                        for (double t = n.Step; t < n.Step + n.Len - 1e-9; t += q) { var piece = n.Clone(); piece.Step = t; piece.Len = Math.Min(q, n.Step + n.Len - t); list.Add(piece); result.Add(piece); }
+                    }
+                else if (what == "strum" || what == "arp")
+                    foreach (var chord in src.GroupBy(n => Math.Round(n.Step * 96)))   // notes starting together form a chord
+                    {
+                        var keys = chord.OrderBy(n => n.Key).ToList();
+                        if (keys.Count < 2) { result.AddRange(keys); continue; }
+                        if (what == "strum")
+                            for (int k = 0; k < keys.Count; k++) { double d = Math.Min(0.25 * k, keys[k].Len - 1 / 24.0); keys[k].Step += d; keys[k].Len -= d; result.Add(keys[k]); }   // 1/64 apart, ends kept
+                        else
+                        {
+                            double start = keys[0].Step, end = keys.Max(n => n.Step + n.Len);
+                            foreach (var n in keys) list.Remove(n);
+                            int k = 0;
+                            for (double t = start; t < end - 1e-9; t += q, k++) { var a = keys[k % keys.Count].Clone(); a.Step = t; a.Len = Math.Min(q, end - t); list.Add(a); result.Add(a); }
+                        }
+                    }
+                else foreach (var n in src) { n.Slide = what == "slide"; result.Add(n); }
+                sel = result;
+            }
+            dirty = true; Changed();
+        });
+    }
+
     void RollMove(object sender, MouseEventArgs e)
     {
         if (boxFrom.HasValue && e.Button == MouseButtons.Right) { boxTo = e.Location; roll.Invalidate(); return; }
-        if (dragMode == "vel" && e.Button == MouseButtons.Left) { SetVelocity(e); return; }
+        if (dragMode == "vel" && e.Button != MouseButtons.None) { SetLane(e); return; }
         if (moving != null && e.Button == MouseButtons.Left)
         {
             if (!resizing) { MoveNotes(e); return; }
-            int ns = (int)Math.Floor((e.X - KeyW) / ((roll.Width - KeyW) / (float)CurPat.Length));
-            int nl = Math.Max(1, Math.Min(CurPat.Length - moveHit.Step, ns - moveHit.Step + 1));
-            if (nl != moveHit.Len) { moveHit.Len = nl; moved = true; Changed(); }
+            double nl = Math.Max(Grid(), Math.Min(CurPat.Length - moveHit.Step, SnapNear(XStep(e.X)) - moveHit.Step));
+            if (Math.Abs(nl - moveHit.Len) > 1e-9) { moveHit.Len = nl; lastLen = nl; moved = true; Changed(); }
             return;
         }
-        if (dragNote == null || e.Button != MouseButtons.Left) return;
-        float cw = (roll.Width - KeyW) / (float)CurPat.Length;
-        int s = (int)Math.Floor((e.X - KeyW) / cw);
-        int len = Math.Max(1, Math.Min(CurPat.Length - dragNote.Step, s - dragNote.Step + 1));
-        if (len != dragNote.Len) { dragNote.Len = len; Changed(); }
+        if (dragNotes == null || e.Button != MouseButtons.Left) return;
+        double len2 = Math.Max(Grid(), Math.Min(CurPat.Length - dragNotes[0].Step, SnapDown(XStep(e.X)) + Grid() - dragNotes[0].Step));
+        if (Math.Abs(len2 - dragNotes[0].Len) > 1e-9) { foreach (var n in dragNotes) n.Len = len2; lastLen = len2; Changed(); }
     }
 
-    void MoveNotes(MouseEventArgs e)   // shift every grabbed note by the mouse's step/key offset, kept inside the pattern and the MIDI range
+    void MoveNotes(MouseEventArgs e)   // shift every grabbed note by the mouse's offset, snapping the grabbed note's start; kept inside the pattern and the MIDI range
     {
-        float rh = (roll.Height - Top0 - VelH) / (float)(Hi - Lo), cw = (roll.Width - KeyW) / (float)CurPat.Length;
-        int ds = (int)Math.Floor((e.X - KeyW) / cw) - moveAt.X, dk = Hi - 1 - (int)Math.Floor((e.Y - Top0) / rh) - moveAt.Y;
-        var d = Pattern.ClampMove(moveFrom, CurPat.Length, ds, dk); ds = d.X; dk = d.Y;
-        bool newPitch = moveHit.Key != moveFrom[moveHit].Y + dk;
-        foreach (var kv in moveFrom) { kv.Key.Step = kv.Value.X + ds; kv.Key.Key = kv.Value.Y + dk; }
-        if (ds != 0 || dk != 0) moved = true;
+        var o = moveFrom[moveHit];
+        double ds = SnapNear(o.Step + XStep(e.X) - moveAt) - o.Step; int dk = YKey(e.Y) - moveKey;
+        Pattern.ClampMove(moveFrom, CurPat.Length, ref ds, ref dk);
+        bool newPitch = moveHit.Key != o.Key + dk;
+        foreach (var kv in moveFrom) { kv.Key.Step = kv.Value.Step + ds; kv.Key.Key = kv.Value.Key + dk; }
+        if (Math.Abs(ds) > 1e-9 || dk != 0) moved = true;
         if (newPitch) eng.Preview.Enqueue(new Engine.Voice { Ch = P.Channels[selCh], Key = moveHit.Key, Len = Engine.SR / 8 });   // hear the new pitch
         Changed();
     }
@@ -3364,12 +3580,32 @@ class MainForm : Form
         {
             var list = CurPat.For(selCh);
             if (!moved) { list.Remove(moveHit); sel.Remove(moveHit); }   // a plain click still removes the note, as before
-            else list.RemoveAll(x => !moveFrom.ContainsKey(x) && moveFrom.Keys.Any(m => m.Step == x.Step && m.Key == x.Key));   // a moved note replaces one it lands on
+            else list.RemoveAll(x => !moveFrom.ContainsKey(x) && moveFrom.Keys.Any(m => Math.Abs(m.Step - x.Step) < 1e-6 && m.Key == x.Key));   // a moved note replaces one it lands on
         }
         moving = null; moveFrom = null; moveHit = null;
         Changed();
     }
 
+    void RollWheel(object sender, MouseEventArgs e)   // wheel: scroll keys; Ctrl: zoom keys; Shift: scroll across; Ctrl+Shift: zoom across
+    {
+        int notches = e.Delta / 120; if (notches == 0) notches = Math.Sign(e.Delta);
+        var mods = ModifierKeys; bool ctrl = (mods & Keys.Control) != 0, shift = (mods & Keys.Shift) != 0;
+        if (ctrl && shift)
+        {
+            double at = XStep(e.X), span = Math.Max(1, Math.Min(CurPat.Length, Span() * Math.Pow(0.8, notches)));
+            rollSpan = span >= CurPat.Length ? 0 : span;
+            rollFrom = Math.Max(0, at - (e.X - KeyW) / (double)(roll.Width - KeyW) * span);   // the 16th under the mouse stays put
+        }
+        else if (shift) rollFrom = Math.Max(0, Math.Min(CurPat.Length - Span(), From() - notches * Span() / 8));
+        else if (ctrl)
+        {
+            int mid = rollTop - rollRows / 2;
+            rollRows = Math.Max(12, Math.Min(128, (int)Math.Round(rollRows * Math.Pow(0.8, notches))));
+            rollTop = Math.Max(rollRows - 1, Math.Min(127, mid + rollRows / 2));
+        }
+        else rollTop = Math.Max(rollRows - 1, Math.Min(127, rollTop + 3 * notches));
+        roll.Invalidate();
+    }
     // ---- mixer: master + inserts, each with fader, pan, mute, meter and effect slots
     void ToggleMixer()
     {
@@ -4075,7 +4311,7 @@ class MainForm : Form
             var chord = cpj.Patterns[1].For(3);   // steps 0, 4, 8, 12; each 3 steps long; velocity 100
             chord[1].Vel = 70;
             var pasted = cpj.Patterns[0].Paste(3, chord, 0);
-            int dup = Pattern.DupOffset(pasted);
+            double dup = Pattern.DupOffset(pasted);
             var duped = cpj.Patterns[0].Paste(3, pasted, dup);
             var again = cpj.Patterns[0].Paste(3, duped, dup);   // a third copy would start at step 32: past the 2-bar end
             var p0 = cpj.Patterns[0].For(3);
@@ -4086,8 +4322,9 @@ class MainForm : Form
             check(cpj.Patterns[0].For(3).Count(n => n.Step == 4 && n.Key == chord[1].Key) == 1 && cpj.Patterns[0].For(3).First(n => n.Step == 4).Len == 2
                   && Pattern.DupOffset(new[] { new Note { Step = 2, Len = 3 } }) == 4, "a pasted note replaces one on the same step and key; a short selection duplicates one beat later");
             var mvA = new Note { Step = 2, Key = 60, Len = 4 }; var mvB = new Note { Step = 10, Key = 125, Len = 2 };
-            var mvFrom = new Dictionary<Note, Point> { { mvA, new Point(2, 60) }, { mvB, new Point(10, 125) } };
-            check(Pattern.ClampMove(mvFrom, 16, 3, 1) == new Point(3, 1) && Pattern.ClampMove(mvFrom, 16, 9, 5) == new Point(4, 2) && Pattern.ClampMove(mvFrom, 16, -9, -70) == new Point(-2, -60),
+            var mvFrom = new Dictionary<Note, Note> { { mvA, mvA.Clone() }, { mvB, mvB.Clone() } };
+            Func<double, int, string> clampTo = (ds0, dk0) => { double ds1 = ds0; int dk1 = dk0; Pattern.ClampMove(mvFrom, 16, ref ds1, ref dk1); return ds1 + "," + dk1; };
+            check(clampTo(3, 1) == "3,1" && clampTo(9, 5) == "4,2" && clampTo(-9, -70) == "-2,-60" && clampTo(2.5, 0) == "2.5,0",
                 "dragging two notes stops at the pattern's edges and the top/bottom of the MIDI range, keeping their spacing");
 
             // every built-in sound plays, stays under full scale and ends after its note; the pitched ones play A4 in tune
@@ -4499,6 +4736,38 @@ class MainForm : Form
                 check(kc2.Color == kc.Color && kc2.Group == "Synths" && kc2.ArpDir == 4 && kc2.ArpRange == 3 && kc2.ArpTime == 2 && Math.Abs(kc2.ArpGate - 0.3f) < 1e-6 && kn.Pan == -0.5f && kn.Fine == -37
                       && kb.Channels[0].Group == null && kb.Channels[0].ArpDir == 0,
                       "saved and opened again: channel colour, group and arpeggiator, and each note's pan and fine pitch");
+            }
+
+            {   // piano roll timing: off-grid notes, slide notes, glide
+                Func<Project> one = () => { var pj = new Project(); pj.Channels.Add(new Channel { Kind = "synth", Name = "L", Insert = 1, Knob = new[] { 0f, 0.1f, 0f, 0.5f } }); pj.Patterns.Add(new Pattern { Name = "P" }); return pj; };
+                Func<Project, int, float[]> run2 = (pj, frames) => { var en = new Engine { Proj = pj, Playing = true }; var o = new float[frames * 2]; var bk = new float[2048];
+                    for (int at = 0; at < frames; at += 1024) { en.Render(bk, 1024); Array.Copy(bk, 0, o, at * 2, Math.Min(2048, (frames - at) * 2)); } return o; };
+                Func<float[], int> firstSound = o => { for (int k = 0; k < o.Length / 2; k++) if (Math.Abs(o[2 * k]) > 1e-4) return k; return -1; };
+                double sps16 = 60.0 / 128 / 4 * Engine.SR; string got = ""; bool timeOk = true;
+                foreach (var at in new[] { 0.5, 2 / 3.0, 1.25, 3 + 1 / 3.0 })
+                {
+                    var pj = one(); pj.Patterns[0].For(0).Add(new Note { Step = at, Key = 69, Len = 1 });
+                    int on = firstSound(run2(pj, 30000)), want = (int)Math.Round(at * sps16);
+                    timeOk &= Math.Abs(on - want) <= 2; got += at.ToString("0.###") + "→" + on + "/" + want + " ";
+                }
+                check(timeOk, "notes off the 16th grid (1/32, triplets, 1/64) start exactly then (16ths → sample heard / expected: " + got.Trim() + ")");
+
+                Func<float[], int, int, double> freq = (o, a0, n) => { int cross = 0, first = -1, last = -1; for (int k = a0 + 1; k < a0 + n; k++) if (o[2 * (k - 1)] < 0 && o[2 * k] >= 0) { cross++; if (first < 0) first = k; last = k; } return cross < 2 ? 0 : (cross - 1) * (double)Engine.SR / (last - first); };
+                int s16 = (int)sps16;
+                var sl = one(); sl.Patterns[0].For(0).Add(new Note { Step = 0, Key = 60, Len = 16 }); sl.Patterns[0].For(0).Add(new Note { Step = 4, Key = 67, Len = 4, Slide = true });
+                var so2 = run2(sl, s16 * 12);
+                double before = freq(so2, s16 * 1, s16 * 2), after = freq(so2, s16 * 9, s16 * 2);
+                check(Math.Abs(before / 261.6 - 1) < 0.03 && Math.Abs(after / 392 - 1) < 0.03,
+                    "slide note: a held C (" + before.ToString("0") + " Hz) bends up to the slide's G (" + after.ToString("0") + " Hz) over the slide note, without starting a new note");
+                var gl = one(); gl.Channels[0].Glide = 0.2f; gl.Patterns[0].For(0).Add(new Note { Step = 0, Key = 60, Len = 8 }); gl.Patterns[0].For(0).Add(new Note { Step = 4, Key = 72, Len = 8 });
+                var go = run2(gl, s16 * 10);
+                double early = freq(go, s16 * 4 + 60, 900), late = freq(go, s16 * 4 + Engine.SR / 8, s16);
+                check(early < 360 && Math.Abs(late / 523.3 - 1) < 0.03, "glide (100 ms): the next note starts near the last one's pitch (" + early.ToString("0") + " Hz) and slides up to its own (" + late.ToString("0") + " Hz)");
+
+                var fr = Project.Demo(); var fn = new Note { Step = 2 / 3.0, Key = 61, Len = 1 / 3.0, Slide = true }; fr.Patterns[0].For(3).Add(fn); fr.Channels[3].Glide = 0.35f;
+                var fb = Project.Parse(fr.Lines().ToArray(), null); var fb2 = fb.Patterns[0].For(3).Last();
+                check(fb2.Step == fn.Step && fb2.Len == fn.Len && fb2.Slide && fb.Channels[3].Glide == 0.35f && !fb.Patterns[0].For(0)[0].Slide,
+                    "saved and opened again: a triplet note's exact position and length, the slide flag, and the channel's glide");
             }
 
             {   // limiter: nothing past the ceiling, quiet sound untouched (just 5 ms late); chorus, flanger, phaser change the sound, not its level
