@@ -160,13 +160,59 @@ class Insert   // one mixer track: effects run in slot order, then fader and pan
     public float SendLevel { get { return Sends.Count > 0 ? Sends[0].Level : 0.5f; } set { if (Sends.Count > 0) Sends[0].Level = value; } }
 }
 
-class Lane   // automation clip: one value (0..1) per 16th across the whole playlist, driving one control while the song plays
+class LanePoint { public double At; public float Value, Tension; }   // an automation point: at a 16th, a value 0..1, and the curve's bend to the next point (-1..1)
+
+// Automation: one control's curve, stored as a value (0..1) per 16th and edited as points with bendable curves. Automation clips
+// on the playlist (Clip.Lane) play stretches of it; a lane that's on no clip at all (made in code) plays from bar 1.
+class Lane
 {
     public int Ins, Slot = -1, Param;   // Slot -1 = the strip itself (Param 0 volume, 1 pan, 2 send level); else an effect slot and its parameter (or FxMix)
     public const int FxMix = 3;         // an effect lane's Param for the effect's wet/dry mix
     public int Ch = -1;                 // >= 0: a channel's sound setting instead (Param = Channel.KAttack .. KPitch) or its rack volume / pan (LaneVol, LanePan); Ins and Slot unused
     public bool Tempo;                  // true: the song tempo (0..1 = MinBpm..MaxBpm); every other field unused
-    public readonly float[] Values = new float[Project.Bars * Project.Steps];
+    public float[] Values = new float[Project.Bars * Project.Steps];
+    public List<LanePoint> Points;   // null until edited as points; Render() turns them into Values
+
+    public float At(double pos)   // the value at a position in 16ths, between the stored 16ths; past the end it holds the last
+    {
+        if (pos <= 0) return Values[0];
+        int k = (int)pos; if (k >= Values.Length - 1) return Values[Values.Length - 1];
+        return Values[k] + (Values[k + 1] - Values[k]) * (float)(pos - k);
+    }
+
+    public static float Bend(float t, float tension)   // 0..1 along a segment, curved: tension > 0 starts slow, < 0 starts fast
+    {
+        return tension == 0 ? t : tension > 0 ? (float)Math.Pow(t, 1 + 4 * tension) : 1 - (float)Math.Pow(1 - t, 1 - 4 * tension);
+    }
+
+    public void Render()   // Points -> Values (at least the old 32 bars; longer if a point is further)
+    {
+        if (Points == null || Points.Count == 0) return;
+        var pts = Points.OrderBy(q => q.At).ToList();
+        int len = Math.Max(Values.Length, (int)Math.Ceiling(pts[pts.Count - 1].At) + 1);
+        var v = new float[len];
+        for (int k = 0, j = 0; k < len; k++)
+        {
+            while (j < pts.Count - 1 && pts[j + 1].At <= k) j++;
+            if (k <= pts[0].At) v[k] = pts[0].Value;
+            else if (j >= pts.Count - 1) v[k] = pts[pts.Count - 1].Value;
+            else { var a = pts[j]; var b = pts[j + 1]; float t = (float)((k - a.At) / Math.Max(1e-9, b.At - a.At)); v[k] = a.Value + (b.Value - a.Value) * Bend(t, a.Tension); }
+        }
+        Values = v;   // one reference swap: the audio thread sees the old curve or the new one
+    }
+
+    public void MakePoints()   // Values -> Points, keeping only the corners (a drawn ramp becomes two points)
+    {
+        if (Points != null) return;
+        Points = new List<LanePoint>();
+        for (int k = 0; k < Values.Length; k++)
+        {
+            bool corner = k == 0 || k == Values.Length - 1 || Math.Abs(Values[k] - (Values[k - 1] + Values[k + 1]) / 2) > 1e-4;
+            if (corner) Points.Add(new LanePoint { At = k, Value = Values[k] });
+        }
+    }
+
+    public bool SameTarget(Lane o) { return Tempo == o.Tempo && (Tempo || Ch == o.Ch && Param == o.Param && (Ch >= 0 || Ins == o.Ins && Slot == o.Slot)); }
 
     public float Get(Project p)
     {
@@ -654,13 +700,15 @@ class Effect
 class Clip
 {
     public int Track, Pattern;
+    public int Lane = -1;          // >= 0: an automation clip playing that lane (Project.Automation) instead of a pattern
     public double Start, Offset;   // in 16ths
     public double Len = -1;        // in 16ths; -1 = as long as its pattern (and it follows the pattern's length until resized)
-    public double Length(Project p) { return Len > 0 ? Len : Pattern < p.Patterns.Count ? p.Patterns[Pattern].Length : Project.Steps; }
+    public double Length(Project p) { return Len > 0 ? Len : Lane < 0 && Pattern >= 0 && Pattern < p.Patterns.Count ? p.Patterns[Pattern].Length : Project.Steps; }
     public Clip Copy() { return (Clip)MemberwiseClone(); }
 }
 
-class Track { public string Name; public int Color; public bool Mute; }   // a playlist track's name, colour and mute; null name = "Track N"
+class Track { public string Name; public int Color; public bool Mute; }
+class Link { public int Cc; public Lane Target; }   // a MIDI controller knob (CC number) moving a control, like FL's "Link to controller"   // a playlist track's name, colour and mute; null name = "Track N"
 class Marker { public double At; public string Name; public int Beats; }   // at a 16th in the song; Beats > 0: the time signature becomes Beats/4 from here
 
 // The playlist seen as a [track, bar] grid of clips that start on a bar and follow their pattern's length: how the playlist
@@ -700,6 +748,36 @@ class Project
         for (int i = 0; i < Inserts; i++) Mixer[i] = new Insert { Vol = i == 0 ? 0.8f : 1f };
     }
 
+    public List<Link> Links = new List<Link>();   // MIDI controller knobs linked to controls
+
+    // A lane's value at song position pos (16ths): from the automation clip playing there, or (a lane on no clip) its own curve
+    // from bar 1; null when it has clips but none plays here (the control keeps its value).
+    public float? LaneValue(int k, double pos)
+    {
+        var l = Automation[k]; bool any = false;
+        foreach (var c in Clips)
+        {
+            if (c.Lane != k) continue;
+            any = true;
+            if (TrackMuted(c.Track) || pos < c.Start - 1e-9 || pos >= c.Start + c.Length(this) - 1e-9) continue;
+            return l.At(pos - c.Start + c.Offset);
+        }
+        return any ? (float?)null : l.At(pos);
+    }
+
+    public void RemoveLane(int k)   // with its clips; later lanes' clips renumbered
+    {
+        Automation.RemoveAt(k);
+        Clips.RemoveAll(c => c.Lane == k);
+        foreach (var c in Clips) if (c.Lane > k) c.Lane--;
+    }
+
+    public int FreeTrack()   // the first playlist track with nothing on it
+    {
+        for (int t = 0; t < Tracks; t++) if (!Clips.Any(c => c.Track == t)) return t;
+        return Tracks - 1;
+    }
+
     public Track TrackAt(int t) { return TrackInfo[t] ?? (TrackInfo[t] = new Track()); }
     public bool TrackMuted(int t) { return t >= 0 && t < Tracks && TrackInfo[t] != null && TrackInfo[t].Mute; }
     public string TrackName(int t) { return TrackInfo[t] != null && TrackInfo[t].Name != null ? TrackInfo[t].Name : "Track " + (t + 1); }
@@ -711,7 +789,7 @@ class Project
         foreach (var c in Clips)
         {
             double rel = abs - c.Start;
-            if (rel < -1e-9 || rel >= c.Length(this) - 1e-9 || c.Pattern >= Patterns.Count || TrackMuted(c.Track)) continue;
+            if (c.Lane >= 0 || rel < -1e-9 || rel >= c.Length(this) - 1e-9 || c.Pattern < 0 || c.Pattern >= Patterns.Count || TrackMuted(c.Track)) continue;
             var pat = Patterns[c.Pattern];
             hits.Add(new KeyValuePair<Pattern, int>(pat, (int)Math.Floor((rel + c.Offset) % pat.Length + 1e-6) % pat.Length));
         }
@@ -821,8 +899,10 @@ class Project
     {
         Channels.RemoveAt(i);
         foreach (var pat in Patterns) if (i < pat.Notes.Count) pat.Notes.RemoveAt(i);
-        Automation.RemoveAll(l => l.Ch == i);
+        for (int k = Automation.Count - 1; k >= 0; k--) if (Automation[k].Ch == i) RemoveLane(k);   // its lanes go, with their clips
         foreach (var l in Automation) if (l.Ch > i) l.Ch--;
+        Links.RemoveAll(lk => lk.Target.Ch == i);
+        foreach (var lk in Links) if (lk.Target.Ch > i) lk.Target.Ch--;
     }
 
     // Move an insert's effect from one slot to another; the ones in between shift by one. Automation lanes on that insert's
@@ -841,8 +921,8 @@ class Project
     public void RemovePattern(int k)   // the playlist stores pattern indices: clear this one's cells, shift later ones down
     {
         Patterns.RemoveAt(k);
-        Clips.RemoveAll(c => c.Pattern == k);
-        foreach (var c in Clips) if (c.Pattern > k) c.Pattern--;
+        Clips.RemoveAll(c => c.Lane < 0 && c.Pattern == k);
+        foreach (var c in Clips) if (c.Lane < 0 && c.Pattern > k) c.Pattern--;
     }
 
     public int SongBars()   // whole bars to the end of the last clip
@@ -888,7 +968,9 @@ class Project
             for (int ch = 0; ch < pat.Notes.Count; ch++)
                 foreach (var n in pat.Notes[ch]) w.Add(string.Join("\t", "n", ch, n.Step.ToString("R"), n.Key, n.Len.ToString("R"), n.Vel, n.Pan.ToString("R"), n.Fine, n.Slide ? "1" : "0"));
         }
-        foreach (var c in Clips) w.Add(string.Join("\t", "clip", c.Track, c.Start.ToString("R"), c.Pattern, c.Len.ToString("R"), c.Offset.ToString("R")));
+        foreach (var c in Clips) w.Add(string.Join("\t", "clip", c.Track, c.Start.ToString("R"), c.Pattern, c.Len.ToString("R"), c.Offset.ToString("R"), c.Lane));
+
+        foreach (var lk in Links) w.Add(string.Join("\t", "link", lk.Cc, lk.Target.Tempo ? "1" : "0", lk.Target.Ch, lk.Target.Ins, lk.Target.Slot, lk.Target.Param));
         for (int t = 0; t < Tracks; t++)
         {
             var tr = TrackInfo[t];
@@ -900,6 +982,8 @@ class Project
             w.Add(l.Tempo ? "autotempo\t" + string.Join("\t", l.Values.Select(v => v.ToString("R")))
                 : l.Ch >= 0 ? string.Join("\t", "autoch", l.Ch, l.Param, string.Join("\t", l.Values.Select(v => v.ToString("R"))))
                             : string.Join("\t", "auto", l.Ins, l.Slot, l.Param, string.Join("\t", l.Values.Select(v => v.ToString("R")))));
+        for (int k = 0; k < Automation.Count; k++)   // automation points, after the lanes they belong to (the lane lines hold the curve they make)
+            if (Automation[k].Points != null) w.Add("pts\t" + k + "\t" + string.Join(";", Automation[k].Points.Select(q => q.At.ToString("R") + ":" + q.Value.ToString("R") + ":" + q.Tension.ToString("R"))));
         return w;
     }
 
@@ -1019,8 +1103,24 @@ class Project
             {
                 if (f.Length < 6) throw new InvalidDataException("Bad playlist clip on line " + (li + 1));
                 double len = double.Parse(f[4], CultureInfo.InvariantCulture);
-                p.Clips.Add(new Clip { Track = Int(f[1], 0, Tracks - 1), Start = Dbl(f[2], 0, MaxBars * Steps), Pattern = Int(f[3], 0, int.MaxValue),
-                                       Len = len < 0 ? -1 : Dbl(f[4], 1e-6, MaxBars * Steps), Offset = Dbl(f[5], 0, MaxBars * Steps) });
+                p.Clips.Add(new Clip { Track = Int(f[1], 0, Tracks - 1), Start = Dbl(f[2], 0, MaxBars * Steps), Pattern = Int(f[3], -1, int.MaxValue),
+                                       Len = len < 0 ? -1 : Dbl(f[4], 1e-6, MaxBars * Steps), Offset = Dbl(f[5], 0, MaxBars * Steps), Lane = f.Length > 6 ? Int(f[6], -1, int.MaxValue) : -1 });
+            }
+            else if (f[0] == "pts")
+            {
+                if (f.Length < 3) throw new InvalidDataException("Bad automation points on line " + (li + 1));
+                var l = p.Automation[Int(f[1], 0, p.Automation.Count - 1)]; l.Points = new List<LanePoint>();
+                foreach (var q in f[2].Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var v = q.Split(':'); if (v.Length != 3) throw new InvalidDataException("Bad automation point on line " + (li + 1));
+                    l.Points.Add(new LanePoint { At = Dbl(v[0], 0, MaxBars * Steps), Value = Num(v[1], 0, 1), Tension = Num(v[2], -1, 1) });
+                }
+                l.Render();
+            }
+            else if (f[0] == "link")
+            {
+                if (f.Length < 7) throw new InvalidDataException("Bad MIDI link on line " + (li + 1));
+                p.Links.Add(new Link { Cc = Int(f[1], 0, 127), Target = new Lane { Tempo = f[2] == "1", Ch = Int(f[3], -1, int.MaxValue), Ins = Int(f[4], 0, Inserts - 1), Slot = Int(f[5], -1, Insert.SlotCount - 1), Param = Int(f[6], 0, 16) } });
             }
             else if (f[0] == "track")
             {
@@ -1059,7 +1159,8 @@ class Project
             }
         }
         if (p.Patterns.Count == 0) p.Patterns.Add(new Pattern { Name = "Pattern 1" });
-        if (p.Clips.Any(c => c.Pattern >= p.Patterns.Count)) throw new InvalidDataException("Playlist refers to a missing pattern.");
+        if (p.Clips.Any(c => c.Lane < 0 && (c.Pattern < 0 || c.Pattern >= p.Patterns.Count))) throw new InvalidDataException("Playlist refers to a missing pattern.");
+        if (p.Clips.Any(c => c.Lane >= p.Automation.Count || c.Lane >= 0 && c.Len <= 0)) throw new InvalidDataException("Playlist refers to a missing automation lane.");
         return p;
     }
 }
@@ -1463,7 +1564,7 @@ static class Midi
             if (song)
             {
                 int len = p.SongBars() * Project.Steps;
-                var lane = p.Automation.FirstOrDefault(l => l.Tempo);
+                int laneK = p.Automation.FindIndex(l => l.Tempo);
                 for (int abs = 0, last = -1; abs < len; abs++)
                 {
                     foreach (var hit in p.SoundingAt(abs))   // the same clips Engine.Trigger plays at this step
@@ -1472,7 +1573,8 @@ static class Midi
                         for (int ch = 0; ch < Math.Min(pat.Notes.Count, p.Channels.Count); ch++)
                             if (!p.Channels[ch].Mute) foreach (var n in pat.Notes[ch]) if (!n.Slide && n.Step >= s && n.Step < s + 1) starts.Add(Tuple.Create(abs + n.Step - s, ch, n));
                     }
-                    int bpm = lane == null ? p.Bpm : (int)Math.Round(Project.MinBpm + lane.Values[Math.Min(abs, lane.Values.Length - 1)] * (Project.MaxBpm - Project.MinBpm));
+                    float? tv = laneK < 0 ? null : p.LaneValue(laneK, abs);
+                    int bpm = tv.HasValue ? (int)Math.Round(Project.MinBpm + tv.Value * (Project.MaxBpm - Project.MinBpm)) : last > 0 ? last : p.Bpm;
                     if (bpm != last) { tempo.Add(Tuple.Create(abs * PerStep, 2, Tempo(bpm))); last = bpm; }   // a tempo lane: one change per 16th it moves
                 }
             }
@@ -1693,6 +1795,8 @@ class Engine
     public readonly ConcurrentQueue<int> MidiIn = new ConcurrentQueue<int>();   // raw MIDI messages from the keyboard
     public readonly ConcurrentQueue<KeyValuePair<int, double>> MidiRec = new ConcurrentQueue<KeyValuePair<int, double>>();   // (message, pattern step as heard) for recording
     public volatile Channel MidiTarget;                                          // the channel the keyboard plays, like FL's selected channel
+    public volatile Lane LearnTarget;                                            // waiting for a controller to link to this control
+    public readonly ConcurrentQueue<int> Learned = new ConcurrentQueue<int>();   // the controller number that answered, for the UI
     readonly Voice[] held = new Voice[128];                                      // sounding keyboard notes, by key
     bool pedal; readonly bool[] sustained = new bool[128];                       // sustain pedal down; keys let go while it was down
     const double BendRange = 2;                                                  // semitones at full wheel, the usual default
@@ -1836,9 +1940,8 @@ class Engine
     {
         lock (proj)
         {
-            int last = Project.Bars * Project.Steps - 1, idx = Math.Min(last, Math.Max(0, lastAbs)), next = Math.Min(idx + 1, last);   // lanes span the first Bars bars; past them they hold their last value
-            float frac = step == 0 ? 0 : (float)Math.Max(0, Math.Min(1, (sps - toNext) / sps));   // how far we are into the current 16th
-            foreach (var l in proj.Automation) l.Set(proj, l.Values[idx] + (l.Values[next] - l.Values[idx]) * frac);
+            double frac = step == 0 ? 0 : Math.Max(0, Math.Min(1, (sps - toNext) / sps)), pos = Math.Max(0, lastAbs) + frac;   // how far we are into the current 16th
+            for (int k = 0; k < proj.Automation.Count; k++) { var v = proj.LaneValue(k, pos); if (v.HasValue) proj.Automation[k].Set(proj, v.Value); }
         }
     }
 
@@ -1851,6 +1954,12 @@ class Engine
         {
             bendMul = Math.Pow(2, ((key | vel << 7) - 8192) / 8192.0 * BendRange / 12);
             return;
+        }
+        if (status == 0xB0)   // a controller: MIDI learn takes it; linked controls follow it
+        {
+            var learn = LearnTarget;
+            if (learn != null) { LearnTarget = null; Learned.Enqueue(key); return; }
+            lock (proj) foreach (var lk in proj.Links) if (lk.Cc == key) lk.Target.Set(proj, vel / 127f);
         }
         if (status == 0xB0 && key == 1) { modDepth = vel / 127.0; return; }   // controller 1 = mod wheel: vibrato depth
         if (status == 0xB0 && key == 64)   // controller 64 = sustain pedal: 64..127 down, 0..63 up
@@ -2474,7 +2583,6 @@ class MainForm : Form
     readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 33 };
     int selCh = 3; string dragMode; int dragCh; string filePath; bool dirty; int lastStep = -2;
     Effect dragFx; int dragParam; float dragX0, dragW;
-    int selLane = -1, autoK = -1; float autoV;   // automation lane shown in the playlist (-1 = editing patterns), last painted step
     List<Note> sel = new List<Note>(), clip = new List<Note>();   // piano roll selection, and the copy buffer
     Point? boxFrom, boxTo;                                        // right-drag selection box in the piano roll
     List<Note> moving; Dictionary<Note, Note> moveFrom; Note moveHit; bool moved, resizing;   // notes being dragged: each one as it was before, and the grabbed one
@@ -2574,8 +2682,7 @@ class MainForm : Form
         bpm.Controls[0].Visible = false;   // Windows draws the spin arrows light; the wheel and ↑/↓ still change the tempo
         new ToolTip().SetToolTip(bpm, "Tempo: type it, scroll the wheel or press ↑/↓ · right-click: automate it");
         bpm.ValueChanged += (s, e) => { if (!syncingBpm) Edit(() => { lock (P) P.Bpm = (int)bpm.Value; dirty = true; }); };
-        bpm.ContextMenuStrip = new ContextMenuStrip();   // right-click the BPM box: a tempo lane, like FL's tempo automation clip
-        bpm.ContextMenuStrip.Items.Add("Automate tempo", null, (s, e) => Edit(() => Automate(new Lane { Tempo = true })));
+        bpm.MouseUp += (s, e) => { if (e.Button == MouseButtons.Right) { var l = new Lane { Tempo = true }; ControlMenu(l, bpm, e.Location); } };   // a tempo lane, like FL's tempo automation clip
         patBox.Margin = midiBox.Margin = new Padding(3, 5, 3, 3);
         bar.Controls.Add(Gap(patBox));   // the list shows "Pattern 1"…, so it needs no label
         patBox.SelectedIndexChanged += (s, e) => { eng.CurPattern = Math.Max(0, patBox.SelectedIndex); Changed(false); };
@@ -2662,6 +2769,7 @@ class MainForm : Form
             }
             KeyValuePair<int, double> ev;
             while (eng.MidiRec.TryDequeue(out ev)) RecordMidi(ev.Key, ev.Value);
+            if (!eng.Learned.IsEmpty) LearnArrived();
         };
         timer.Start();
         autoTimer.Tick += (s, e) => Autosave(); autoTimer.Start();
@@ -2842,6 +2950,7 @@ class MainForm : Form
         if (keyData == Keys.Space && !(ActiveControl is NumericUpDown)) { TogglePlay(); return true; }   // space = play/stop, like FL
         if (keyData == Keys.F9) { ToggleMixer(); return true; }
         if (keyData == Keys.F1) { ShowAbout(); return true; }
+        if (keyData == Keys.Escape && learning != null) { eng.LearnTarget = null; learning = null; learnFor = null; Text = "MiniDAW" + (filePath != null ? " — " + Path.GetFileName(filePath) : ""); return true; }
         if (keyData == (Keys.Control | Keys.M)) { ToggleMetronome(); return true; }
         if (keyData == (Keys.Control | Keys.Z)) { UndoRedo(false); return true; }
         if (keyData == (Keys.Control | Keys.Y) || keyData == (Keys.Control | Keys.Shift | Keys.Z)) { UndoRedo(true); return true; }
@@ -2969,7 +3078,7 @@ class MainForm : Form
                 }
                 var shown = c.KnobsShown(); int r = (e.Y - BarsTop) / RowH;
                 if (r >= shown.Length) return;
-                if (e.Button == MouseButtons.Right) { int k = shown[r]; m.Edit(() => m.AutomateKnob(m.P.Channels.IndexOf(c), k)); return; }   // a lane for it, over the playlist
+                if (e.Button == MouseButtons.Right) { var l = new Lane { Ch = m.P.Channels.IndexOf(c), Param = shown[r] }; m.ControlMenu(l, view, e.Location); return; }   // automation clip or MIDI link
                 if (e.Button != MouseButtons.Left) return;
                 m.BeginEdit(); drag = shown[r]; Set(e);   // one drag = one undo step
             };
@@ -3039,7 +3148,6 @@ class MainForm : Form
         patBox.SelectedIndex = Math.Min(pattern, P.Patterns.Count - 1);
         bpm.Value = Math.Max(bpm.Minimum, Math.Min(bpm.Maximum, P.Bpm));
         selCh = Math.Max(0, Math.Min(selCh, P.Channels.Count - 1));
-        if (selLane >= P.Automation.Count) selLane = -1;   // New/Open may bring fewer lanes
         if (groupFilter != null && !P.Channels.Any(c => c.Group == groupFilter)) groupFilter = null;   // that group is gone (deleted, undone, another project)
         RackHeight();
         Changed(false);
@@ -3921,20 +4029,48 @@ class MainForm : Form
     static float Clamp01(float v) { return Math.Max(0, Math.Min(1, v)); }
 
     // Like FL's right-click > "Create automation clip": one lane per control, starting flat at its current value, shown in the playlist.
-    void AutomateControl(int ins, int slot, int param) { Automate(new Lane { Ins = ins, Slot = slot, Param = param }); }   // a mixer control
-    void AutomateKnob(int ch, int param) { Automate(new Lane { Ch = ch, Param = param }); }                               // a channel's sound setting
+    void AutomateControl(int ins, int slot, int param) { var l = new Lane { Ins = ins, Slot = slot, Param = param }; ControlMenu(l, mixer, mixer.PointToClient(Cursor.Position)); }   // a mixer control
+    void AutomateKnob(int ch, int param) { var l = new Lane { Ch = ch, Param = param }; ControlMenu(l, rack, rack.PointToClient(Cursor.Position)); }                               // a channel's sound setting
 
-    void Automate(Lane want)
+    void Automate(Lane want)   // a lane for the control (flat at its current value) and an automation clip for it on a free track, then its editor
     {
-        int k = P.Automation.FindIndex(l => l.Tempo == want.Tempo && (want.Tempo || l.Ch == want.Ch && l.Param == want.Param && (want.Ch >= 0 || l.Ins == want.Ins && l.Slot == want.Slot)));
+        int k = P.Automation.FindIndex(l => l.SameTarget(want));
         if (k < 0)
         {
             float v = want.Get(P);
             for (int s = 0; s < want.Values.Length; s++) want.Values[s] = v;
-            lock (P) P.Automation.Add(want);
-            k = P.Automation.Count - 1; dirty = true;
+            lock (P)
+            {
+                P.Automation.Add(want); k = P.Automation.Count - 1;
+                P.Clips.Add(new Clip { Lane = k, Pattern = -1, Track = P.FreeTrack(), Start = 0, Len = Math.Max(4, P.SongBars()) * Project.Steps });
+            }
+            dirty = true;
         }
-        selLane = k; Changed(false);
+        Changed(false); ShowAutomation(k);
+    }
+
+    // Right-click on any control that can move with the song: make an automation clip, or link it to a knob on a MIDI controller.
+    internal void ControlMenu(Lane target, Control at, Point where)
+    {
+        var m = new ContextMenuStrip(); string name = target.Name(P);
+        m.Items.Add("Create automation clip for " + name, null, (s, e) => Edit(() => Automate(target)));
+        var linked = P.Links.FirstOrDefault(lk => lk.Target.SameTarget(target));
+        if (linked == null) m.Items.Add("Link to MIDI controller… (then move a knob)", null, (s, e) => { learnFor = target; learning = name; eng.LearnTarget = target; Text = "MiniDAW — move a knob or slider on your MIDI controller to link it to " + name + "  (Esc cancels)"; });
+        else m.Items.Add("Unlink from MIDI controller " + linked.Cc, null, (s, e) => Edit(() => { lock (P) P.Links.Remove(linked); dirty = true; }));
+        m.Show(at, where);
+    }
+    string learning; Lane learnFor;   // the control waiting for a MIDI knob (its name shows in the title)
+
+    internal void LearnArrived()   // called by the timer: the engine heard a controller while learning
+    {
+        int cc;
+        while (eng.Learned.TryDequeue(out cc))
+        {
+            var t = learnFor; if (t == null) continue;
+            int c = cc;   // one knob drives one control: an older link to either is replaced
+            Edit(() => { lock (P) { P.Links.RemoveAll(lk => lk.Target.SameTarget(t) || lk.Cc == c); P.Links.Add(new Link { Cc = c, Target = t }); } dirty = true; });
+            Text = "MiniDAW — linked MIDI controller " + c + " to " + learning; learning = null; learnFor = null;
+        }
     }
 
     static int Next(IEnumerable<int> options, int cur, int dir)   // step through options, wrapping around
@@ -4212,6 +4348,145 @@ class MainForm : Form
         g.DrawString("click to edit", Small, DimB, r.Right - 64, r.Bottom - 14);
     }
 
+    AutoWindow autoWin;
+    internal void ShowAutomation(int k)   // one automation editor at a time; it follows whichever lane opened it last
+    {
+        if (k < 0 || k >= P.Automation.Count) return;
+        if (autoWin == null || autoWin.IsDisposed) autoWin = new AutoWindow(this);
+        autoWin.Target(P.Automation[k]);
+        if (!autoWin.Visible) autoWin.Show(this); else autoWin.Activate();
+    }
+
+    // The automation editor, like FL's automation clips: points joined by curves across the lane (as far as its clips reach).
+    // Click to add a point, drag to move it, right-click to delete it; drag the small circle between two points to bend that
+    // curve. The LFO menu fills the lane with a wave in time with the song. Each change is one undo step.
+    internal class AutoWindow : Form
+    {
+        readonly MainForm m; readonly Canvas view = new Canvas(); Lane key;   // key: which control (looked up each time, so undo can't strand us)
+        int drag = -1; bool bending; float bendY, bend0;
+        const int X0 = 46, Y0 = 34;
+        static readonly string[] Shapes = { "Sine", "Triangle", "Square", "Saw up", "Saw down" };
+        static readonly string[] RateNames = { "2 bars", "1 bar", "1/2 bar", "1 beat", "1/8" }; static readonly double[] Rates = { 32, 16, 8, 4, 2 };
+        public AutoWindow(MainForm main)
+        {
+            m = main; FormBorderStyle = FormBorderStyle.SizableToolWindow; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(760, 300); MinimumSize = new Size(420, 220); Font = main.Font;
+            view.Dock = DockStyle.Fill; Controls.Add(view); view.Paint += PaintView;
+            view.MouseDown += (s, e) => Down(e);
+            view.MouseMove += (s, e) => { if (e.Button == MouseButtons.Left && (drag >= 0 || bending)) DragTo(e); };
+            view.MouseUp += (s, e) => { if (drag >= 0 || bending) { drag = -1; bending = false; m.EndEdit(); } };
+            HandleCreated += (s, e) => DarkTitle(Handle);
+            KeyPreview = true; KeyDown += (s, e) => m.PianoKey(e, true); KeyUp += (s, e) => m.PianoKey(e, false);
+        }
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData) { return m.ProcessCmdKey(ref msg, keyData); }
+        public void Target(Lane l) { key = l; view.Invalidate(); }
+        int Index() { return key == null ? -1 : m.P.Automation.FindIndex(l => l.SameTarget(key)); }
+        Lane L() { int k = Index(); return k < 0 ? null : m.P.Automation[k]; }
+        double Span() { int k = Index(); double sp = 64; foreach (var c in m.P.Clips) if (c.Lane == k) sp = Math.Max(sp, c.Offset + c.Length(m.P)); var l = L(); if (l != null && l.Points != null && l.Points.Count > 0) sp = Math.Max(sp, l.Points.Max(q => q.At) + 4); return sp; }
+        float W { get { return view.Width - X0 - 14; } }
+        float H { get { return view.Height - Y0 - 26; } }
+        float PX(double pos) { return X0 + (float)(pos / Span()) * W; }
+        float PY(float v) { return Y0 + (1 - v) * H; }
+        double Pos(float x) { return Math.Max(0, Math.Round((x - X0) / W * Span() * 4) / 4); }   // snapped to 1/64 notes
+        float Val(float y) { return Clamp01(1 - (y - Y0) / H); }
+        List<LanePoint> Pts(Lane l) { l.MakePoints(); l.Points.Sort((a, b) => a.At.CompareTo(b.At)); return l.Points; }
+        PointF Mid(List<LanePoint> pts, int j)   // the bend handle of segment j: where the curve is halfway across
+        {
+            var a = pts[j]; var b = pts[j + 1]; return new PointF(PX((a.At + b.At) / 2), PY(a.Value + (b.Value - a.Value) * Lane.Bend(0.5f, a.Tension)));
+        }
+        void Changed(Lane l) { l.Render(); m.dirty = true; m.playlist.Invalidate(); view.Invalidate(); }
+
+        void Down(MouseEventArgs e)
+        {
+            var l = L(); if (l == null) return;
+            if (e.Y < Y0 - 6) { Header(e); return; }
+            var pts = Pts(l);
+            int hit = pts.FindIndex(q => Math.Abs(PX(q.At) - e.X) < 8 && Math.Abs(PY(q.Value) - e.Y) < 8);
+            if (e.Button == MouseButtons.Right) { if (hit >= 0 && pts.Count > 1) { m.Edit(() => pts.RemoveAt(hit)); Changed(l); } return; }
+            if (e.Button != MouseButtons.Left) return;
+            m.BeginEdit();
+            if (hit >= 0) { drag = hit; return; }
+            for (int j = 0; j < pts.Count - 1; j++)
+            {
+                var mp = Mid(pts, j);
+                if (Math.Abs(mp.X - e.X) < 8 && Math.Abs(mp.Y - e.Y) < 8) { drag = j; bending = true; bendY = e.Y; bend0 = pts[j].Tension; return; }
+            }
+            var np = new LanePoint { At = Pos(e.X), Value = Val(e.Y) };
+            pts.Add(np); pts.Sort((a, b) => a.At.CompareTo(b.At)); drag = pts.IndexOf(np);
+            Changed(l);
+        }
+
+        void DragTo(MouseEventArgs e)
+        {
+            var l = L(); if (l == null) return; var pts = Pts(l);
+            if (drag < 0 || drag >= pts.Count) return;
+            if (bending) pts[drag].Tension = Math.Max(-1, Math.Min(1, bend0 + (bendY - e.Y) / 80f * (pts[drag + 1].Value >= pts[drag].Value ? -1 : 1)));
+            else
+            {
+                double lo = drag > 0 ? pts[drag - 1].At + 0.25 : 0, hi = drag < pts.Count - 1 ? pts[drag + 1].At - 0.25 : double.MaxValue;   // points keep their order
+                pts[drag].At = Math.Max(lo, Math.Min(hi, Pos(e.X))); pts[drag].Value = Val(e.Y);
+            }
+            Changed(l);
+        }
+
+        void Header(MouseEventArgs e)   // LFO ▾ and Flatten
+        {
+            var l = L(); if (l == null) return;
+            if (e.X < X0 + 90)
+            {
+                var menu = new ContextMenuStrip();
+                for (int sh = 0; sh < Shapes.Length; sh++)
+                {
+                    var item = new ToolStripMenuItem(Shapes[sh]);
+                    for (int r = 0; r < Rates.Length; r++) { int shape = sh; double rate = Rates[r]; item.DropDownItems.Add("every " + RateNames[r], null, (s, a) => { m.Edit(() => { l.Points = Lfo(shape, rate, Span()); }); Changed(l); }); }
+                    menu.Items.Add(item);
+                }
+                menu.Show(view, X0, Y0 - 4);
+            }
+            else if (e.X < X0 + 170) { float v = l.At(0); m.Edit(() => { l.Points = new List<LanePoint> { new LanePoint { At = 0, Value = v }, new LanePoint { At = Span(), Value = v } }; }); Changed(l); }
+        }
+
+        internal static List<LanePoint> Lfo(int shape, double period, double span)   // a wave between 0 and 1, one cycle per period (16ths)
+        {
+            var pts = new List<LanePoint>(); double half = period / 2;
+            if (shape == 0) for (double t = 0; t <= span + 1e-9; t += period / 16) pts.Add(Pt(t, 0.5 + 0.5 * Math.Sin(2 * Math.PI * t / period)));
+            else if (shape == 1) for (int k = 0; k * half <= span + 1e-9; k++) pts.Add(Pt(k * half, k % 2));   // triangle: straight lines between 0 and 1
+            else if (shape == 2) for (int k = 0; k * half <= span + 1e-9; k++) { int v = k % 2 == 0 ? 1 : 0; if (k > 0) pts.Add(Pt(k * half - 0.01, 1 - v)); pts.Add(Pt(k * half, v)); }   // square: on, off
+            else for (int k = 0; k * period <= span + 1e-9; k++) { int start = shape == 3 ? 0 : 1; if (k > 0) pts.Add(Pt(k * period - 0.01, 1 - start)); pts.Add(Pt(k * period, start)); }   // saw: a ramp, then a jump back
+            return pts;
+        }
+        static LanePoint Pt(double at, double v) { return new LanePoint { At = at, Value = (float)v }; }
+        void PaintView(object sender, PaintEventArgs e)
+        {
+            var g = e.Graphics; var l = L();
+            Text = l == null ? "Automation" : "Automation — " + l.Name(m.P);
+            if (l == null) { g.DrawString("This automation lane was deleted.", Font, DimB, 16, 16); return; }
+            RouteBox(g, X0, 8, 84, "LFO  ▾", false); RouteBox(g, X0 + 92, 8, 72, "Flatten", false);
+            g.DrawString("click: add a point · drag: move it · drag a small circle: bend the curve · right-click a point: delete", Small, DimB, X0 + 176, 8);
+            Round(g, Well, X0, Y0, W, H, 4);
+            double span = Span(); int k = Index();
+            foreach (var c in m.P.Clips.Where(c => c.Lane == k))   // the stretches its clips play, lightly marked
+                using (var b = new SolidBrush(Color.FromArgb(18, Blue))) g.FillRectangle(b, PX(c.Offset), Y0, (float)(c.Length(m.P) / span * W), H);
+            using (var pen = new Pen(Color.FromArgb(40, 46, 56)))
+                for (int bar = 0; bar * 16 <= span; bar++) { g.DrawLine(pen, PX(bar * 16), Y0, PX(bar * 16), Y0 + H); if (span / 16 < 40 || bar % 4 == 0) g.DrawString((bar + 1).ToString(), Small, DimB, PX(bar * 16) + 2, Y0 + H + 4); }
+            var curve = new List<PointF>();
+            for (float x = 0; x <= W; x += 2) curve.Add(new PointF(X0 + x, PY(l.At(x / W * span))));
+            var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+            var poly = new List<PointF>(curve) { new PointF(X0 + W, Y0 + H), new PointF(X0, Y0 + H) };
+            using (var b = new SolidBrush(Color.FromArgb(40, On))) g.FillPolygon(b, poly.ToArray());
+            using (var pen = new Pen(On, 2)) g.DrawLines(pen, curve.ToArray());
+            var pts = l.Points;
+            if (pts != null)
+            {
+                var sorted = pts.OrderBy(q => q.At).ToList();
+                float gap = sorted.Count > 1 ? (PX(sorted[sorted.Count - 1].At) - PX(sorted[0].At)) / (sorted.Count - 1) : W, r = gap < 14 ? 2.5f : 5;   // dense (an LFO): small dots, no bend circles
+                if (gap >= 24) for (int j = 0; j < sorted.Count - 1; j++) { var mp = Mid(sorted, j); using (var pen = new Pen(Color.FromArgb(200, 206, 211, 220), 1.5f)) g.DrawEllipse(pen, mp.X - 3.5f, mp.Y - 3.5f, 7, 7); }
+                foreach (var q in sorted) using (var b = new SolidBrush(Color.FromArgb(230, 235, 242))) g.FillEllipse(b, PX(q.At) - r, PY(q.Value) - r, 2 * r, 2 * r);
+            }
+            g.SmoothingMode = am;
+            g.DrawString("max", Small, DimB, 8, Y0 - 2); g.DrawString("min", Small, DimB, 8, Y0 + H - 12);
+        }
+    }
     EqWindow eqWin;
     void ShowEq(int ins, int slot)   // one EQ editor at a time; it follows whichever slot opened it last
     {
@@ -4327,14 +4602,11 @@ class MainForm : Form
     {
         var g = e.Graphics; int W = playlist.Width, H = playlist.Height;
         Header(g, playlist, "PLAYLIST");
-        int nl = P.Automation.Count; bool auto = selLane >= 0 && selLane < nl;
+        int nl = P.Automation.Count;
         RouteBox(g, PlSnapX, 4, PlSnapW, "snap: " + PlSnapNames[Array.IndexOf(PlSnaps, plSnap)], plSnap != 16);
-        g.DrawString(auto ? "drag: draw the automation curve (top = max) · plays in Song mode"
-            : "click: place · drag: move (Shift: copy) · edges: resize / trim · Ctrl+click: split · right: erase · ruler: drag = loop, right-click = markers · wheel: tracks · Shift / Ctrl: across",
+        g.DrawString("click: place · drag: move (Shift: copy) · edges: resize / trim · Ctrl+click: split · right: erase · click an automation clip: edit · ruler: drag = loop, right-click = markers · wheel: tracks",
             Small, DimB, new RectangleF(PlSnapX + PlSnapW + 10, 5, Math.Max(10, W - AutoBoxX - PlSnapX - PlSnapW - 20), 14), Fit);
-        RouteBox(g, W - AutoBoxX, 4, AutoBoxW, nl == 0 ? "automation: right-click a mixer control, a rack bar or BPM to add a lane"
-            : auto ? "automating " + P.Automation[selLane].Name(P) + "  (" + (selLane + 1) + "/" + nl + ")" : "automation: off · click to edit (" + nl + " lanes)", auto);
-        if (auto) RouteBox(g, W - 78, 4, 72, "delete lane", true);
+        RouteBox(g, W - AutoBoxX, 4, AutoBoxW, nl == 0 ? "automation: right-click a control (fader, knob, BPM…) to make a clip" : "automation: " + nl + (nl == 1 ? " lane" : " lanes") + "  ▾", nl > 0);
         float cw = PlCw(); double to = plFrom + plSpan;
         // ruler: bar numbers (following time signatures), the loop region, markers
         using (var b = new SolidBrush(Color.FromArgb(24, 27, 33))) g.FillRectangle(b, PlHead, 23, W - PlHead, PlY0 - 23);
@@ -4374,10 +4646,11 @@ class MainForm : Form
         g.SetClip(new RectangleF(PlHead, PlY0, W - PlHead, H - PlY0));
         foreach (var c in P.Clips)
         {
-            if (c.Track < plTop || c.Track >= plTop + shown || c.Pattern >= P.Patterns.Count) continue;
+            if (c.Track < plTop || c.Track >= plTop + shown || c.Lane < 0 && (c.Pattern < 0 || c.Pattern >= P.Patterns.Count) || c.Lane >= P.Automation.Count) continue;
             double len = c.Length(P);
             if (c.Start > to || c.Start + len < plFrom) continue;
             var rc = new RectangleF(PlX(c.Start) + 1, PlTrackY(c.Track) + 1, (float)(len * cw) - 2, plRowH - 2);
+            if (c.Lane >= 0) { PaintAutoClip(g, c, rc, cw); continue; }
             var col = PatColors[c.Pattern % PatColors.Length]; if (P.TrackMuted(c.Track)) col = Color.FromArgb(90, col);
             Round(g, col, rc.X, rc.Y, rc.Width, rc.Height, 4);
             RoundEdge(g, c == plClip ? Color.White : ControlPaint.Dark(col, 0.25f), c == plClip ? 1.5f : 1, rc, 4);
@@ -4386,21 +4659,6 @@ class MainForm : Form
             if (rc.Height >= 20 && rc.Width > 24) PreviewNotes(g, pat, c, new RectangleF(rc.X + 2, rc.Y + 13, rc.Width - 4, rc.Height - 15), cw);
         }
         g.Clip = clip0;
-        if (auto)   // the lane's curve over the visible tracks; patterns fade back while it is edited
-        {
-            var vals = P.Automation[selLane].Values; float gh = yEnd - PlY0;
-            using (var dim = new SolidBrush(Color.FromArgb(170, PanelBg))) g.FillRectangle(dim, PlHead, PlY0, W - PlHead, gh);
-            var pts = new List<PointF>();
-            for (int k = Math.Max(0, (int)plFrom - 1); k < vals.Length && k <= to + 1; k++) pts.Add(new PointF(PlX(k), PlY0 + (1 - vals[k]) * gh));   // playback interpolates between these points
-            if (pts.Count >= 2)
-            {
-                var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
-                var poly = new List<PointF>(pts) { new PointF(pts[pts.Count - 1].X, PlY0 + gh), new PointF(pts[0].X, PlY0 + gh) };
-                using (var fill = new SolidBrush(Color.FromArgb(40, On))) g.FillPolygon(fill, poly.ToArray());
-                using (var pen = new Pen(On, 2)) g.DrawLines(pen, pts.ToArray());
-                g.SmoothingMode = am;
-            }
-        }
         int ps = eng.PlayStep;
         if (eng.SongMode && ps >= 0 && ps >= plFrom && ps <= to)   // playhead: a line with a marker in the ruler
         {
@@ -4410,6 +4668,24 @@ class MainForm : Form
             using (var b = new SolidBrush(On)) g.FillPolygon(b, new[] { new PointF(x - 5, PlY0 - 8), new PointF(x + 5, PlY0 - 8), new PointF(x, PlY0 - 1) });
             g.SmoothingMode = am;
         }
+    }
+
+    void PaintAutoClip(Graphics g, Clip c, RectangleF rc, float cw)   // an automation clip: its name and the stretch of curve it plays
+    {
+        var lane = P.Automation[c.Lane]; var col = Color.FromArgb(P.TrackMuted(c.Track) ? 90 : 255, 62, 110, 120);
+        Round(g, col, rc.X, rc.Y, rc.Width, rc.Height, 4);
+        RoundEdge(g, c == plClip ? Color.White : Color.FromArgb(90, 160, 170), c == plClip ? 1.5f : 1, rc, 4);
+        var pts = new List<PointF>();
+        for (float x = 0; x <= rc.Width; x += 2) pts.Add(new PointF(rc.X + x, rc.Bottom - 2 - lane.At(c.Offset + x / cw) * (rc.Height - 4)));
+        var am = g.SmoothingMode; g.SmoothingMode = SmoothingMode.AntiAlias;
+        if (pts.Count > 1)
+        {
+            var poly = new List<PointF>(pts) { new PointF(pts[pts.Count - 1].X, rc.Bottom - 1), new PointF(pts[0].X, rc.Bottom - 1) };
+            using (var b = new SolidBrush(Color.FromArgb(60, 255, 255, 255))) g.FillPolygon(b, poly.ToArray());
+            using (var pen = new Pen(Color.FromArgb(230, 255, 255, 255), 1.5f)) g.DrawLines(pen, pts.ToArray());
+        }
+        g.SmoothingMode = am;
+        if (rc.Width > 30) g.DrawString(lane.Name(P), Small, Brushes.White, new RectangleF(rc.X + 4, rc.Y, rc.Width - 6, 14), Fit);
     }
 
     void PreviewNotes(Graphics g, Pattern pat, Clip c, RectangleF area, float cw)   // the clip's notes as small dashes, like FL's clip previews
@@ -4430,8 +4706,7 @@ class MainForm : Form
 
     void PlaylistDown(object sender, MouseEventArgs e)
     {
-        autoK = -1; dragMode = null;
-        bool automating = selLane >= 0 && selLane < P.Automation.Count;
+        dragMode = null;
         if (e.Y < 22)   // header: snap, lane picker (click next, right-click previous, through "off") and delete
         {
             int nl = P.Automation.Count;
@@ -4441,11 +4716,20 @@ class MainForm : Form
                 for (int k = 0; k < PlSnaps.Length; k++) { double v = PlSnaps[k]; ((ToolStripMenuItem)m.Items.Add(PlSnapNames[k], null, (s, a) => { plSnap = v; playlist.Invalidate(); })).Checked = plSnap == v; }
                 m.Show(playlist, e.X, 22); return;
             }
-            if (selLane >= 0 && selLane < nl && e.X >= playlist.Width - 78) { lock (P) P.Automation.RemoveAt(selLane); selLane = -1; dirty = true; }
-            else if (nl > 0 && e.X >= playlist.Width - AutoBoxX && e.X < playlist.Width - AutoBoxX + AutoBoxW)
-                selLane = Next(Enumerable.Range(-1, nl + 1), selLane, e.Button == MouseButtons.Right ? -1 : 1);
-            else return;
-            playlist.Invalidate(); return;
+            if (nl > 0 && e.X >= playlist.Width - AutoBoxX && e.X < playlist.Width - AutoBoxX + AutoBoxW)   // every lane: open its editor, or delete it with its clips
+            {
+                var m = new ContextMenuStrip();
+                for (int k = 0; k < nl; k++)
+                {
+                    int lk = k; var item = new ToolStripMenuItem(P.Automation[k].Name(P) + "  (" + P.Clips.Count(c => c.Lane == k) + " clips)");
+                    item.DropDownItems.Add("Edit the curve…", null, (s, a) => ShowAutomation(lk));
+                    item.DropDownItems.Add("Add a clip of it on a free track", null, (s, a) => Edit(() => { lock (P) P.Clips.Add(new Clip { Lane = lk, Pattern = -1, Track = P.FreeTrack(), Start = 0, Len = Math.Max(4, P.SongBars()) * Project.Steps }); dirty = true; Changed(); }));
+                    item.DropDownItems.Add("Delete this lane and its clips", null, (s, a) => Edit(() => { lock (P) P.RemoveLane(lk); dirty = true; Changed(); }));
+                    m.Items.Add(item);
+                }
+                m.Show(playlist, e.X, 22);
+            }
+            return;
         }
         double st = PlStep(e.X);
         if (e.Y < PlY0)   // the ruler: drag for a loop region; right-click for markers and time signatures
@@ -4462,7 +4746,6 @@ class MainForm : Form
             else if (e.X < 20) { lock (P) P.TrackAt(t).Mute = !P.TrackMuted(t); dirty = true; Changed(); }
             return;
         }
-        if (automating) { PlaylistMouse(sender, e); return; }
         var hit = ClipHit(t, st);
         if (e.Button == MouseButtons.Right) { dragMode = "erase"; PlaylistMouse(sender, e); return; }
         if (e.Button != MouseButtons.Left) return;
@@ -4503,26 +4786,15 @@ class MainForm : Form
             Changed(); return;
         }
         if (e.Button != MouseButtons.Left && e.Button != MouseButtons.Right) return;
-        if (selLane >= 0 && selLane < P.Automation.Count)   // automation mode: drag paints the lane; patterns are locked
-        {
-            if (e.Button != MouseButtons.Left || e.Y < PlY0) return;
-            var vals = P.Automation[selLane].Values;
-            int k = Math.Max(0, Math.Min(vals.Length - 1, (int)Math.Floor(st)));
-            float val = Clamp01(1 - (e.Y - PlY0) / (Math.Min(playlist.Height, PlTrackY(Project.Tracks)) - PlY0));
-            int from = autoK < 0 ? k : autoK;   // fill every step since the last mouse event, so a fast drag leaves no gaps
-            for (int s = Math.Min(from, k); s <= Math.Max(from, k); s++) vals[s] = from == k ? val : autoV + (val - autoV) * (s - from) / (k - from);
-            autoK = k; autoV = val; dirty = true;
-            playlist.Invalidate(); return;
-        }
         int t = PlTrack(e.Y);
         if (t < 0 || t >= Project.Tracks || e.X < PlHead || st < 0) return;
         if (dragMode == "erase" && e.Button == MouseButtons.Right)
         {
             var hit = ClipHit(t, st);
-            if (hit != null) { lock (P) P.Clips.Remove(hit); dirty = true; Changed(); }
+            if (hit != null) { lock (P) { P.Clips.Remove(hit); if (hit.Lane >= 0 && !P.Clips.Any(c => c.Lane == hit.Lane)) P.RemoveLane(hit.Lane); } dirty = true; Changed(); }   // a lane's last clip takes the lane with it
             return;
         }
-        if (dragMode == "paint" && e.Button == MouseButtons.Left && patBox.SelectedIndex >= 0 && ClipHit(t, st) == null)
+        if (dragMode == "paint" && e.Button == MouseButtons.Left && patBox.SelectedIndex >= 0 && ClipHit(t, st) == null && plClip == null)
         {
             double at = PlSnapDown(st);
             if (at >= Project.MaxBars * Project.Steps) return;
@@ -4548,7 +4820,12 @@ class MainForm : Form
         dragMode = null;
         if (plClip == null) return;
         var c = plClip; plClip = null;
-        if (!plMoved) { if (plMode == "move" && c.Pattern < P.Patterns.Count) patBox.SelectedIndex = c.Pattern; playlist.Invalidate(); return; }   // a click: edit that pattern
+        if (!plMoved)   // a click: edit that pattern, or that automation curve
+        {
+            if (plMode == "move" && c.Lane >= 0) ShowAutomation(c.Lane);
+            else if (plMode == "move" && c.Pattern >= 0 && c.Pattern < P.Patterns.Count) patBox.SelectedIndex = c.Pattern;
+            playlist.Invalidate(); return;
+        }
         if (plMode == "move" && (ModifierKeys & Keys.Shift) != 0)
             lock (P) { var copy = c.Copy(); c.Start = plOrig.Start; c.Track = plOrig.Track; P.Clips.Add(copy); }
         dirty = true; Changed();
@@ -5401,6 +5678,41 @@ class MainForm : Form
                 var fb = Project.Parse(fr.Lines().ToArray(), null); var fb2 = fb.Patterns[0].For(3).Last();
                 check(fb2.Step == fn.Step && fb2.Len == fn.Len && fb2.Slide && fb.Channels[3].Glide == 0.35f && !fb.Patterns[0].For(0)[0].Slide,
                     "saved and opened again: a triplet note's exact position and length, the slide flag, and the channel's glide");
+            }
+
+            {   // automation clips: they act only where they sit; points with bentMid curves; the LFO tool; MIDI controller links
+                Func<double, float[]> silenceAt = start =>
+                {
+                    var ap2 = Project.Demo(); foreach (var pt in ap2.Patterns) for (int c = 1; c < 4; c++) pt.For(c).Clear();   // kicks only, on insert 1
+                    var lane = new Lane { Ins = 1, Param = 0 }; ap2.Automation.Add(lane);   // insert 1's fader, all the way down
+                    ap2.Clips.Add(new Clip { Lane = 0, Pattern = -1, Track = 5, Start = start, Len = 16 });
+                    return Engine.Bounce(ap2.ExportCopy(), true, 0);
+                };
+                double b16 = 60.0 / 128 / 4 * Engine.SR;
+                Func<float[], int, double> barPeak = (a, bar) => a.Skip((int)((bar * 16 + 1) * b16) * 2).Take((int)(4 * b16) * 2).DefaultIfEmpty(0).Max(x => Math.Abs(x));   // from its 2nd 16th: mixer settings change once per audio block (~23 ms)
+                var at3 = silenceAt(32); var at4 = silenceAt(48);
+                check(barPeak(at3, 0) > 0.1 && barPeak(at3, 1) > 0.1 && barPeak(at3, 2) < 1e-4 && barPeak(at4, 2) > 0.1 && barPeak(at4, 3) < 1e-4,
+                    "automation clip: a fader-down clip at bar 3 leaves bars 1-2 playing and silences bar 3; moved to bar 4, bar 3 plays again");
+                var bend = new Lane { Points = new List<LanePoint> { new LanePoint { At = 0, Value = 0 }, new LanePoint { At = 16, Value = 1 } } }; bend.Render(); float straight = bend.Values[8];
+                bend.Points[0].Tension = 0.5f; bend.Render(); float bentMid = bend.Values[8];
+                var lfo = new Lane { Points = AutoWindow.Lfo(0, 16, 64) }; lfo.Render();
+                check(Math.Abs(straight - 0.5f) < 1e-4 && bentMid < 0.3f && Math.Abs(lfo.Values[4] - 1) < 0.01 && Math.Abs(lfo.Values[12]) < 0.01 && Math.Abs(lfo.Values[20] - 1) < 0.01,
+                    "automation points: a straight ramp is halfway at its middle, a bent one " + bentMid.ToString("0.00") + "; a 1-bar sine LFO peaks on beat 2 and dips on beat 4 of every bar");
+                var lk = Project.Demo(); lk.Links.Add(new Link { Cc = 74, Target = new Lane { Ins = 1, Param = 0 } });
+                var le3 = new Engine { Proj = lk }; var lb3 = new float[2048];
+                le3.MidiIn.Enqueue(0xB0 | 74 << 8 | 32 << 16); le3.Render(lb3, 1024); float linked = lk.Mixer[1].Vol;
+                le3.LearnTarget = new Lane { Ins = 2, Param = 1 }; le3.MidiIn.Enqueue(0xB0 | 21 << 8 | 127 << 16); le3.Render(lb3, 1024); int learned; bool got = le3.Learned.TryDequeue(out learned);
+                check(Math.Abs(linked - 32 / 127f) < 1e-6 && got && learned == 21 && le3.LearnTarget == null && lk.Mixer[2].Pan == 0,
+                    "MIDI link: controller 74 at 32 sets insert 1's fader to " + linked.ToString("0.00") + "; while learning, the next controller (21) is captured instead of moving anything");
+                var sv = Project.Demo(); var svLane = new Lane { Ch = 1, Param = Channel.KTone }; svLane.Points = new List<LanePoint> { new LanePoint { At = 0, Value = 0.2f, Tension = -0.4f }, new LanePoint { At = 40, Value = 0.9f } }; svLane.Render();
+                sv.Automation.Add(new Lane { Tempo = true }); sv.Automation.Add(svLane); sv.Clips.Add(new Clip { Lane = 1, Pattern = -1, Track = 7, Start = 16, Len = 48, Offset = 4 });
+                sv.Links.Add(new Link { Cc = 10, Target = new Lane { Ch = 2, Param = Channel.LanePan } });
+                var svb = Project.Parse(sv.Lines().ToArray(), null); var c2 = svb.Clips.Last();
+                bool saved = c2.Lane == 1 && c2.Start == 16 && c2.Len == 48 && c2.Offset == 4 && svb.Automation[1].Points.Count == 2 && svb.Automation[1].Points[0].Tension == -0.4f
+                    && Math.Abs(svb.Automation[1].Values[20] - svLane.Values[20]) < 1e-6 && svb.Links.Count == 1 && svb.Links[0].Cc == 10 && svb.Links[0].Target.Ch == 2;
+                sv.RemoveChannel(1);
+                check(saved && sv.Automation.Count == 1 && !sv.Clips.Any(c => c.Lane >= 0 && c.Lane != 0) && sv.Links[0].Target.Ch == 1,
+                    "saved and opened again: automation clips, points with their bends, MIDI links; deleting a channel takes its lanes and their clips with it");
             }
 
             {   // mixer: 125 inserts, free routing without loops, the new effects

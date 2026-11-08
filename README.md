@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 140 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 144 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -171,11 +171,29 @@ The master stays on the left; the 125 inserts scroll beside it with the mouse wh
 | Vocoder | Release, Bright, Mix. Put a synth on the insert and a voice (or any sound) on another insert, then set this insert's **sc** to that one: the synth "speaks". With no sidechain it does nothing |
 ## Automation
 
-1. In the mixer, **right-click** a fader, a pan bar, a send-level bar or any effect setting. In the channel rack, right-click a channel's **volume or pan bar**. Right-click the **BPM** box → **Automate tempo** for a tempo lane (40–300 BPM). Or, in a channel's **sound settings** window, right-click Attack, Release, Tone/Decay or Pitch. Either way, this creates a lane for it, shown over the playlist. A Tone lane is the classic filter sweep. Pitch changes take effect from the next note.
-2. **Drag** across the playlist to draw the curve: up = maximum, across = time.
-3. The box at the playlist's top right switches between lanes, or picks "off" to go back to editing patterns. Next to it is **delete lane**.
-4. Lanes play in **Song mode** and in exports, and the mixer's controls visibly move along with them.
+**Right-click any control that can change during a song:**
+- in the mixer: fader, pan, send level, an effect's setting or wet/dry
+- in the channel rack: volume or pan
+- in a sound settings window: Attack, Release, Tone/Decay or Pitch
+- the **BPM** box
 
+The menu offers:
+- **Create automation clip:** an automation clip for that control appears on the first free playlist track, flat at the control's current value, and its editor opens.
+  - Automation clips move, stretch, trim, split and copy like pattern clips. A clip only acts where it sits; before and after it, the control keeps its value.
+  - Click a clip to open its editor.
+  - Erasing a lane's last clip deletes the lane.
+  - The **automation ▾** pill at the playlist's top right lists every lane, to edit it, add another clip of it, or delete it.
+  - Clips play in **Song** mode and in exports, and the controls visibly move along with them.
+- **Link to MIDI controller…:** then move a knob or slider on your MIDI controller. From then on that knob moves the control, live, like FL's "Link to controller".
+  - **Esc** cancels the waiting.
+  - **Unlink** in the same menu removes it.
+  - Links are saved with the project.
+
+**The automation editor:**
+- Click to add a point, drag it to move, and right-click it to delete.
+- Drag the small circle between two points to bend that stretch of curve.
+- **LFO ▾** fills the lane with a sine, triangle, square or saw wave, repeating every 2 bars down to every 1/8.
+- **Flatten** resets the lane to one level.
 ## Playing and recording notes
 
 - **MIDI keyboard:** pick it in the toolbar's MIDI list. It plays the channel selected in the rack, and how hard you hit a key sets the note's velocity, both live and when recording.
@@ -264,13 +282,12 @@ MiniDAW is open source under the [MIT License](LICENSE): use it, change it, shar
 ## Limits
 
 - Patterns are 1 to 4 bars long (stretch a clip to repeat one). Songs can be up to 999 bars.
-- Automation lanes still cover the first 32 bars; past that they hold their last value.
 - Time signatures change bar numbering, bar lines and metronome accents; patterns still count in 16ths.
 - Velocity only changes loudness, not tone. The computer keyboard always plays at velocity 100.
 - Swing is one setting for the whole project, not per channel. Recording doesn't take swing into account when snapping notes.
 - The pitch wheel (±2 semitones) and the vibrato (5.5 Hz, ±½ semitone) can't be adjusted, and they don't affect Pluck or the drums. The computer keyboard has no sustain, pitch or mod controls.
 - Sidechain drives the Compressor and the Vocoder. The Parametric EQ's settings can't be automated yet.
-- Mixer controls, rack volume/pan, sound settings and tempo can be automated. Lanes span the whole song and are drawn freehand.
+- Mixer controls, rack volume/pan, sound settings and tempo can be automated, and linked to MIDI controllers. Mixer changes take effect once per audio block (about 23 ms).
 - No VST plugins. Export is 44.1 kHz only.
 - Audio uses the classic Windows `waveOut` output with about 0.1 s of delay. No ASIO.
 - Recording works only in Pattern mode and only adds notes (overdub).
