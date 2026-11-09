@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 144 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 147 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -96,6 +96,7 @@ Needs Windows 10 or 11.
 
 | Sound | How it's made |
 |---|---|
+| Analog synth | Three oscillators (sine, saw, square, triangle or noise; each with its own octave or tuning and level), unison up to 7 voices spread left and right, a low/band/high-pass filter with its own envelope, an amp envelope and an LFO (on pitch, filter, volume or pan). 28 settings, all automatable; six presets. Saw and square are band-limited, so high notes don't alias |
 | Saw lead | Saw wave through a soft low-pass |
 | Square lead | Square wave, hollow and reedy |
 | Pluck | Karplus-Strong string: a noise burst circulating in a one-period delay that softens on every pass |
@@ -104,6 +105,20 @@ Needs Windows 10 or 11.
 | Electric piano | Two-operator FM: a sine bent by itself, the bend fading fast like a struck tine |
 | Kick, Snare, Hat, Clap | Synthesized drums (pitch-swept sine, filtered noise bursts) |
 
+**Sampler options** (a sample channel's sound settings):
+- **Stretch:** make it up to twice as long or half as long without changing its pitch.
+- **Reverse.**
+- **Loop while held,** between a loop start and loop end; the note fades out 30 ms after you let go.
+
+**Slices** (right-click the channel → **Slices**), like FL's Slicex:
+- Cut a loop at its hits, or into 4, 8 or 16 equal parts. Then C5 plays the first slice, C#5 the second, and so on.
+- **Put the slices in this pattern** lays them out as notes at the song's tempo, so the loop plays back as it was. Rearrange those notes to remix it.
+
+**Browser** (**F8**, or **browser** in the channel rack's header): a panel on the left.
+- **Synth presets:** click one to hear it, double-click to add it as a channel.
+- **Folders:** shows a folder's WAV files, MIDI files, projects and subfolders. Click the folder line to pick another one; it's remembered.
+  - Click a sample to hear it, and double-click it (or drag it onto the window) to add it.
+  - Double-click a MIDI file to import it, or a project to open it.
 **Samples:** **+ Sample…** loads a WAV file (16-bit, 24-bit or 32-bit float, mono or stereo). Stereo files keep their left and right sides, and the channel's pan works as a balance control. Note C5 plays a sample at its original pitch.
 
 **Drag and drop:**
@@ -242,6 +257,7 @@ The export window remembers your choices until MiniDAW closes.
 |---|---|
 | Space | Play / Stop |
 | F9 | Mixer ↔ piano roll |
+| F8 | Browser |
 | F1 | About MiniDAW |
 | Ctrl+M | Metronome on / off |
 | Ctrl+Z | Undo (each click or drag is one step, and a recording take is one step; up to 100 steps) |
@@ -291,4 +307,4 @@ MiniDAW is open source under the [MIT License](LICENSE): use it, change it, shar
 - No VST plugins. Export is 44.1 kHz only.
 - Audio uses the classic Windows `waveOut` output with about 0.1 s of delay. No ASIO.
 - Recording works only in Pattern mode and only adds notes (overdub).
-- MIDI import keeps timing to 1/96 of a beat; a song longer than the playlist only gets its first 32 bars placed (the rest of its patterns are still created).
+- MIDI import keeps timing to 1/96 of a beat; a song is placed on the playlist up to its 999-bar limit.

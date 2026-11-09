@@ -1862,6 +1862,7 @@ class Engine
     readonly float[][] ib = new float[Project.Inserts][];          // per-insert stereo bus buffers
     float[] dryBuf;                                                 // scratch for effects' wet/dry mix
     public readonly ConcurrentQueue<Voice> Preview = new ConcurrentQueue<Voice>();
+    public readonly ConcurrentQueue<Channel> Hush = new ConcurrentQueue<Channel>();   // stop every voice of this channel (the browser's previews)
     public readonly ConcurrentQueue<int> MidiIn = new ConcurrentQueue<int>();   // raw MIDI messages from the keyboard
     public readonly ConcurrentQueue<KeyValuePair<int, double>> MidiRec = new ConcurrentQueue<KeyValuePair<int, double>>();   // (message, pattern step as heard) for recording
     public volatile Channel MidiTarget;                                          // the channel the keyboard plays, like FL's selected channel
@@ -1887,6 +1888,7 @@ class Engine
         now = rendered;
         if (arps.Count > 0 && arps.Keys.Any(c => !proj.Channels.Contains(c)))   // the project was replaced (open, undo): forget its arpeggiators
             foreach (var gone in arps.Keys.Where(c => !proj.Channels.Contains(c)).ToList()) arps.Remove(gone);
+        Channel hush; while (Hush.TryDequeue(out hush)) foreach (var v in voices) if (v.Ch == hush) v.Done = true;   // a browser preview cut short
         Voice pv; while (Preview.TryDequeue(out pv)) AddVoice(pv);
         bool playing = Playing;
         if (playing && !wasPlaying) { step = 0; toNext = 0; countLeft = CountIn ? Project.Steps : 0; }
@@ -2740,7 +2742,7 @@ class MainForm : Form
 {
     readonly Engine eng = new Engine();
     Project P { get { return eng.Proj; } }
-    readonly Canvas rack = new Canvas(), roll = new Canvas(), playlist = new Canvas(), mixer = new Canvas();
+    readonly Canvas rack = new Canvas(), roll = new Canvas(), playlist = new Canvas(), mixer = new Canvas(), browser = new Canvas { Dock = DockStyle.Left, Width = 250, Visible = false };
     readonly ComboBox patBox = new DarkCombo { Width = 124 };
     readonly NumericUpDown bpm = new NumericUpDown { Minimum = Project.MinBpm, Maximum = Project.MaxBpm, Width = 62, BackColor = Well, ForeColor = Txt,
         BorderStyle = BorderStyle.FixedSingle, TextAlign = HorizontalAlignment.Center, Font = new Font("Segoe UI", 10, FontStyle.Bold) };
@@ -2906,7 +2908,9 @@ class MainForm : Form
         rack.Dock = DockStyle.Top;
         roll.Dock = mixer.Dock = DockStyle.Fill;
         mixer.Visible = false;   // mixer and piano roll share the middle area; F9 swaps them
-        Controls.Add(roll); Controls.Add(mixer); Controls.Add(playlist); Controls.Add(rack); Controls.Add(bar);   // dock order: last added docks first
+        Controls.Add(roll); Controls.Add(mixer); Controls.Add(playlist); Controls.Add(rack); Controls.Add(browser); Controls.Add(bar);   // dock order: last added docks first
+        browser.Paint += PaintBrowser; browser.MouseDown += BrowserDown; browser.MouseMove += BrowserMove; browser.MouseDoubleClick += BrowserOpen;
+        browser.MouseWheel += (s, e) => { browserScroll = Math.Max(0, browserScroll - Math.Sign(e.Delta) * 3); browser.Invalidate(); };
 
         // every click or drag is one undo step: the snapshot is taken before the panel's own MouseDown and closed after its own MouseUp
         foreach (var c in new[] { rack, roll, playlist, mixer }) c.MouseDown += (s, e) => BeginEdit();
@@ -3121,6 +3125,7 @@ class MainForm : Form
     {
         if (keyData == Keys.Space && !(ActiveControl is NumericUpDown)) { TogglePlay(); return true; }   // space = play/stop, like FL
         if (keyData == Keys.F9) { ToggleMixer(); return true; }
+        if (keyData == Keys.F8) { ToggleBrowser(); return true; }
         if (keyData == Keys.F1) { ShowAbout(); return true; }
         if (keyData == Keys.Escape && learning != null) { eng.LearnTarget = null; learning = null; learnFor = null; Text = "MiniDAW" + (filePath != null ? " — " + Path.GetFileName(filePath) : ""); return true; }
         if (keyData == (Keys.Control | Keys.M)) { ToggleMetronome(); return true; }
@@ -3610,7 +3615,8 @@ class MainForm : Form
     {
         var g = e.Graphics;
         Header(g, rack, "CHANNEL RACK");
-        g.DrawString("dot: mute · name: click = edit, double-click = settings, right-click = menu · bars: volume / pan · box: mixer insert · click steps", Small, DimB, 120, 5);
+        RouteBox(g, 120, 4, 86, browser.Visible ? "browser ◂" : "browser ▸", browser.Visible);
+        g.DrawString("dot: mute · name: click = edit, double-click = settings, right-click = menu · bars: volume / pan · box: mixer insert · click steps", Small, DimB, 214, 5);
         float swx = rack.Width - SwingW - 10;   // swing bar, top right, like FL's swing knob on the channel rack
         ValueBar(g, swx, 4, SwingW, 15, 0, P.Swing, DeepBlue);
         g.DrawString("Swing  " + (int)Math.Round(P.Swing * 100) + "%", Small, TxtB, swx + 6, 5);
@@ -3702,9 +3708,10 @@ class MainForm : Form
     void RackDown(object sender, MouseEventArgs e)
     {
         int dir = e.Button == MouseButtons.Right ? -1 : 1;
-        if (e.Y < Top0)   // header: swing bar, graph switch, group filter
+        if (e.Y < Top0)   // header: browser switch, swing bar, graph switch, group filter
         {
-            if (e.Button == MouseButtons.Left && e.X >= rack.Width - SwingW - 10) { dragMode = "swing"; RackMove(sender, e); }
+            if (e.X >= 120 && e.X < 206) ToggleBrowser();
+            else if (e.Button == MouseButtons.Left && e.X >= rack.Width - SwingW - 10) { dragMode = "swing"; RackMove(sender, e); }
             else if (e.X >= GraphBoxX() && e.X < GraphBoxX() + GraphBoxW) { graphMode = (graphMode + dir + GraphNames.Length) % GraphNames.Length; RackHeight(); rack.Invalidate(); }
             else if (e.X >= GroupBoxX() && e.X < GroupBoxX() + GroupBoxW && (groupFilter != null || Groups().Count > 0))
             {
@@ -3773,6 +3780,107 @@ class MainForm : Form
                 list.Add(new Note { Step = Math.Round(at * 24) / 24, Key = 60 + k, Len = Math.Max(1 / 24.0, Math.Min(CurPat.Length - at, end - at)) });
             }
         }
+    }
+
+    // ---- browser (F8), like FL's: synth presets, and a folder of samples, MIDI files and projects. Click to hear, double-click to
+    // add (or open), drag a sample onto the window to add it. The folder is remembered between runs.
+    internal static string BrowserFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MiniDAW", "browser.txt");
+    string browserDir; int browserScroll; Channel previewCh; Point browseDown; string dragFile;
+    const int BrowseRow = 20, BrowseTop = 26;
+
+    void ToggleBrowser() { browser.Visible = !browser.Visible; browserCache = null; rack.Invalidate(); }
+
+    string BrowserDir()
+    {
+        if (browserDir == null)
+        {
+            try { browserDir = File.Exists(BrowserFile) ? File.ReadAllText(BrowserFile).Trim() : null; } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            if (browserDir == null || !Directory.Exists(browserDir)) browserDir = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
+        }
+        return browserDir;
+    }
+
+    class Item { public string Text, Path; public int Preset = -1; public bool Folder, Heading; }
+
+    List<Item> browserCache;   // the rows, read once per folder (and again each time the panel opens)
+
+    List<Item> BrowserItems()   // the rows, top to bottom
+    {
+        if (browserCache != null) return browserCache;
+        var items = browserCache = new List<Item> { new Item { Text = "SYNTH PRESETS", Heading = true } };
+        for (int k = 0; k < Channel.PresetNames.Length; k++) items.Add(new Item { Text = Channel.PresetNames[k], Preset = k });
+        string dir = BrowserDir();
+        items.Add(new Item { Text = "FOLDER  ·  click to change", Heading = true });
+        items.Add(new Item { Text = "⌂ " + (Path.GetFileName(dir.TrimEnd('\\')) == "" ? dir : Path.GetFileName(dir.TrimEnd('\\'))), Path = dir, Folder = true });
+        try
+        {
+            var parent = Directory.GetParent(dir);
+            if (parent != null) items.Add(new Item { Text = "  ..", Path = parent.FullName, Folder = true });
+            foreach (var sub in Directory.GetDirectories(dir).OrderBy(x => x)) items.Add(new Item { Text = "  ▸ " + Path.GetFileName(sub), Path = sub, Folder = true });
+            foreach (var f in Directory.GetFiles(dir).Where(f => IsExt(f, ".wav") || IsMidi(f) || IsExt(f, ".mdaw")).OrderBy(x => x))
+                items.Add(new Item { Text = "  " + (IsExt(f, ".wav") ? "♪ " : IsMidi(f) ? "♫ " : "▣ ") + Path.GetFileName(f), Path = f });
+        }
+        catch (UnauthorizedAccessException) { items.Add(new Item { Text = "  (can't read this folder)", Heading = true }); }
+        catch (IOException) { items.Add(new Item { Text = "  (can't read this folder)", Heading = true }); }
+        return items;
+    }
+
+    Item BrowserAt(int y) { var items = BrowserItems(); int i = (y - BrowseTop) / BrowseRow + browserScroll; return y >= BrowseTop && i >= 0 && i < items.Count ? items[i] : null; }
+
+    void PaintBrowser(object sender, PaintEventArgs e)
+    {
+        var g = e.Graphics; Header(g, browser, "BROWSER  (F8)");
+        var items = BrowserItems(); browserScroll = Math.Min(browserScroll, Math.Max(0, items.Count - 5));
+        for (int i = browserScroll, r = 0; i < items.Count; i++, r++)
+        {
+            float y = BrowseTop + r * BrowseRow; if (y > browser.Height) break;
+            var it = items[i];
+            if (it.Heading) { g.DrawString(it.Text, Small, DimB, 8, y + 4); continue; }
+            if (it.Path != null && it.Path == dragFile) Round(g, Sel, 4, y, browser.Width - 8, BrowseRow - 2, 3);
+            g.DrawString(it.Text, Font, it.Folder ? TxtB : it.Preset >= 0 ? new SolidBrush(Color.FromArgb(232, 160, 96)) : TxtB, new RectangleF(8, y, browser.Width - 12, BrowseRow), Fit);
+        }
+    }
+
+    void BrowserDown(object sender, MouseEventArgs e)   // click: hear it, or go into a folder
+    {
+        var it = BrowserAt(e.Y); browseDown = e.Location; dragFile = null;
+        if (it == null || it.Heading || e.Button != MouseButtons.Left) return;
+        if (it.Folder && it.Text.StartsWith("⌂"))   // the folder line: pick another
+        {
+            using (var d = new FolderBrowserDialog { SelectedPath = BrowserDir() })
+                if (d.ShowDialog(this) == DialogResult.OK) SetBrowserDir(d.SelectedPath);
+            return;
+        }
+        if (it.Folder) { SetBrowserDir(it.Path); return; }
+        if (previewCh != null) eng.Hush.Enqueue(previewCh);   // one preview at a time
+        previewCh = null;
+        if (it.Preset >= 0) previewCh = new Channel { Kind = "analog", Name = "preview", Syn = (float[])Channel.SynPresets[it.Preset].Clone() };
+        else if (IsExt(it.Path, ".wav")) { var c = new Channel { Kind = "sample", Name = "preview" }; try { Wav.Load(it.Path, c); previewCh = c; } catch (InvalidDataException) { } catch (IOException) { } }
+        if (previewCh != null) eng.Preview.Enqueue(new Engine.Voice { Ch = previewCh, Key = 60, Len = it.Preset >= 0 ? Engine.SR / 2 : int.MaxValue / 2 });
+        dragFile = it.Path; browser.Invalidate();
+    }
+
+    void BrowserMove(object sender, MouseEventArgs e)   // drag a sample out: the window's own drop handler adds it
+    {
+        if (e.Button != MouseButtons.Left || dragFile == null || !IsExt(dragFile, ".wav")) return;
+        if (Math.Abs(e.X - browseDown.X) + Math.Abs(e.Y - browseDown.Y) < 6) return;
+        string f = dragFile; dragFile = null;
+        browser.DoDragDrop(new DataObject(DataFormats.FileDrop, new[] { f }), DragDropEffects.Copy);
+    }
+
+    void BrowserOpen(object sender, MouseEventArgs e)   // double-click: add the preset or sample as a channel; import a MIDI file; open a project
+    {
+        var it = BrowserAt(e.Y);
+        if (it == null || it.Heading || it.Folder) return;
+        if (it.Preset >= 0) { AddChannel(new Channel { Kind = "analog", Name = FreeName(Channel.PresetNames[it.Preset]), Syn = (float[])Channel.SynPresets[it.Preset].Clone() }); return; }
+        if (IsExt(it.Path, ".mdaw")) { if (ConfirmDiscard()) OpenPath(it.Path); return; }
+        OpenFiles(new[] { it.Path });   // a WAV becomes a sample channel; a MIDI file is imported
+    }
+
+    void SetBrowserDir(string dir)
+    {
+        browserDir = dir; browserScroll = 0; browserCache = null; browser.Invalidate();
+        try { Directory.CreateDirectory(Path.GetDirectoryName(BrowserFile)); File.WriteAllText(BrowserFile, dir); } catch (IOException) { } catch (UnauthorizedAccessException) { }   // remembering it is a nicety
     }
 
     static Bitmap Swatch(Color c)   // a colour chip for the Colour menu
