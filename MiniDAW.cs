@@ -1542,6 +1542,326 @@ static class Flac
 
 // Windows' own Media Foundation: its MP3 encoder (Windows 8 and later) for export, and its decoders, which the self-test uses
 // to check exported WAV, FLAC and MP3 files with a reader that isn't MiniDAW's own.
+// ---------------------------------------------------------------- Ogg Vorbis, encoded here (Windows can play Vorbis but has no encoder)
+// A deliberately small encoder. It uses 2048-sample blocks only. A floor-1 curve follows the level of the spectrum and is the
+// quantizer's step, so the noise sits a set distance below the music and below the threshold of hearing. Residue type 1 codes
+// 16-coefficient partitions of five classes (silent, tiny, small, and two cascades of coarse-to-fine steps for loud peaks). Each file gets Huffman tables built from a first pass. No stereo coupling; VBR.
+static class Vorbis
+{
+    const int N = 2048, M = N / 2, Part = 16, Mult = 2, Range = 128;
+    static readonly int[] PointX = { 1, 2, 3, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 896, 960 };
+    static readonly int[] Xs = ListX(), Lo = new int[Xs.Length], Hi = new int[Xs.Length], Sorted;
+    static readonly double[] DbTable = Enumerable.Range(0, 256).Select(i => Math.Exp((i - 255) * Math.Log(1 / 1.0649863e-07) / 255)).ToArray();   // the decoder's floor1_inverse_dB_table
+    static readonly double[] Win = Enumerable.Range(0, N).Select(n => Math.Sin(Math.PI / 2 * Math.Pow(Math.Sin(Math.PI * (n + 0.5) / N), 2))).ToArray();
+    public static readonly double[] SnrDb = { 12, 18, 24, 30 }, CutHz = { 15000, 17000, 19000, 20000 };   // the four qualities: how far below the music the noise sits, and the highest pitch kept
+
+    static Vorbis()
+    {
+        for (int i = 2; i < Xs.Length; i++)   // each point's nearest already-placed neighbours below and above, as the decoder finds them
+        {
+            Lo[i] = 0; Hi[i] = 1;
+            for (int j = 0; j < i; j++) { if (Xs[j] < Xs[i] && Xs[j] > Xs[Lo[i]]) Lo[i] = j; if (Xs[j] > Xs[i] && Xs[j] < Xs[Hi[i]]) Hi[i] = j; }
+        }
+        Sorted = Enumerable.Range(0, Xs.Length).OrderBy(i => Xs[i]).ToArray();
+    }
+
+    static int[] ListX()   // 0 and the end first, then the points coarse to fine, so each is predicted from far-apart neighbours
+    {
+        var order = new List<int> { 0, M }; var q = new Queue<int[]>(); q.Enqueue(new[] { 0, PointX.Length });
+        while (q.Count > 0) { var r = q.Dequeue(); if (r[0] >= r[1]) continue; int mid = (r[0] + r[1]) / 2; order.Add(PointX[mid]); q.Enqueue(new[] { r[0], mid }); q.Enqueue(new[] { mid + 1, r[1] }); }
+        return order.ToArray();
+    }
+
+    internal sealed class Bits   // Vorbis packs bits least significant first
+    {
+        readonly List<byte> o = new List<byte>(); int acc, n;
+        public void Put(long v, int bits) { for (int i = 0; i < bits; i++) { acc |= (int)((v >> i) & 1) << n; if (++n == 8) { o.Add((byte)acc); acc = 0; n = 0; } } }
+        public byte[] Done() { if (n > 0) { o.Add((byte)acc); acc = 0; n = 0; } return o.ToArray(); }
+    }
+
+    static int Ilog(long x) { int r = 0; while (x > 0) { r++; x >>= 1; } return r; }
+
+    sealed class Book
+    {
+        public readonly int Dim, Entries, Lookup, Values, Min, Delta; public readonly long[] Count; int[] len, code;
+        public Book(int dim, int entries, int lookup, int min, int delta)
+        {
+            Dim = dim; Entries = entries; Lookup = lookup; Min = min; Delta = delta; Count = new long[entries];
+            if (lookup == 1) while (Math.Pow(Values + 1, dim) <= entries) Values++;
+        }
+        public void Use(Bits w, int e) { if (w == null) Count[e]++; else w.Put(code[e], len[e]); }
+        public int Index(int[] v, int at)   // the lattice entry for Dim values starting at v[at]
+        {
+            int e = 0, mul = 1; for (int i = 0; i < Dim; i++) { e += (v[at + i] - Min) / Delta * mul; mul *= Values; } return e;
+        }
+        public void Build()   // Huffman lengths from the counts, then codewords assigned the way every Vorbis decoder assigns them
+        {
+            var c = (long[])Count.Clone(); int used = c.Count(x => x > 0);
+            for (int i = 0; used < 2 && i < Entries; i++) if (c[i] == 0) { c[i] = 1; used++; }   // never a one-symbol tree
+            while (true) { len = HuffLens(c); if (len.Max() <= 24) break; for (int i = 0; i < Entries; i++) if (c[i] > 0) c[i] = c[i] / 2 + 1; }   // the format allows 32 bits, some decoders only 24
+            code = new int[Entries]; var marker = new uint[33];
+            for (int i = 0; i < Entries; i++)
+            {
+                int l = len[i]; if (l == 0) continue;
+                uint entry = marker[l]; uint rev = 0; for (int j = 0; j < l; j++) rev = (rev << 1) | ((entry >> j) & 1); code[i] = (int)rev;
+                for (int j = l; j > 0; j--) { if ((marker[j] & 1) != 0) { if (j == 1) marker[1]++; else marker[j] = marker[j - 1] << 1; break; } marker[j]++; }
+                for (int j = l + 1; j < 33; j++) { if ((marker[j] >> 1) == entry) { entry = marker[j]; marker[j] = marker[j - 1] << 1; } else break; }
+            }
+        }
+        static int[] HuffLens(long[] c)
+        {
+            var lens = new int[c.Length]; var items = new List<KeyValuePair<long, List<int>>>();
+            for (int i = 0; i < c.Length; i++) if (c[i] > 0) items.Add(new KeyValuePair<long, List<int>>(c[i], new List<int> { i }));
+            while (items.Count > 1)
+            {
+                items.Sort((a, b) => a.Key.CompareTo(b.Key)); var a0 = items[0]; var a1 = items[1]; items.RemoveRange(0, 2);
+                foreach (int i in a0.Value) lens[i]++; foreach (int i in a1.Value) lens[i]++;
+                a0.Value.AddRange(a1.Value); items.Add(new KeyValuePair<long, List<int>>(a0.Key + a1.Key, a0.Value));
+            }
+            return lens;
+        }
+        public void Header(Bits b)
+        {
+            b.Put(0x564342, 24); b.Put(Dim, 16); b.Put(Entries, 24); b.Put(0, 1); b.Put(1, 1);   // unordered, sparse
+            for (int i = 0; i < Entries; i++) { b.Put(len[i] > 0 ? 1 : 0, 1); if (len[i] > 0) b.Put(len[i] - 1, 5); }
+            b.Put(Lookup, 4);
+            if (Lookup == 1)
+            {
+                b.Put(Float(Min), 32); b.Put(Float(Delta), 32); int bits = Ilog(Values - 1); b.Put(bits - 1, 4); b.Put(0, 1);
+                for (int i = 0; i < Values; i++) b.Put(i, bits);
+            }
+        }
+        static long Float(int v) { return (v < 0 ? 0x80000000L : 0) | (788L << 21) | (uint)Math.Abs(v); }   // Vorbis' float: mantissa × 2^(exponent - 788)
+    }
+
+    // ---- the transform: MDCT of N windowed samples = a DCT-IV of the folded block, done with an N/4-point complex FFT
+    internal static void Mdct(double[] x, double[] X)
+    {
+        int L = M / 2; var re = new double[L]; var im = new double[L]; var u = new double[M];
+        for (int n = 0; n < M / 2; n++) { u[n] = -x[3 * M / 2 - 1 - n] - x[3 * M / 2 + n]; u[M / 2 + n] = x[n] - x[M - 1 - n]; }   // (-c reversed - d, a - b reversed)
+        for (int m = 0; m < L; m++) { double a = u[2 * m], b = u[M - 1 - 2 * m], ang = -Math.PI * m / M, c = Math.Cos(ang), s = Math.Sin(ang); re[m] = a * c - b * s; im[m] = a * s + b * c; }
+        Fft(re, im);
+        for (int p = 0; p < L; p++)
+        {
+            double ang = -Math.PI * (p + 0.25) / M, c = Math.Cos(ang), s = Math.Sin(ang), yr = re[p] * c - im[p] * s, yi = re[p] * s + im[p] * c;
+            X[2 * p] = yr * 4 / N; X[M - 1 - 2 * p] = -yi * 4 / N;   // 4/N: the decoder's inverse is unscaled
+        }
+    }
+
+    static void Fft(double[] re, double[] im)   // in place, radix 2
+    {
+        int n = re.Length;
+        for (int i = 1, j = 0; i < n; i++) { int bit = n >> 1; for (; (j & bit) != 0; bit >>= 1) j ^= bit; j ^= bit; if (i < j) { double t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; } }
+        for (int len = 2; len <= n; len <<= 1)
+        {
+            double ang = -2 * Math.PI / len, wr = Math.Cos(ang), wi = Math.Sin(ang);
+            for (int i = 0; i < n; i += len)
+            {
+                double cr = 1, ci = 0;
+                for (int k = 0; k < len / 2; k++)
+                {
+                    int a = i + k, b = a + len / 2; double tr = re[b] * cr - im[b] * ci, ti = re[b] * ci + im[b] * cr;
+                    re[b] = re[a] - tr; im[b] = im[a] - ti; re[a] += tr; im[a] += ti;
+                    double t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+                }
+            }
+        }
+    }
+
+    // ---- floor 1, exactly as a decoder computes it
+    static int RenderPoint(int x0, int y0, int x1, int y1, int x) { int dy = y1 - y0, adx = x1 - x0, off = Math.Abs(dy) * (x - x0) / adx; return dy < 0 ? y0 - off : y0 + off; }
+    static void RenderLine(int x0, int y0, int x1, int y1, int[] v)
+    {
+        int dy = y1 - y0, adx = x1 - x0, ady = Math.Abs(dy), bas = dy / adx, sy = dy < 0 ? bas - 1 : bas + 1, y = y0, err = 0; ady -= Math.Abs(bas) * adx;
+        if (x0 < M) v[x0] = y;
+        for (int x = x0 + 1; x < x1 && x < M; x++) { err += ady; if (err >= adx) { err -= adx; y += sy; } else y += bas; v[x] = y; }
+    }
+
+    sealed class Enc
+    {
+        readonly float[] lr; readonly int chans, rate; readonly double gain; public readonly int Frames, K;
+        const int Classes = 5, MaxQ = 8 * 256 + 8 * 16 + 8;
+        readonly Book floorBook = new Book(1, Range, 0, 0, 0), classBook = new Book(2, Classes * Classes, 0, 0, 0), small = new Book(4, 81, 1, -1, 1),
+            mid = new Book(2, 81, 1, -4, 1), coarse = new Book(2, 289, 1, -128, 16), fine = new Book(2, 289, 1, -8, 1), huge = new Book(2, 289, 1, -2048, 256);
+        static readonly int[][] Steps = { null, null, null, new[] { 16, 1 }, new[] { 256, 16, 1 } };   // the cascades: each pass codes what the earlier ones left
+        readonly double[] x = new double[N], X = new double[M], ath = new double[M]; readonly int[] curve = new int[M];
+
+        public Enc(float[] lr, int chans, int rate, double snrDb, double cutHz)
+        {
+            this.lr = lr; this.chans = chans; this.rate = rate; Frames = lr.Length / chans; K = (Frames + M - 1) / M;
+            gain = Math.Sqrt(12) * Math.Pow(10, -snrDb / 20);   // a uniform quantizer's noise is step / sqrt(12)
+            for (int k = 0; k < M; k++)   // threshold of hearing (Terhardt, full scale as 100 dB SPL, held flat outside 0.5-12 kHz), and nothing above the cut-off
+            {
+                double hz = (k + 0.5) * rate / 2.0 / M, f = Math.Max(0.5, Math.Min(12, hz / 1000)), db = 3.64 * Math.Pow(f, -0.8) - 6.5 * Math.Exp(-0.6 * (f - 3.3) * (f - 3.3)) + 1e-3 * Math.Pow(f, 4);
+                ath[k] = hz > cutHz ? 1e9 : Math.Pow(10, (db - 100) / 20) * Math.Sqrt(12);
+            }
+        }
+
+        public void Block(int b, Bits w)   // block b covers frames (b - 1) * M .. (b + 1) * M; w null = just count symbols for the tables
+        {
+            if (w != null) { w.Put(0, 1); w.Put(1, 1); w.Put(1, 1); }   // audio packet, mode 0 (no bits), long window between long ones
+            var q = new int[chans][]; var used = new bool[chans];
+            for (int c = 0; c < chans; c++)
+            {
+                for (int n = 0; n < N; n++) { long f = (long)(b - 1) * M + n; x[n] = f >= 0 && f < Frames ? lr[f * chans + c] * Win[n] : 0; }
+                Mdct(x, X);
+                q[c] = new int[M]; used[c] = Floor(w, q[c]);
+            }
+            Residue(w, q, used);
+        }
+
+        bool Floor(Bits w, int[] q)   // picks the curve, codes it, and quantizes the spectrum by it; false = silent (nothing coded)
+        {
+            double peak = 0; for (int k = 0; k < M; k++) peak = Math.Max(peak, Math.Abs(X[k]));
+            if (peak < 1e-7) { if (w != null) w.Put(0, 1); return false; }
+            int nx = Xs.Length; var want = new int[nx]; double step = 20 * Math.Log10(1 / 1.0649863e-07) / 255;
+            for (int s = 0; s < nx; s++)
+            {
+                int i = Sorted[s], a = s == 0 ? 0 : (Xs[Sorted[s - 1]] + Xs[i] + 1) / 2, e = s == nx - 1 ? M : Math.Max(a + 1, (Xs[i] + Xs[Sorted[s + 1]] + 1) / 2);   // the bins nearer this point than its neighbours (never none)
+                double sum = 0, floorMin = double.MaxValue; for (int k = a; k < e; k++) { sum += X[k] * X[k]; floorMin = Math.Min(floorMin, ath[k]); }
+                double F = Math.Max(Math.Sqrt(sum / Math.Max(1, e - a)) * gain, floorMin), idx = 255 + 20 * Math.Log10(F) / step;
+                want[i] = Math.Max(0, Math.Min(Range - 1, (int)Math.Round(idx / Mult)));
+            }
+            var fy = new int[nx]; var val = new int[nx]; var step2 = new bool[nx];
+            fy[0] = want[0]; fy[1] = want[1]; step2[0] = step2[1] = true;
+            for (int i = 2; i < nx; i++)
+            {
+                int pred = RenderPoint(Xs[Lo[i]], fy[Lo[i]], Xs[Hi[i]], fy[Hi[i]], Xs[i]), hiRoom = Range - pred, loRoom = pred, room = (hiRoom < loRoom ? hiRoom : loRoom) * 2, d = want[i] - pred, v;
+                if (d == 0) v = 0;
+                else if (d > 0) v = 2 * d < room ? 2 * d : d + loRoom;
+                else v = -2 * d - 1 < room ? -2 * d - 1 : hiRoom - 1 - d;
+                val[i] = v;
+                if (v == 0) { fy[i] = pred; continue; }   // the same steps a decoder takes, so this side knows the exact curve
+                step2[Lo[i]] = step2[Hi[i]] = step2[i] = true;
+                if (v >= room) fy[i] = hiRoom > loRoom ? v - loRoom + pred : pred - v + hiRoom - 1;
+                else fy[i] = (v & 1) != 0 ? pred - (v + 1) / 2 : pred + v / 2;
+            }
+            if (w != null) { w.Put(1, 1); w.Put(fy[0], 7); w.Put(fy[1], 7); }
+            for (int i = 2; i < nx; i++) floorBook.Use(w, val[i]);
+            int lx = 0, ly = fy[0] * Mult;
+            for (int s = 1; s < nx; s++) { int i = Sorted[s]; if (!step2[i]) continue; int hy = fy[i] * Mult; RenderLine(lx, ly, Xs[i], hy, curve); lx = Xs[i]; ly = hy; }
+            for (int k = 0; k < M; k++) q[k] = (int)Math.Max(-MaxQ, Math.Min(MaxQ, Math.Round(X[k] / DbTable[curve[k]])));
+            return true;
+        }
+
+        void Residue(Bits w, int[][] q, bool[] used)   // residue type 1, in the decoder's order: pass by pass, two partitions per class word
+        {
+            int parts = M / Part; var cls = new int[chans][];
+            for (int c = 0; c < chans; c++)
+            {
+                cls[c] = new int[parts]; if (!used[c]) continue;
+                for (int p = 0; p < parts; p++) { int mx = 0; for (int k = 0; k < Part; k++) mx = Math.Max(mx, Math.Abs(q[c][p * Part + k])); cls[c][p] = mx == 0 ? 0 : mx <= 1 ? 1 : mx <= 4 ? 2 : mx <= 136 ? 3 : 4; }
+            }
+            var pair = new int[2];
+            for (int pass = 0; pass < 3; pass++)
+                for (int pc = 0; pc < parts; )
+                {
+                    if (pass == 0) for (int c = 0; c < chans; c++) if (used[c]) classBook.Use(w, cls[c][pc] * Classes + cls[c][pc + 1]);
+                    for (int i = 0; i < 2 && pc < parts; i++, pc++)
+                        for (int c = 0; c < chans; c++)
+                        {
+                            if (!used[c]) continue; int k = cls[c][pc], at = pc * Part; var v = q[c];
+                            if (pass == 0 && k == 1) for (int j = 0; j < Part; j += 4) small.Use(w, small.Index(v, at + j));
+                            else if (pass == 0 && k == 2) for (int j = 0; j < Part; j += 2) mid.Use(w, mid.Index(v, at + j));
+                            else if (k >= 3 && pass < Steps[k].Length)
+                                for (int j = 0; j < Part; j += 2)
+                                {
+                                    for (int t = 0; t < 2; t++) pair[t] = Stage(v[at + j + t], Steps[k], pass);
+                                    int st = Steps[k][pass]; var bk = st == 256 ? huge : st == 16 ? coarse : fine; bk.Use(w, bk.Index(pair, 0));
+                                }
+                        }
+                }
+        }
+
+        static int Stage(int v, int[] steps, int pass)   // what cascade pass `pass` adds: each takes the nearest multiple of its step (within ±8 of them) of what's left
+        {
+            for (int i = 0; ; i++) { int a = (int)Math.Max(-8, Math.Min(8, Math.Round(v / (double)steps[i]))); if (i == pass) return a * steps[i]; v -= a * steps[i]; }
+        }
+
+        public void BuildBooks() { foreach (var b in Books()) b.Build(); }
+        Book[] Books() { return new[] { floorBook, classBook, small, mid, coarse, fine, huge }; }
+
+        public byte[] Ident()
+        {
+            var b = new Bits(); b.Put(1, 8); foreach (char ch in "vorbis") b.Put(ch, 8);
+            b.Put(0, 32); b.Put(chans, 8); b.Put(rate, 32); b.Put(0, 32); b.Put(0, 32); b.Put(0, 32); b.Put(8, 4); b.Put(11, 4); b.Put(1, 1);   // version, bitrates unset, blocks 256 and 2048
+            return b.Done();
+        }
+        public byte[] Comment()
+        {
+            var b = new Bits(); b.Put(3, 8); foreach (char ch in "vorbis") b.Put(ch, 8);
+            const string vendor = "MiniDAW"; b.Put(vendor.Length, 32); foreach (char ch in vendor) b.Put(ch, 8); b.Put(0, 32); b.Put(1, 1);
+            return b.Done();
+        }
+        public byte[] Setup()
+        {
+            var b = new Bits(); b.Put(5, 8); foreach (char ch in "vorbis") b.Put(ch, 8);
+            var books = Books(); b.Put(books.Length - 1, 8); foreach (var bk in books) bk.Header(b);
+            b.Put(0, 6); b.Put(0, 16);   // one time-domain transform, the only kind
+            b.Put(0, 6); b.Put(1, 16);   // one floor, type 1
+            int partitions = PointX.Length / 2; b.Put(partitions, 5); for (int i = 0; i < partitions; i++) b.Put(0, 4);   // all of class 0
+            b.Put(2 - 1, 3); b.Put(0, 2); b.Put(0 + 1, 8);   // class 0: two points, no subclasses, coded with book 0
+            b.Put(Mult - 1, 2); b.Put(10, 4); for (int i = 2; i < Xs.Length; i++) b.Put(Xs[i], 10);   // multiplier, range bits (2^10 = M), the points
+            b.Put(0, 6); b.Put(1, 16);   // one residue, type 1
+            b.Put(0, 24); b.Put(M, 24); b.Put(Part - 1, 24); b.Put(Classes - 1, 6); b.Put(1, 8);   // all of the spectrum, 16-wide partitions, 5 classes, class book 1
+            int[] cascade = { 0, 1, 1, 3, 7 }; foreach (int c in cascade) { b.Put(c, 3); b.Put(0, 1); }
+            b.Put(2, 8); b.Put(3, 8); b.Put(4, 8); b.Put(5, 8); b.Put(6, 8); b.Put(4, 8); b.Put(5, 8);   // 1: small; 2: mid; 3: coarse, fine; 4: huge, coarse, fine
+            b.Put(0, 6); b.Put(0, 16); b.Put(0, 1); b.Put(0, 1); b.Put(0, 2); b.Put(0, 8); b.Put(0, 8); b.Put(0, 8);   // one mapping: one submap, no coupling, floor 0, residue 0
+            b.Put(0, 6); b.Put(1, 1); b.Put(0, 16); b.Put(0, 16); b.Put(0, 8);   // one mode: long blocks, mapping 0
+            b.Put(1, 1);
+            return b.Done();
+        }
+    }
+
+    sealed class Ogg   // pages: up to 255 segments of up to 255 bytes; a packet that ends on a page sets its granule (frames so far)
+    {
+        static readonly uint[] Crc = Enumerable.Range(0, 256).Select(i => { uint r = (uint)i << 24; for (int k = 0; k < 8; k++) r = (r & 0x80000000) != 0 ? (r << 1) ^ 0x04C11DB7 : r << 1; return r; }).ToArray();
+        readonly MemoryStream o = new MemoryStream(), body = new MemoryStream(); readonly List<byte> laces = new List<byte>();
+        int seq; long granule = -1; bool cont;
+        public long Pending { get { return body.Length; } }
+        public void Packet(byte[] p, long gran)
+        {
+            int pos = 0;
+            while (true)
+            {
+                if (laces.Count == 255) Flush(false);
+                int l = Math.Min(255, p.Length - pos); laces.Add((byte)l); body.Write(p, pos, l); pos += l;
+                if (l < 255) { granule = gran; return; }
+            }
+        }
+        public void Flush(bool last)
+        {
+            if (laces.Count == 0 && !last) return;
+            var h = new byte[27 + laces.Count]; "OggS".Select(c => (byte)c).ToArray().CopyTo(h, 0);
+            h[5] = (byte)((cont ? 1 : 0) | (seq == 0 ? 2 : 0) | (last ? 4 : 0));
+            BitConverter.GetBytes(granule).CopyTo(h, 6); BitConverter.GetBytes(0x4D444157).CopyTo(h, 14); BitConverter.GetBytes(seq++).CopyTo(h, 18);
+            h[26] = (byte)laces.Count; laces.CopyTo(h, 27);
+            var data = body.ToArray(); uint crc = 0;
+            foreach (byte x in h) crc = (crc << 8) ^ Crc[((crc >> 24) ^ x) & 0xff]; foreach (byte x in data) crc = (crc << 8) ^ Crc[((crc >> 24) ^ x) & 0xff];
+            BitConverter.GetBytes(crc).CopyTo(h, 22); o.Write(h, 0, h.Length); o.Write(data, 0, data.Length);
+            cont = laces.Count > 0 && laces[laces.Count - 1] == 255; laces.Clear(); body.SetLength(0); granule = -1;
+        }
+        public byte[] Bytes() { return o.ToArray(); }
+    }
+
+    public static byte[] Encode(float[] lr, int chans, int rate, int quality)   // interleaved samples → an .ogg file
+    {
+        var e = new Enc(lr, chans, rate, SnrDb[quality], CutHz[quality]);
+        for (int b = 0; b <= e.K; b++) e.Block(b, null);   // first pass: what each table will have to code
+        e.BuildBooks();
+        var ogg = new Ogg();
+        ogg.Packet(e.Ident(), 0); ogg.Flush(false);
+        ogg.Packet(e.Comment(), 0); ogg.Packet(e.Setup(), 0); ogg.Flush(false);
+        for (int b = 0; b <= e.K; b++)
+        {
+            var w = new Bits(); e.Block(b, w); bool last = b == e.K;
+            ogg.Packet(w.Done(), last ? e.Frames : (long)b * M);
+            if (last) ogg.Flush(true); else if (ogg.Pending > 4000) ogg.Flush(false);
+        }
+        return ogg.Bytes();
+    }
+}
+
 static class MediaFoundation
 {
     [DllImport("mfplat.dll", ExactSpelling = true)] static extern int MFStartup(int version, int flags);
@@ -3256,7 +3576,7 @@ class MainForm : Form
         exportBtn = Btn(bar, "Export…", (s, e) =>
         {
             var m = new ContextMenuStrip();
-            m.Items.Add("Audio (WAV, FLAC, MP3)…", null, (s2, e2) => ExportAudio());
+            m.Items.Add("Audio (WAV, FLAC, MP3, OGG)…", null, (s2, e2) => ExportAudio());
             m.Items.Add("MIDI file (.mid)…", null, (s2, e2) => ExportMidi());
             m.Show(exportBtn, 0, exportBtn.Height);
         });
@@ -3921,8 +4241,8 @@ class MainForm : Form
     }
 
     // ---- audio export, like FL's render window: format and quality, plus optional stems (each mixer insert as its own file)
-    static readonly string[] Formats = { "WAV", "FLAC (lossless, about half the size)", "MP3" }, Exts = { ".wav", ".flac", ".mp3" };
-    static string[] Qualities(int f) { return f == 0 ? new[] { "16-bit", "24-bit", "32-bit float" } : f == 1 ? new[] { "16-bit", "24-bit" } : new[] { "128 kbps", "192 kbps", "256 kbps", "320 kbps" }; }
+    static readonly string[] Formats = { "WAV", "FLAC (lossless, about half the size)", "MP3", "OGG Vorbis" }, Exts = { ".wav", ".flac", ".mp3", ".ogg" };
+    static string[] Qualities(int f) { return f == 0 ? new[] { "16-bit", "24-bit", "32-bit float" } : f == 1 ? new[] { "16-bit", "24-bit" } : f == 2 ? new[] { "128 kbps", "192 kbps", "256 kbps", "320 kbps" } : new[] { "Low", "Medium", "High", "Very high" }; }
     static int exportFormat, exportQuality; static bool exportStems;   // remembered while MiniDAW runs
 
     bool AskExport()
@@ -3933,7 +4253,7 @@ class MainForm : Form
             f.HandleCreated += (s, e) => DarkTitle(f.Handle);
             var fmt = new DarkCombo { Left = 92, Top = 14, Width = 272 }; var q = new DarkCombo { Left = 92, Top = 46, Width = 272 };
             fmt.Items.AddRange(Formats);
-            fmt.SelectedIndexChanged += (s, e) => { q.Items.Clear(); q.Items.AddRange(Qualities(fmt.SelectedIndex)); q.SelectedIndex = fmt.SelectedIndex == 2 ? 3 : 0; };
+            fmt.SelectedIndexChanged += (s, e) => { q.Items.Clear(); q.Items.AddRange(Qualities(fmt.SelectedIndex)); q.SelectedIndex = fmt.SelectedIndex == 2 ? 3 : fmt.SelectedIndex == 3 ? 2 : 0; };
             fmt.SelectedIndex = exportFormat; q.SelectedIndex = Math.Min(exportQuality, q.Items.Count - 1);
             var stems = new CheckBox { Text = "Also save each mixer insert as its own file (stems)", Left = 14, Top = 82, AutoSize = true, Checked = exportStems };
             var what = new Label { Text = (eng.SongMode ? "Exports the whole song (Song mode), " : "Exports the current pattern (Pattern mode), ") + (Engine.SR / 1000.0).ToString("0.#", CultureInfo.InvariantCulture) + " kHz stereo" + (Engine.SR > 48000 ? " (MP3: 48 kHz)." : "."), Left = 14, Top = 108, AutoSize = true, ForeColor = Dim };
@@ -3981,6 +4301,7 @@ class MainForm : Form
     {
         if (format == 0) File.WriteAllBytes(path, Wav.Make(lr, Engine.SR, 2, new[] { 16, 24, 32 }[quality]));
         else if (format == 1) File.WriteAllBytes(path, Flac.Encode(lr, Engine.SR, new[] { 16, 24 }[quality]));
+        else if (format == 3) File.WriteAllBytes(path, Vorbis.Encode(lr, 2, Engine.SR, quality));
         else MediaFoundation.Mp3(path, Engine.SR > 48000 ? Wav.Halve(lr) : lr, Engine.SR > 48000 ? Engine.SR / 2 : Engine.SR, new[] { 128, 192, 256, 320 }[quality]);   // MP3 tops out at 48 kHz
     }
 
@@ -6697,6 +7018,23 @@ class MainForm : Form
                 check(before == 0 && during > 0.2 && after < 1e-4 && Math.Abs(atStep17 / expectAt - 1) < 0.1 && midBuf.Max(x => Math.Abs(x)) > 0.1
                       && sb2.Clips.Count == 1 && sb2.Clips[0].Channel == 4 && sb2.Clips[0].Offset == 4 && sv2.Clips.Count == 0,
                     "audio clips: one at bar 2 trimmed 4 16ths in plays only its 8 16ths, from the right place in the audio (" + atStep17.ToString("0.00") + " vs " + expectAt.ToString("0.00") + "); playback starting inside it plays it from there; it saves, and goes with its channel");
+            }
+            {   // OGG Vorbis: the fast transform matches its definition; the pages carry valid checksums, the three headers, and the exact length at the end
+                var rnd = new Random(7); var xin = Enumerable.Range(0, 2048).Select(k => rnd.NextDouble() * 2 - 1).ToArray(); var fast = new double[1024]; Vorbis.Mdct(xin, fast); double worst = 0;
+                for (int k = 0; k < 1024; k += 37) { double d = 0; for (int n = 0; n < 2048; n++) d += xin[n] * Math.Cos(2 * Math.PI / 2048 * (n + 0.5 + 512) * (k + 0.5)); worst = Math.Max(worst, Math.Abs(d * 4 / 2048 - fast[k])); }
+                int frames = 50000; var oggIn = new float[frames * 2]; for (int k = 0; k < frames; k++) { oggIn[2 * k] = (float)(0.5 * Math.Sin(k * 0.06)); oggIn[2 * k + 1] = (float)(0.3 * Math.Sin(k * 0.09)); }
+                var ogg = Vorbis.Encode(oggIn, 2, 44100, 2); int at = 0, pages = 0, packets = 0; bool crcOk = true, bos = false, eos = false; long lastGranule = 0; string first = "";
+                var crcT = Enumerable.Range(0, 256).Select(i => { uint cr = (uint)i << 24; for (int b = 0; b < 8; b++) cr = (cr & 0x80000000) != 0 ? (cr << 1) ^ 0x04C11DB7 : cr << 1; return cr; }).ToArray();
+                while (at + 27 <= ogg.Length && Encoding.ASCII.GetString(ogg, at, 4) == "OggS")
+                {
+                    int segs = ogg[at + 26], plen = 27 + segs; for (int k = 0; k < segs; k++) { plen += ogg[at + 27 + k]; if (ogg[at + 27 + k] < 255) packets++; }
+                    var page = new byte[plen]; Array.Copy(ogg, at, page, 0, plen); uint want = BitConverter.ToUInt32(page, 22); for (int k = 22; k < 26; k++) page[k] = 0;
+                    uint crc = 0; foreach (byte x in page) crc = (crc << 8) ^ crcT[((crc >> 24) ^ x) & 0xff]; crcOk &= crc == want;
+                    if (pages == 0) { bos = (ogg[at + 5] & 2) != 0; first = Encoding.ASCII.GetString(ogg, at + 27 + segs + 1, 6); }
+                    eos = (ogg[at + 5] & 4) != 0; lastGranule = BitConverter.ToInt64(ogg, at + 6); at += plen; pages++;
+                }
+                check(worst < 1e-9 && at == ogg.Length && crcOk && bos && eos && first == "vorbis" && lastGranule == frames && packets == 3 + (frames + 1023) / 1024 + 1,
+                    "OGG Vorbis: the fast MDCT matches the formula (off by " + worst.ToString("0e0") + "); " + pages + " pages with good checksums, the 3 headers and " + (packets - 3) + " audio packets, ending at exactly " + lastGranule + " frames (" + ogg.Length / 1024 + " KB)");
             }
             {   // 48 and 96 kHz: a 44.1 kHz sample keeps its pitch; MP3's half-rate copy keeps 1 kHz and drops 40 kHz (which would fold to 8 kHz); the audio settings file round-trips
                 int keepSr = Engine.SR; string keepFile = AudioSettings.FilePath, keepB = AudioSettings.Backend, keepA = AudioSettings.Asio; int keepR = AudioSettings.Rate;

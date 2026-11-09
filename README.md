@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 153 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 154 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -241,13 +241,14 @@ The menu offers:
 
 ## Export
 
-**Export… → Audio (WAV, FLAC, MP3)…** saves what Play would play: the whole arrangement plus its reverb/delay tail in **Song** mode, or the current pattern once in **Pattern** mode. A small window asks for:
+**Export… → Audio (WAV, FLAC, MP3, OGG)…** saves what Play would play: the whole arrangement plus its reverb/delay tail in **Song** mode, or the current pattern once in **Pattern** mode. A small window asks for:
 
 | Format | Quality | Notes |
 |---|---|---|
 | WAV | 16-bit, 24-bit, 32-bit float | 32-bit float keeps peaks above full scale |
 | FLAC | 16-bit, 24-bit | Lossless: sounds exactly like the WAV at roughly half the size. MiniDAW encodes it itself |
 | MP3 | 128, 192, 256, 320 kbps | Uses the MP3 encoder built into Windows (on Windows "N" editions, install the Media Feature Pack) |
+| OGG Vorbis | Low, Medium, High, Very high | Windows has no Vorbis encoder, so MiniDAW has its own simple one. The bitrate follows the music: for a busy song roughly 110, 170, 210 and 240 kbps. Low keeps sound up to 15 kHz, Very high up to 20 kHz. Its files are bigger than other Vorbis encoders make at the same quality, and they play anywhere Vorbis does |
 
 Files are stereo at the sample rate you play at (see **Audio output** below), so 44.1, 48 or 96 kHz. MP3 can't go above 48 kHz, so a 96 kHz project's MP3 is filtered down to 48 kHz first. Tick **stems** to also save every mixer insert that carries sound as its own file next to the main one, named like `song - Insert 2 (Snare).flac`. Each stem is that insert's output after its effects and fader, and all of them line up with the main file, so you can mix them elsewhere.
 
