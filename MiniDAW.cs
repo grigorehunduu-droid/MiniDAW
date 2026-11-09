@@ -46,9 +46,49 @@ class Channel
     public static readonly double[] ArpTimes = { 0.5, 1, 2, 4 };                  // in 16ths: 1/32, 1/16, 1/8, 1/4
     public static readonly string[] ArpDirs = { "off", "up", "down", "up & down", "random" }, ArpTimeNames = { "1/32", "1/16", "1/8", "1/4" };
     public float[] Sample, SampleR; public int SampleRate = 44100;   // SampleR: the right side of a stereo sample (null = mono)
-    public static readonly string[] Kinds = { "kick", "snare", "hat", "synth", "sample", "square", "pluck", "pad", "bass", "keys", "clap" };
-    public static readonly string[] Sounds = { "synth", "square", "pluck", "pad", "bass", "keys", "kick", "snare", "hat", "clap" };   // built-in sounds, in menu order
-    static readonly string[] Titles = { "Saw lead", "Square lead", "Pluck", "Pad", "Bass", "Electric piano", "Kick", "Snare", "Hat", "Clap" };
+    public static readonly string[] Kinds = { "kick", "snare", "hat", "synth", "sample", "square", "pluck", "pad", "bass", "keys", "clap", "analog" };
+    public static readonly string[] Sounds = { "analog", "synth", "square", "pluck", "pad", "bass", "keys", "kick", "snare", "hat", "clap" };   // built-in sounds, in menu order
+    static readonly string[] Titles = { "Analog synth", "Saw lead", "Square lead", "Pluck", "Pad", "Bass", "Electric piano", "Kick", "Snare", "Hat", "Clap" };
+
+    // Sampler options (Kind "sample"): loop between two points while the note is held, play backwards, time-stretch (longer or
+    // shorter at the same pitch), and slices (notes from C5 up play slice 1, 2, … like FL's Slicex).
+    public bool Loop, Reverse;
+    public float LoopStart, LoopEnd = 1, Stretch = 1;   // loop points as fractions of the sample; Stretch 0.5 .. 2 = half .. twice as long
+    public int[] Slices;                                // sample positions where slices start (the first at 0); null = no slicing
+
+    // Analog synth (Kind "analog"), after FL's 3xOsc and friends: 3 oscillators with unison, a filter with its own envelope, an
+    // amp envelope and an LFO. All settings 0..1; null = the first preset. Automation lanes reach them as Param LaneSyn + i.
+    public float[] Syn;
+    public const int LaneSyn = 6;
+    public static readonly string[] SynNames = { "Osc 1 wave", "Osc 1 octave", "Osc 1 level", "Osc 2 wave", "Osc 2 semitones", "Osc 2 detune", "Osc 2 level", "Osc 3 wave", "Osc 3 octave", "Osc 3 level",
+        "Filter type", "Cutoff", "Resonance", "Filter envelope", "Amp attack", "Amp decay", "Amp sustain", "Amp release", "Filter attack", "Filter decay", "Filter sustain", "Filter release",
+        "LFO rate", "LFO amount", "LFO target", "Unison voices", "Unison spread", "Volume" };
+    public static readonly string[] Waves = { "sine", "saw", "square", "triangle", "noise" }, FilterTypes = { "low-pass", "band-pass", "high-pass" }, LfoTargets = { "pitch", "filter", "volume", "pan" };
+    public static readonly string[] PresetNames = { "Bright saw lead", "Warm pad", "Sub bass", "Pluck", "Wobble bass", "Supersaw chords" };
+    public static readonly float[][] SynPresets = {
+        new[] { .25f, .5f, .8f, .25f, .5f, .57f, .6f, .45f, .25f, .2f, 0f, .62f, .25f, .8f, .05f, .4f, .8f, .25f, .02f, .35f, .3f, .3f, .6f, 0f, 0f, .17f, .3f, .6f },
+        new[] { .25f, .5f, .7f, .25f, .5f, .62f, .7f, .65f, .75f, .3f, 0f, .5f, .1f, .6f, .6f, .5f, .85f, .6f, .6f, .6f, .6f, .6f, .3f, .15f, .3f, .5f, .5f, .55f },
+        new[] { 0f, .25f, 1f, .45f, .5f, .5f, .15f, 0f, .5f, 0f, 0f, .4f, .1f, .55f, .02f, .3f, .9f, .15f, .01f, .25f, .4f, .2f, 0f, 0f, 0f, 0f, 0f, .75f },
+        new[] { .25f, .5f, .8f, .45f, 1f, .5f, .3f, 0f, .5f, 0f, 0f, .35f, .35f, .95f, .01f, .35f, 0f, .3f, 0f, .3f, 0f, .2f, 0f, 0f, 0f, 0f, 0f, .65f },
+        new[] { .25f, .25f, .8f, .45f, .5f, .55f, .7f, 0f, .25f, .5f, 0f, .3f, .6f, .5f, .01f, .3f, 1f, .1f, .01f, .3f, .5f, .2f, .55f, .8f, .3f, 0f, 0f, .6f },
+        new[] { .25f, .5f, .8f, .25f, .5f, .6f, .7f, .25f, .75f, .3f, 0f, .72f, .15f, .6f, .08f, .5f, .75f, .4f, .05f, .5f, .5f, .4f, 0f, 0f, 0f, 1f, .55f, .45f } };
+    public float S(int i) { return (Syn ?? SynPresets[0])[i]; }
+
+    public string SynLabel(int i)   // a synth setting with its value in words
+    {
+        float v = S(i);
+        string val = i == 0 || i == 3 || i == 7 ? Waves[Wave(v)] : i == 1 || i == 8 ? Signed(Oct(v)) + " oct" : i == 4 ? Signed(Semis(v)) + " st" : i == 5 ? Signed((int)Math.Round((v - .5f) * 100)) + " cents"
+            : i == 10 ? FilterTypes[Math.Min(2, (int)(v * 3))] : i == 11 ? (int)Math.Round(CutHz(v)) + " Hz" : i == 13 ? Signed((int)Math.Round((v - .5f) * 200)) + "%"
+            : i >= 14 && i <= 21 && i != 16 && i != 20 ? Secs((int)(EnvSec(v) * Engine.SR)) : i == 22 ? (0.05 * Math.Pow(200, v)).ToString("0.00", CultureInfo.InvariantCulture) + " Hz"
+            : i == 24 ? LfoTargets[Math.Min(3, (int)(v * 4))] : i == 25 ? (1 + (int)Math.Round(v * 6)).ToString() : (int)Math.Round(v * 100) + "%";
+        return SynNames[i] + "  " + val;
+    }
+    static string Signed(int x) { return (x > 0 ? "+" : "") + x; }
+    public static int Wave(float v) { return Math.Min(4, (int)(v * 5)); }
+    public static int Oct(float v) { return (int)Math.Round(v * 4) - 2; }
+    public static int Semis(float v) { return (int)Math.Round(v * 24) - 12; }
+    public static double CutHz(float v) { return 20 * Math.Pow(1000, v); }
+    public static double EnvSec(float v) { return 0.001 + 4 * v * v * v; }
     public static string Title(string kind) { int i = Array.IndexOf(Sounds, kind); return i < 0 ? "Sample" : Titles[i]; }
 
     // Sound settings, all 0..1: attack, release, tone (decay for drums), pitch. null = the sound's built-in settings.
@@ -67,7 +107,7 @@ class Channel
     }
 
     public float K(int i) { return (Knob ?? builtIn[Kind])[i]; }
-    public Channel Copy() { var c = (Channel)MemberwiseClone(); if (Knob != null) c.Knob = (float[])Knob.Clone(); return c; }   // sample data stays shared
+    public Channel Copy() { var c = (Channel)MemberwiseClone(); if (Knob != null) c.Knob = (float[])Knob.Clone(); if (Syn != null) c.Syn = (float[])Syn.Clone(); return c; }   // sample data stays shared
     public int AttackSamples() { double k = K(KAttack); return Math.Max(1, (int)Math.Round(2 * k * k * k * Engine.SR)); }                 // 0 .. 2 s
     public int ReleaseSamples() { double k = K(KRelease); return Math.Max(1, (int)Math.Round((0.005 + 3 * k * k * k) * Engine.SR)); }   // 5 ms .. 3 s
     public double Bright() { double k = K(KTone); return k < 0.5 ? 0.25 + 1.5 * k : 1 + 6 * (k - 0.5); }   // tone or decay: 0.25x .. 4x, 1x in the middle
@@ -76,7 +116,7 @@ class Channel
 
     public int[] KnobsShown()   // the settings that mean something for this sound
     {
-        if (Kind == "sample") return new[] { KPitch };
+        if (Kind == "sample" || Kind == "analog") return new[] { KPitch };
         if (Kind == "hat" || Kind == "clap") return new[] { KTone };
         if (IsDrum) return new[] { KTone, KPitch };
         return new[] { KAttack, KRelease, KTone, KPitch };
@@ -221,7 +261,7 @@ class Lane
         {
             if (Ch >= p.Channels.Count) return 0.5f;
             var ch = p.Channels[Ch];
-            return Param == Channel.LaneVol ? ch.Vol : Param == Channel.LanePan ? (ch.Pan + 1) / 2 : ch.K(Param);
+            return Param == Channel.LaneVol ? ch.Vol : Param == Channel.LanePan ? (ch.Pan + 1) / 2 : Param >= Channel.LaneSyn ? ch.S(Param - Channel.LaneSyn) : ch.K(Param);
         }
         var ins = p.Mixer[Ins];
         if (Slot < 0) return Param == 0 ? ins.Vol : Param == 1 ? (ins.Pan + 1) / 2 : ins.SendLevel;
@@ -238,6 +278,7 @@ class Lane
             var c = p.Channels[Ch];
             if (Param == Channel.LaneVol) { c.Vol = v; return; }
             if (Param == Channel.LanePan) { c.Pan = v * 2 - 1; return; }
+            if (Param >= Channel.LaneSyn) { var sy = (float[])(c.Syn ?? Channel.SynPresets[0]).Clone(); sy[Param - Channel.LaneSyn] = v; c.Syn = sy; return; }   // a whole new array: never half-written
             var k = c.Knob ?? (float[])Channel.BuiltIn(c.Kind).Clone();   // fill the array before publishing it, so no one sees a half-made one
             k[Param] = v; c.Knob = k;
             return;
@@ -254,7 +295,7 @@ class Lane
         {
             if (Ch >= p.Channels.Count) return "missing channel";
             var c = p.Channels[Ch];
-            return c.Name + " · " + new[] { "Attack", "Release", c.IsDrum ? "Decay" : "Tone", "Pitch", "Volume", "Pan" }[Param];
+            return c.Name + " · " + (Param >= Channel.LaneSyn ? Channel.SynNames[Param - Channel.LaneSyn] : new[] { "Attack", "Release", c.IsDrum ? "Decay" : "Tone", "Pitch", "Volume", "Pan" }[Param]);
         }
         string where = Ins == 0 ? "Master" : "Insert " + Ins;
         if (Slot < 0) return where + " · " + new[] { "Volume", "Pan", "Send" }[Param];
@@ -953,7 +994,9 @@ class Project
         var w = new List<string> { "MINIDAW\t1", "bpm\t" + Bpm, "swing\t" + Swing.ToString("R") };
         foreach (var c in Channels)
             w.Add(string.Join("\t", "ch", c.Kind, c.Vol.ToString("R"), c.Pan.ToString("R"), c.Mute ? "1" : "0", Clean(c.Name), c.SamplePath ?? "", c.Insert,
-                              string.Join("\t", Enumerable.Range(0, 4).Select(i => c.K(i).ToString("R"))), c.Color, Clean(c.Group ?? ""), c.ArpDir, c.ArpRange, c.ArpTime, c.ArpGate.ToString("R"), c.Glide.ToString("R")));
+                              string.Join("\t", Enumerable.Range(0, 4).Select(i => c.K(i).ToString("R"))), c.Color, Clean(c.Group ?? ""), c.ArpDir, c.ArpRange, c.ArpTime, c.ArpGate.ToString("R"), c.Glide.ToString("R"),
+                              c.Loop ? "1" : "0", c.Reverse ? "1" : "0", c.LoopStart.ToString("R"), c.LoopEnd.ToString("R"), c.Stretch.ToString("R"),
+                              c.Slices == null ? "" : string.Join(",", c.Slices), c.Syn == null ? "" : string.Join(",", c.Syn.Select(v => v.ToString("R")))));
         for (int i = 0; i < Inserts; i++)
         {
             var m = Mixer[i];
@@ -1040,6 +1083,12 @@ class Project
                     c.ArpDir = Int(f[14], 0, Channel.ArpDirs.Length - 1); c.ArpRange = Int(f[15], 1, 4); c.ArpTime = Int(f[16], 0, Channel.ArpTimes.Length - 1); c.ArpGate = Num(f[17], 0.05f, 1);
                 }
                 if (f.Length > 18) c.Glide = Num(f[18], 0, 1);
+                if (f.Length > 25)   // older files: no sampler options or analog synth settings
+                {
+                    c.Loop = f[19] == "1"; c.Reverse = f[20] == "1"; c.LoopStart = Num(f[21], 0, 1); c.LoopEnd = Num(f[22], 0, 1); c.Stretch = Num(f[23], 0.5f, 2);
+                    c.Slices = f[24] == "" ? null : f[24].Split(',').Select(x => Int(x, 0, int.MaxValue)).ToArray();
+                    if (f[25] != "") { var sy = f[25].Split(',').Select(x => Num(x, 0, 1)).ToArray(); if (sy.Length != Channel.SynNames.Length) throw new InvalidDataException("Bad synth settings on line " + (li + 1)); c.Syn = sy; }
+                }
                 var mem = c.Kind == "sample" && c.SamplePath != null && samplesFrom != null ? samplesFrom.Channels.Find(x => x.SamplePath == c.SamplePath && x.Sample != null) : null;
                 if (mem != null) { c.Sample = mem.Sample; c.SampleR = mem.SampleR; c.SampleRate = mem.SampleRate; }   // arrays are never modified, so sharing is safe
                 else if (c.Kind == "sample" && c.SamplePath != null)
@@ -1120,7 +1169,7 @@ class Project
             else if (f[0] == "link")
             {
                 if (f.Length < 7) throw new InvalidDataException("Bad MIDI link on line " + (li + 1));
-                p.Links.Add(new Link { Cc = Int(f[1], 0, 127), Target = new Lane { Tempo = f[2] == "1", Ch = Int(f[3], -1, int.MaxValue), Ins = Int(f[4], 0, Inserts - 1), Slot = Int(f[5], -1, Insert.SlotCount - 1), Param = Int(f[6], 0, 16) } });
+                p.Links.Add(new Link { Cc = Int(f[1], 0, 127), Target = new Lane { Tempo = f[2] == "1", Ch = Int(f[3], -1, int.MaxValue), Ins = Int(f[4], 0, Inserts - 1), Slot = Int(f[5], -1, Insert.SlotCount - 1), Param = Int(f[6], 0, Channel.LaneSyn + Channel.SynNames.Length - 1) } });
             }
             else if (f[0] == "track")
             {
@@ -1153,7 +1202,7 @@ class Project
             {
                 var l = new Lane();
                 if (f.Length != 3 + l.Values.Length) throw new InvalidDataException("Bad automation lane on line " + (li + 1));
-                l.Ch = Int(f[1], 0, p.Channels.Count - 1); l.Param = Int(f[2], 0, Channel.LanePan);
+                l.Ch = Int(f[1], 0, p.Channels.Count - 1); l.Param = Int(f[2], 0, Channel.LaneSyn + Channel.SynNames.Length - 1);
                 for (int k = 0; k < l.Values.Length; k++) l.Values[k] = Num(f[3 + k], 0, 1);
                 p.Automation.Add(l);
             }
@@ -1553,7 +1602,7 @@ static class Midi
 {
     const int Ppq = 96, PerStep = Ppq / 4;   // ticks per quarter note, and per 16th
     static readonly Dictionary<string, int> DrumNote = new Dictionary<string, int> { { "kick", 36 }, { "snare", 38 }, { "hat", 42 }, { "clap", 39 } };
-    static readonly Dictionary<string, int> Program = new Dictionary<string, int> { { "synth", 81 }, { "square", 80 }, { "pluck", 24 }, { "pad", 89 }, { "bass", 38 }, { "keys", 4 }, { "sample", 0 } };   // GM, 0-based
+    static readonly Dictionary<string, int> Program = new Dictionary<string, int> { { "synth", 81 }, { "square", 80 }, { "pluck", 24 }, { "pad", 89 }, { "bass", 38 }, { "keys", 4 }, { "sample", 0 }, { "analog", 81 } };   // GM, 0-based
 
     public static byte[] Export(Project p, bool song, int pattern)
     {
@@ -1769,7 +1818,7 @@ class Engine
     public const int SR = 44100;
     const int Frames = 1024, NBuf = 4, MaxVoices = 64;   // ~93 ms of buffered output
 
-    public class Voice { public Channel Ch; public int Key, Age, Len, Wait, GlideAge, GlideLen; public float Gain = 1, NotePan; public double Phase, Pos, Rate, Z1, Z2, Detune = 1, Shift, ShiftFrom, ShiftTo; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Shift: semitones it's currently bent by (slides, glide), moving from ShiftFrom to ShiftTo over GlideLen samples   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; NotePan/Detune: the note's own pan and fine pitch; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)
+    public class Voice { public double[] Ph; public double Z3; public Channel Ch; public int Key, Age, Len, Wait, GlideAge, GlideLen; public float Gain = 1, NotePan; public double Phase, Pos, Rate, Z1, Z2, Detune = 1, Shift, ShiftFrom, ShiftTo; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Shift: semitones it's currently bent by (slides, glide), moving from ShiftFrom to ShiftTo over GlideLen samples   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; NotePan/Detune: the note's own pan and fine pitch; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)
 
     // Arpeggiator: a channel's held notes (from patterns, or keys held on a keyboard) play one at a time on a clock instead of together.
     class Held { public int Key, Vel, Fine; public float Pan; public long End; public bool Live; }
@@ -2181,24 +2230,126 @@ class Engine
                 v.Pos = q;
                 return (float)(o * 0.35 * Env(v, c.AttackSamples(), c.ReleaseSamples()));
             }
-            case "sample":
-            {
-                var smp = c.Sample;
-                int i = (int)v.Pos;
-                if (smp == null || i + 1 >= smp.Length) { v.Done = true; return 0; }
-                if (v.Rate == 0) v.Rate = c.SampleRate / (double)SR * Math.Pow(2, (v.Key - 60 + c.Semitones()) / 12.0) * v.Detune;   // key 60 = original pitch
-                float s = (float)(smp[i] + (smp[i + 1] - smp[i]) * (v.Pos - i));
-                var right = c.SampleR;   // stereo: the right side goes out through v.Right
-                v.Stereo = right != null && i + 1 < right.Length;
-                if (v.Stereo) v.Right = (float)(right[i] + (right[i + 1] - right[i]) * (v.Pos - i));
-                v.Pos += v.Rate * br;
-                return s;
-            }
+            case "sample": return Sampler(v, c, br);
+            case "analog": return Analog(v, c, br, t);
         }
         v.Done = true;
         return 0;
     }
 
+    // ---- sampler: one-shot by default; loop, reverse, time-stretch and slices on request
+    static float Read(float[] a, double i) { int k = (int)i; if (k < 0 || k + 1 >= a.Length) return 0; return (float)(a[k] + (a[k + 1] - a[k]) * (i - k)); }
+
+    float Sampler(Voice v, Channel c, double br)   // runs per sample: no allocations
+    {
+        var smp = c.Sample;
+        if (smp == null) { v.Done = true; return 0; }
+        int start = 0, end = smp.Length; var sl = c.Slices;
+        if (sl != null)   // a slice: C5 plays the first, C#5 the second…
+        {
+            int si = v.Key - 60;
+            if (si < 0 || si >= sl.Length) { v.Done = true; return 0; }
+            start = Math.Min(sl[si], smp.Length - 1); end = si + 1 < sl.Length ? Math.Min(sl[si + 1], smp.Length) : smp.Length;
+        }
+        if (v.Rate == 0) v.Rate = c.SampleRate / (double)SR * Math.Pow(2, ((sl != null ? 0 : v.Key - 60) + c.Semitones()) / 12.0) * v.Detune;   // key 60 (C5) = original pitch
+        double pitch = v.Rate * br, len = end - start, lo = c.Loop ? c.LoopStart * len : 0, hi = c.Loop ? Math.Max(lo + 64, c.LoopEnd * len) : len;
+        if (c.Loop && v.Age > v.Len + SR / 30) { v.Done = true; return 0; }   // a looped note fades out over 30 ms after it ends
+        double gain = c.Loop && v.Age > v.Len ? 1 - (v.Age - v.Len) / (SR / 30.0) : 1;
+        var right = c.SampleR; v.Stereo = right != null;
+        float l, r;
+        if (!c.Loop && v.Pos >= len - 1) { v.Done = true; return 0; }
+        if (Math.Abs(c.Stretch - 1) < 1e-3)   // plain playback
+        {
+            l = SampleAt(smp, c, v.Pos, start, end, len, lo, hi); r = v.Stereo ? SampleAt(right, c, v.Pos, start, end, len, lo, hi) : l;
+            v.Pos += pitch;
+        }
+        else   // time-stretch: two overlapping 50 ms grains read at the note's pitch, while where they start moves Stretch times slower
+        {
+            const int G = SR / 20;
+            l = r = 0;
+            for (int j = 0; j < 2; j++)
+            {
+                int age = (v.Age + j * G / 2) % G;
+                if (age == 0) { if (j == 0) v.Z1 = v.Pos; else v.Z2 = v.Pos; }   // a new grain starts where the stretched timeline is now
+                double from = j == 0 ? v.Z1 : v.Z2, w = 0.5 - 0.5 * Math.Cos(2 * Math.PI * age / G), x = from + age * pitch;
+                float sl2 = SampleAt(smp, c, x, start, end, len, lo, hi);
+                l += (float)(sl2 * w); r += (float)((v.Stereo ? SampleAt(right, c, x, start, end, len, lo, hi) : sl2) * w);
+            }
+            v.Pos += pitch / c.Stretch;
+        }
+        v.Right = (float)(r * gain);
+        return (float)(l * gain);
+    }
+
+    static float SampleAt(float[] a, Channel c, double x, int start, int end, double len, double lo, double hi)   // x along the (slice of the) sample: looped, reversed
+    {
+        if (c.Loop && x >= hi) x = lo + (x - lo) % (hi - lo);
+        if (x < 0 || x >= len - 1) return 0;
+        return Read(a, c.Reverse ? end - 1 - x : start + x);
+    }
+
+    // ---- analog synth: 3 oscillators (with unison, spread left and right), a state-variable filter swept by its own envelope,
+    // an amp envelope and an LFO. Saw and square are band-limited with PolyBLEP so high notes don't alias. No allocations per sample.
+    static double Blep(double t, double dt) { if (t < dt) { t /= dt; return t + t - t * t - 1; } if (t > 1 - dt) { t = (t - 1) / dt; return t * t + t + t + 1; } return 0; }
+    double Osc(int wave, double ph, double dt)
+    {
+        switch (wave)
+        {
+            case 0: return Math.Sin(2 * Math.PI * ph);
+            case 1: return 2 * ph - 1 - Blep(ph, dt);
+            case 2: return (ph < 0.5 ? 1 : -1) + Blep(ph, dt) - Blep((ph + 0.5) % 1, dt);
+            case 3: return 1 - 4 * Math.Abs(ph - 0.5);
+            default: return Noise();
+        }
+    }
+    static double Adsr(int age, int len, double a, double d, double sus, double rel, out bool done)   // 0..1; the release fades from wherever the note ended
+    {
+        double ta = age / (double)SR, tl = len / (double)SR; done = false;
+        if (ta <= tl) return EnvHeld(ta, a, d, sus);
+        double r = (ta - tl) / rel; if (r >= 1) { done = true; return 0; }
+        return EnvHeld(tl, a, d, sus) * (1 - r);
+    }
+    static double EnvHeld(double t, double a, double d, double sus) { return t < a ? t / a : t < a + d ? 1 - (1 - sus) * (t - a) / d : sus; }
+
+    float Analog(Voice v, Channel c, double br, double t)
+    {
+        var sy = c.Syn ?? Channel.SynPresets[0];
+        int uni = 1 + (int)Math.Round(sy[25] * 6);
+        if (v.Ph == null || v.Ph.Length != 3 * uni) { v.Ph = new double[3 * uni]; for (int k = 0; k < v.Ph.Length; k++) v.Ph[k] = (k * 0.37) % 1; v.Rate = Hz(v.Key + c.Semitones()) * v.Detune; }   // once per note
+        bool done, fdone;
+        double amp = Adsr(v.Age, v.Len, Channel.EnvSec(sy[14]), Channel.EnvSec(sy[15]), sy[16], Channel.EnvSec(sy[17]), out done);
+        if (done) { v.Done = true; return 0; }
+        double fenv = Adsr(v.Age, v.Len, Channel.EnvSec(sy[18]), Channel.EnvSec(sy[19]), sy[20], Channel.EnvSec(sy[21]), out fdone);
+        double lfo = Math.Sin(2 * Math.PI * 0.05 * Math.Pow(200, sy[22]) * t) * sy[23]; int lt = Math.Min(3, (int)(sy[24] * 4));
+        double pitch = v.Rate * br * (lt == 0 ? Math.Pow(2, lfo / 12) : 1);   // LFO on pitch: up to a semitone either way
+        double l = 0, r = 0;
+        for (int o = 0; o < 3; o++)
+        {
+            float lvl = o == 0 ? sy[2] : o == 1 ? sy[6] : sy[9];
+            if (lvl <= 0) continue;
+            int wav = Channel.Wave(o == 0 ? sy[0] : o == 1 ? sy[3] : sy[7]);
+            double mult = o == 0 ? Math.Pow(2, Channel.Oct(sy[1])) : o == 1 ? Math.Pow(2, (Channel.Semis(sy[4]) + (sy[5] - 0.5)) / 12) : Math.Pow(2, Channel.Oct(sy[8]));
+            for (int u = 0; u < uni; u++)
+            {
+                double spread = uni == 1 ? 0 : (u / (double)(uni - 1) * 2 - 1) * sy[26] * 0.5;   // unison: up to ±25 cents; alternate voices lean left and right
+                double dt = pitch * mult * Math.Pow(2, spread / 12) / SR; int k = o * uni + u;
+                v.Ph[k] += dt; if (v.Ph[k] >= 1) v.Ph[k] -= Math.Floor(v.Ph[k]);
+                double x = Osc(wav, v.Ph[k], dt) * lvl;
+                if (uni == 1) { l += x; r += x; } else if (u % 2 == 0) { l += x * 1.4; r += x * 0.6; } else { l += x * 0.6; r += x * 1.4; }
+            }
+        }
+        l /= uni; r /= uni;
+        double cut = Channel.CutHz(sy[11]) * Math.Pow(2, (sy[13] - 0.5) * 2 * 6 * fenv + (lt == 1 ? lfo * 2 : 0));   // filter envelope: up to ±6 octaves; LFO: ±2
+        double g = Math.Tan(Math.PI * Math.Min(cut, 0.45 * SR) / SR), kq = 2 - 1.95 * sy[12], a1 = 1 / (1 + g * (g + kq)), a2 = g * a1, a3 = g * a2;
+        int ft = Math.Min(2, (int)(sy[10] * 3));
+        double v3 = l - v.Z2, v1 = a1 * v.Z1 + a2 * v3, v2 = v.Z2 + a2 * v.Z1 + a3 * v3;   // TPT state-variable filter, left (Z1, Z2) and right (Z3, Pos)
+        v.Z1 = 2 * v1 - v.Z1; v.Z2 = 2 * v2 - v.Z2; l = ft == 0 ? v2 : ft == 1 ? v1 : l - kq * v1 - v2;
+        v3 = r - v.Pos; v1 = a1 * v.Z3 + a2 * v3; v2 = v.Pos + a2 * v.Z3 + a3 * v3;
+        v.Z3 = 2 * v1 - v.Z3; v.Pos = 2 * v2 - v.Pos; r = ft == 0 ? v2 : ft == 1 ? v1 : r - kq * v1 - v2;
+        double vol = amp * sy[27] * 0.5 * (lt == 2 ? 1 - Math.Abs(lfo) * 0.5 : 1), pan = lt == 3 ? lfo : 0;
+        v.Stereo = true; v.Right = (float)(r * vol * Math.Min(1, 1 + pan));
+        return (float)(l * vol * Math.Min(1, 1 - pan));
+    }
     public string Start()
     {
         var fmt = new WAVEFORMATEX { wFormatTag = 1, nChannels = 2, nSamplesPerSec = SR, wBitsPerSample = 16, nBlockAlign = 4, nAvgBytesPerSec = SR * 4 };
@@ -5248,6 +5399,7 @@ class MainForm : Form
             foreach (var kind in Channel.Sounds)
             {
                 var sp4 = new Project(); sp4.Channels.Add(new Channel { Kind = kind, Name = kind, Insert = 1 });
+                if (kind == "analog") { var plain = (float[])Channel.SynPresets[0].Clone(); plain[6] = plain[9] = plain[25] = 0; sp4.Channels[0].Syn = plain; }   // one saw: the preset's detuned 2nd oscillator, sub and unison never repeat exactly
                 var pat4 = new Pattern { Name = "P" }; sp4.Patterns.Add(pat4);
                 pat4.For(0).Add(new Note { Step = 0, Key = 69, Len = 16 });   // A4 = 440 Hz, held for the whole bar
                 var a4 = Engine.Bounce(sp4, false, 0);
