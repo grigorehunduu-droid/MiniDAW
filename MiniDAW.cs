@@ -46,7 +46,9 @@ class Channel
     public static readonly double[] ArpTimes = { 0.5, 1, 2, 4 };                  // in 16ths: 1/32, 1/16, 1/8, 1/4
     public static readonly string[] ArpDirs = { "off", "up", "down", "up & down", "random" }, ArpTimeNames = { "1/32", "1/16", "1/8", "1/4" };
     public float[] Sample, SampleR; public int SampleRate = 44100;   // SampleR: the right side of a stereo sample (null = mono)
-    public static readonly string[] Kinds = { "kick", "snare", "hat", "synth", "sample", "square", "pluck", "pad", "bass", "keys", "clap", "analog" };
+    public static readonly string[] Kinds = { "kick", "snare", "hat", "synth", "sample", "square", "pluck", "pad", "bass", "keys", "clap", "analog", "vst" };
+    public string PluginPath, PluginCid, PluginId, PluginState;   // Kind "vst": the .vst3, which class in it, its instance id, and its settings as saved
+    public Vst3 Plugin;                                           // the running instance (null if it couldn't load)
     public static readonly string[] Sounds = { "analog", "synth", "square", "pluck", "pad", "bass", "keys", "kick", "snare", "hat", "clap" };   // built-in sounds, in menu order
     static readonly string[] Titles = { "Analog synth", "Saw lead", "Square lead", "Pluck", "Pad", "Bass", "Electric piano", "Kick", "Snare", "Hat", "Clap" };
 
@@ -110,7 +112,7 @@ class Channel
     public static int Semis(float v) { return (int)Math.Round(v * 24) - 12; }
     public static double CutHz(float v) { return 20 * Math.Pow(1000, v); }
     public static double EnvSec(float v) { return 0.001 + 4 * v * v * v; }
-    public static string Title(string kind) { int i = Array.IndexOf(Sounds, kind); return i < 0 ? "Sample" : Titles[i]; }
+    public static string Title(string kind) { int i = Array.IndexOf(Sounds, kind); return kind == "vst" ? "Plugin" : i < 0 ? "Sample" : Titles[i]; }
 
     // Sound settings, all 0..1: attack, release, tone (decay for drums), pitch. null = the sound's built-in settings.
     public float[] Knob;
@@ -365,12 +367,17 @@ class Effect
     double lfo; float[] peaks;   // modulation phase (chorus, flanger, phaser); the limiter's look-ahead window of peak levels
     readonly double[] apx = new double[12], apy = new double[12];   // phaser: 6 all-pass stages per side
 
+    public const string PluginType = "VST3";   // a plugin in the slot: no settings of ours, the plugin keeps its own
+    public string PluginPath, PluginCid, PluginId, PluginState; public Vst3 Plugin;
+
     public Effect(string type)
     {
-        t = Array.IndexOf(Types, type);
+        t = type == PluginType ? Types.Length : Array.IndexOf(Types, type);
         if (t < 0) throw new InvalidDataException("Unknown effect: " + type);
-        Type = type; P = (float[])Defaults[t].Clone();
+        Type = type; P = t == Types.Length ? new float[0] : (float[])Defaults[t].Clone();
     }
+
+    public string Name { get { return Plugin != null ? Plugin.Name : t == Types.Length ? Path.GetFileNameWithoutExtension(PluginPath ?? "VST3") + " (missing)" : Type; } }
 
     public string ParamName(int i) { return Names[t][i]; }
 
@@ -641,7 +648,8 @@ class Effect
             case 11: Multi(b, n2); break;
             case 12: Beat(b, n2); break;
             case 13: Vocode(b, n2, key); break;
-            default: PitchCorrect(b, n2); break;
+            case 14: PitchCorrect(b, n2); break;
+            default: var pl = Plugin; if (pl != null) pl.Process(b, b, n2 / 2, Playing, Sps > 0 ? 60.0 * Engine.SR / (4 * Sps) : 120, Pos / 4); break;
         }
     }
 
@@ -987,7 +995,11 @@ class Project
             c.Vol = m.Vol; c.Pan = m.Pan; c.Mute = m.Mute; c.ToMaster = m.ToMaster; c.Sidechain = m.Sidechain;
             c.Sends = m.Sends.Select(r => new Route { To = r.To, Level = r.Level }).ToList();   // own copies: send-level lanes drive the copy, not the live mixer
             for (int s = 0; s < Insert.SlotCount; s++)
-                if (m.Slots[s] != null) { c.Slots[s] = new Effect(m.Slots[s].Type); Array.Copy(m.Slots[s].P, c.Slots[s].P, c.Slots[s].P.Length); c.Slots[s].Bypass = m.Slots[s].Bypass; c.Slots[s].Mix = m.Slots[s].Mix; }
+                if (m.Slots[s] != null)
+                {
+                    var o = m.Slots[s]; var d = c.Slots[s] = new Effect(o.Type); Array.Copy(o.P, d.P, d.P.Length); d.Bypass = o.Bypass; d.Mix = o.Mix;
+                    d.Plugin = o.Plugin; d.PluginPath = o.PluginPath; d.PluginCid = o.PluginCid; d.PluginId = o.PluginId; d.PluginState = o.PluginState;   // the same plugin: the live engine is stopped while exporting
+                }
         }
         return p;
     }
@@ -1098,14 +1110,21 @@ class Project
             w.Add(string.Join("\t", "ch", c.Kind, c.Vol.ToString("R"), c.Pan.ToString("R"), c.Mute ? "1" : "0", Clean(c.Name), c.SamplePath ?? "", c.Insert,
                               string.Join("\t", Enumerable.Range(0, 4).Select(i => c.K(i).ToString("R"))), c.Color, Clean(c.Group ?? ""), c.ArpDir, c.ArpRange, c.ArpTime, c.ArpGate.ToString("R"), c.Glide.ToString("R"),
                               c.Loop ? "1" : "0", c.Reverse ? "1" : "0", c.LoopStart.ToString("R"), c.LoopEnd.ToString("R"), c.Stretch.ToString("R"),
-                              c.Slices == null ? "" : string.Join(",", c.Slices), c.Syn == null ? "" : string.Join(",", c.Syn.Select(v => v.ToString("R")))));
+                              c.Slices == null ? "" : string.Join(",", c.Slices), c.Syn == null ? "" : string.Join(",", c.Syn.Select(v => v.ToString("R"))))
+                  + (c.Kind == "vst" ? "\t" + string.Join("\t", c.PluginPath ?? "", c.PluginCid ?? "", c.PluginId ?? "", c.Plugin != null ? c.Plugin.GetState() : c.PluginState ?? "") : ""));   // a plugin: where, which, and its settings
         for (int i = 0; i < Inserts; i++)
         {
             var m = Mixer[i];
             w.Add(string.Join("\t", "ins", i, m.Vol.ToString("R"), m.Pan.ToString("R"), m.Mute ? "1" : "0", m.SendTo, m.SendLevel.ToString("R"), m.Sidechain, m.ToMaster ? "1" : "0",
                               string.Join(",", m.Sends.Skip(1).Select(r => r.To + ":" + r.Level.ToString("R")))));   // the first send in its old place; more sends after
             for (int s = 0; s < Insert.SlotCount; s++)
-                if (m.Slots[s] != null) w.Add(string.Join("\t", "fx", i, s, m.Slots[s].Type, string.Join("\t", m.Slots[s].P.Select(v => v.ToString("R"))), m.Slots[s].Bypass ? "1" : "0", m.Slots[s].Mix.ToString("R")));   // as many settings as the effect has
+                if (m.Slots[s] != null)
+                {
+                    var fx = m.Slots[s]; var fl = new List<string> { "fx", i.ToString(), s.ToString(), fx.Type };
+                    fl.AddRange(fx.P.Select(v => v.ToString("R"))); fl.Add(fx.Bypass ? "1" : "0"); fl.Add(fx.Mix.ToString("R"));   // as many settings as the effect has
+                    if (fx.Type == Effect.PluginType) fl.AddRange(new[] { fx.PluginPath ?? "", fx.PluginCid ?? "", fx.PluginId ?? "", fx.Plugin != null ? fx.Plugin.GetState() : fx.PluginState ?? "" });
+                    w.Add(string.Join("\t", fl));
+                }
         }
         foreach (var pat in Patterns)
         {
@@ -1191,6 +1210,13 @@ class Project
                     c.Slices = f[24] == "" ? null : f[24].Split(',').Select(x => Int(x, 0, int.MaxValue)).ToArray();
                     if (f[25] != "") { var sy = f[25].Split(',').Select(x => Num(x, 0, 1)).ToArray(); if (sy.Length != Channel.SynNames.Length) throw new InvalidDataException("Bad synth settings on line " + (li + 1)); c.Syn = sy; }
                 }
+                if (c.Kind == "vst")
+                {
+                    if (f.Length < 30) throw new InvalidDataException("Bad plugin channel on line " + (li + 1));
+                    c.PluginPath = f[26]; c.PluginCid = f[27]; c.PluginId = f[28]; c.PluginState = f[29]; string err;
+                    c.Plugin = Vst3.Attach(c.PluginId, c.PluginPath, c.PluginCid, c.PluginState, out err);
+                    if (c.Plugin == null) p.Warnings.Add(c.Name + ": " + err);
+                }
                 var mem = c.Kind == "sample" && c.SamplePath != null && samplesFrom != null ? samplesFrom.Channels.Find(x => x.SamplePath == c.SamplePath && x.Sample != null) : null;
                 if (mem != null) { c.Sample = mem.Sample; c.SampleR = mem.SampleR; c.SampleRate = mem.SampleRate; }   // arrays are never modified, so sharing is safe
                 else if (c.Kind == "sample" && c.SamplePath != null)
@@ -1229,6 +1255,13 @@ class Project
                 for (int j = 0; j < np; j++) fx.P[j] = Num(f[4 + j], 0, 1);
                 fx.Bypass = f.Length > 4 + np && f[4 + np] == "1";   // older files have no bypass field: on
                 fx.Mix = f.Length > 5 + np ? Num(f[5 + np], 0, 1) : 1;  // ... and no mix field: fully wet
+                if (fx.Type == Effect.PluginType)
+                {
+                    if (f.Length < 10) throw new InvalidDataException("Bad plugin effect on line " + (li + 1));
+                    fx.PluginPath = f[6]; fx.PluginCid = f[7]; fx.PluginId = f[8]; fx.PluginState = f[9]; string err;
+                    fx.Plugin = Vst3.Attach(fx.PluginId, fx.PluginPath, fx.PluginCid, fx.PluginState, out err);
+                    if (fx.Plugin == null) p.Warnings.Add("Insert " + f[1] + ": " + err);
+                }
                 p.Mixer[Int(f[1], 0, Inserts - 1)].Slots[Int(f[2], 0, Insert.SlotCount - 1)] = fx;
             }
             else if (f[0] == "pat")   // older files have no length: one bar
@@ -2321,6 +2354,7 @@ class Engine
         if (clickBuf == null || clickBuf.Length < n2) clickBuf = new float[n2]; else Array.Clear(clickBuf, 0, n2);
         for (int f = 0; f < frames; f++)
         {
+            curF = f;
             if (playing && countLeft > 0)   // count-in: a bar of beats, accent first, then the song starts on the next 16th
             {
                 if (toNext <= 0) { if (countLeft % 4 == 0) Click(countLeft == Project.Steps); countLeft--; toNext += sps; }
@@ -2353,6 +2387,15 @@ class Engine
                 var bus = ib[(uint)v.Ch.Insert < (uint)ib.Length ? v.Ch.Insert : 0];
                 bus[2 * f] += s * g * Math.Min(1, 1 - pan); bus[2 * f + 1] += (v.Stereo ? v.Right : s) * g * Math.Min(1, 1 + pan);   // pan acts as balance on stereo
             }
+        }
+        plugChans.Clear(); lock (proj) foreach (var c in proj.Channels) if (c.Kind == "vst" && c.Plugin != null) plugChans.Add(c);
+        foreach (var c in plugChans)   // plugin instruments: the block at once, with the notes gathered above
+        {
+            if (plugBuf == null || plugBuf.Length < n2) plugBuf = new float[n2];
+            c.Plugin.Process(null, plugBuf, frames, playing, proj.Bpm, blockPos / 4);
+            if (c.Mute) continue;
+            float gl = c.Vol * Math.Min(1, 1 - c.Pan), gr = c.Vol * Math.Min(1, 1 + c.Pan); var bus = ib[(uint)c.Insert < (uint)ib.Length ? c.Insert : 0];
+            for (int k = 0; k < n2; k += 2) { bus[k] += plugBuf[k] * gl; bus[k + 1] += plugBuf[k + 1] * gr; }
         }
         var master = ib[0];
         blockSps = sps; blockPos0 = blockPos; blockPlaying = playing;   // tempo-synced effects (Beat FX) follow the song
@@ -2409,6 +2452,8 @@ class Engine
     }
 
     double blockSps, blockPos0; bool blockPlaying;   // this block's tempo and song position, for tempo-synced effects
+    int curF;                                                // the frame of the block being rendered: plugin notes start there
+    readonly List<Channel> plugChans = new List<Channel>(); float[] plugBuf;
 
     void Strip(Insert ins, float[] b, int n2, int idx, float[] key)
     {
@@ -2476,7 +2521,16 @@ class Engine
         }
     }
 
-    void AddVoice(Voice v) { if (voices.Count >= MaxVoices) voices.RemoveAt(0); voices.Add(v); }
+    void AddVoice(Voice v)
+    {
+        if (voices.Count >= MaxVoices)
+        {
+            var old = voices[0];
+            if (old.Ch.Kind == "vst" && old.Ch.Plugin != null && old.Age > 0 && !old.Done) old.Ch.Plugin.Note(curF, old.Key, 0, false);   // cut short: its plugin still needs the note-off
+            voices.RemoveAt(0);
+        }
+        voices.Add(v);
+    }
 
     void Click(bool bar) { clickAge = 0; clickHz = bar ? 1600 : 1000; }
 
@@ -2681,6 +2735,13 @@ class Engine
             }
             case "sample": return Sampler(v, c, br);
             case "analog": return Analog(v, c, br, t);
+            case "vst":   // a plugin channel's voice only says when its note starts and ends; the plugin makes the sound
+            {
+                var pl = c.Plugin; if (pl == null) { v.Done = true; return 0; }
+                if (v.Age == 1) pl.Note(curF, v.Key, v.Gain * 100 / 127f, true);
+                if (v.Age > v.Len) { pl.Note(curF, v.Key, 0, false); v.Done = true; }
+                return 0;
+            }
         }
         v.Done = true;
         return 0;
@@ -3303,7 +3364,472 @@ class AsioOut : IOutput
     }
 }
 
+// ---------------------------------------------------------------- VST3 plugins: instruments in the rack, effects in mixer slots
+// A small host written against Steinberg's VST3 interfaces. It loads the module and makes its first audio class. It connects the
+// controller to it and runs it on 32-bit float stereo. Notes go in as events, the editor's knob moves go in as parameter changes,
+// and the editor sits in a window of ours. Our side of the interfaces (host, handler, events, parameters, streams, messages) are
+// native objects made here from delegates. 64-bit plugins only, as MiniDAW runs 64-bit. No latency compensation.
+sealed class Vst3
+{
+    static byte[] Iid(string g) { return new Guid(g).ToByteArray(); }   // VST3 lays its ids out like Windows GUIDs on Windows
+    internal static readonly byte[] IUnknown = Iid("00000000-0000-0000-C000-000000000046"), IComponent = Iid("E831FF31-F2D5-4301-928E-BBEE25697802"),
+        IAudioProcessor = Iid("42043F99-B7DA-453C-A569-E79D9AAEC33D"), IEditController = Iid("DCD7BBE3-7742-448D-A874-AACC979C759E"),
+        IConnectionPoint = Iid("70A4156F-6E6E-4026-9891-48BFAA60D8D1"), IPluginFactory2 = Iid("0007B650-F24B-4C0B-A464-EDB9F00B2ABB"),
+        IPluginFactory3 = Iid("4555A2AB-C123-4E57-9B12-291036878931"), IHostApplication = Iid("58E595CC-DB2D-4969-8B6A-AF8C36A664E5"),
+        IComponentHandler = Iid("93A0BEA3-0BD0-45DB-8E89-0B0CC1E46AC6"), IEventList = Iid("3A2C4214-3463-49FE-B2C4-F397B9695A44"),
+        IParameterChanges = Iid("A4779663-0BB6-4A56-B443-84A8466FEB9D"), IParamValueQueue = Iid("01263A18-ED07-4F6F-98C9-D3564686F9BA"),
+        IBStream = Iid("C3BF6EA2-3099-4752-9B6B-F9901EE33E9B"), IPlugFrame = Iid("367FAF01-AFA9-4693-8D4D-A2A0ED0882A3"),
+        IMessage = Iid("936F033B-C6C0-47DB-BB08-82F813C1E613"), IAttributeList = Iid("1E5F0AEB-CC7F-4533-A254-401138AD5EE4");
+    const int NoInterface = unchecked((int)0x80004002), InvalidArgument = unchecked((int)0x80070057), ResultFalse = 1, MaxBlock = 4096;
+
+    // ---- calling the plugin: its objects are pointers to vtables; methods are called by slot
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int QueryFn(IntPtr self, byte[] iid, out IntPtr obj);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate uint RefFn(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int VoidFn(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int PtrFn(IntPtr self, IntPtr p);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int IndexPtrFn(IntPtr self, int index, IntPtr info);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CreateFn(IntPtr self, byte[] cid, byte[] iid, out IntPtr obj);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int CidFn(IntPtr self, byte[] cid);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int BusCountFn(IntPtr self, int type, int dir);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int BusInfoFn(IntPtr self, int type, int dir, int index, IntPtr info);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int BusActFn(IntPtr self, int type, int dir, int index, byte state);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int ByteFn(IntPtr self, byte state);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int IntFn(IntPtr self, int v);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int ArrangeFn(IntPtr self, ulong[] ins, int nIn, ulong[] outs, int nOut);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int GetArrFn(IntPtr self, int dir, int index, out ulong arr);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate IntPtr ViewFn(IntPtr self, [MarshalAs(UnmanagedType.LPStr)] string name);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int StrFn(IntPtr self, [MarshalAs(UnmanagedType.LPStr)] string s);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int AttachFn(IntPtr self, IntPtr parent, [MarshalAs(UnmanagedType.LPStr)] string type);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate IntPtr FactoryFn();
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] [return: MarshalAs(UnmanagedType.I1)] delegate bool InitDllFn();
+    // ---- our side: the methods of the objects we hand to the plugin
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HQuery(IntPtr self, IntPtr iid, out IntPtr obj);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate uint HRef(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HPtr(IntPtr self, IntPtr p);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HCreate(IntPtr self, IntPtr cid, IntPtr iid, out IntPtr obj);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HId(IntPtr self, uint id);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HEdit(IntPtr self, uint id, double value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HInt(IntPtr self, int v);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HCount(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HIndexPtr(IntPtr self, int index, IntPtr p);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate IntPtr HData(IntPtr self, int index);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate IntPtr HAddData(IntPtr self, IntPtr id, out int index);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate uint HParamId(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HGetPoint(IntPtr self, int index, out int offset, out double value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HAddPoint(IntPtr self, int offset, double value, out int index);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HStreamIO(IntPtr self, IntPtr buf, int n, IntPtr done);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HSeek(IntPtr self, long pos, int mode, IntPtr result);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HResize(IntPtr self, IntPtr view, IntPtr rect);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate IntPtr HGetPtr(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate void HSetStr(IntPtr self, IntPtr s);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HSetInt(IntPtr self, IntPtr id, long v);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HSetPtr(IntPtr self, IntPtr id, IntPtr p);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HGetInt(IntPtr self, IntPtr id, out long v);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HSetFloat(IntPtr self, IntPtr id, double v);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HGetFloat(IntPtr self, IntPtr id, out double v);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HGetString(IntPtr self, IntPtr id, IntPtr buf, uint size);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HSetBinary(IntPtr self, IntPtr id, IntPtr data, uint size);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int HGetBinary(IntPtr self, IntPtr id, out IntPtr data, out uint size);
+
+    [DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryEx(string path, IntPtr file, int flags);
+    [DllImport("kernel32", CharSet = CharSet.Ansi)] static extern IntPtr GetProcAddress(IntPtr module, string name);
+
+    static T Fn<T>(IntPtr obj, int slot) where T : class { return Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(Marshal.ReadIntPtr(obj), slot * IntPtr.Size), typeof(T)) as T; }
+    static IntPtr Query(IntPtr obj, byte[] iid) { IntPtr r; return obj != IntPtr.Zero && Fn<QueryFn>(obj, 0)(obj, iid, out r) == 0 ? r : IntPtr.Zero; }
+    static void Release(IntPtr obj) { if (obj != IntPtr.Zero) Fn<RefFn>(obj, 2)(obj); }
+    static IntPtr AllocZero(int n) { IntPtr p = Marshal.AllocHGlobal(n); Marshal.Copy(new byte[n], 0, p, n); return p; }
+    static void PutDouble(IntPtr p, int at, double v) { Marshal.WriteInt64(p, at, BitConverter.DoubleToInt64Bits(v)); }
+    static bool Same(IntPtr p, byte[] id) { for (int i = 0; i < 16; i++) if (Marshal.ReadByte(p, i) != id[i]) return false; return true; }
+    static string Text(IntPtr p, int max) { var b = new byte[max]; Marshal.Copy(p, b, 0, max); int n = Array.IndexOf(b, (byte)0); return Encoding.UTF8.GetString(b, 0, n < 0 ? max : n); }
+
+    // A native object of ours: a pointer to a vtable of delegates (QueryInterface, AddRef, Release, then the interface's methods).
+    // The plugin may hold it for as long as it likes, so it is never freed; reference counts are not tracked.
+    internal sealed class Native
+    {
+        static readonly List<Native> Live = new List<Native>();
+        public readonly IntPtr Ptr; readonly Delegate[] keep; readonly byte[][] ids;
+        public Native(byte[] iid, params Delegate[] methods)
+        {
+            ids = new[] { iid, IUnknown };
+            var all = new List<Delegate> { (HQuery)QueryMe, (HRef)(self => 2), (HRef)(self => 1) }; all.AddRange(methods); keep = all.ToArray();
+            IntPtr vt = Marshal.AllocHGlobal(IntPtr.Size * keep.Length);
+            for (int i = 0; i < keep.Length; i++) Marshal.WriteIntPtr(vt, i * IntPtr.Size, Marshal.GetFunctionPointerForDelegate(keep[i]));
+            Ptr = Marshal.AllocHGlobal(IntPtr.Size); Marshal.WriteIntPtr(Ptr, vt);
+            lock (Live) Live.Add(this);
+        }
+        int QueryMe(IntPtr self, IntPtr iid, out IntPtr obj)
+        {
+            foreach (var id in ids) if (Same(iid, id)) { obj = self; return 0; }
+            obj = IntPtr.Zero; return NoInterface;
+        }
+    }
+
+    // The host context every plugin gets: our name, and new messages and attribute lists (components and controllers talk with them).
+    internal static readonly Native HostApp = new Native(IHostApplication,
+        (HPtr)((self, name) => { const string n = "MiniDAW\0"; for (int i = 0; i < n.Length; i++) Marshal.WriteInt16(name, i * 2, n[i]); return 0; }),
+        (HCreate)((IntPtr self, IntPtr cid, IntPtr iid, out IntPtr obj) =>
+        {
+            obj = Same(cid, IMessage) ? Message().Ptr : Same(cid, IAttributeList) ? Attributes().Ptr : IntPtr.Zero;
+            return obj == IntPtr.Zero ? NoInterface : 0;
+        }));
+
+    internal static Native Stream(MemoryStream ms)   // an IBStream over memory: how states go in and out
+    {
+        return new Native(IBStream,
+            (HStreamIO)((self, buf, n, done) => { var b = new byte[Math.Max(0, n)]; int got = ms.Read(b, 0, b.Length); Marshal.Copy(b, 0, buf, got); if (done != IntPtr.Zero) Marshal.WriteInt32(done, got); return 0; }),
+            (HStreamIO)((self, buf, n, done) => { var b = new byte[Math.Max(0, n)]; Marshal.Copy(buf, b, 0, b.Length); ms.Write(b, 0, b.Length); if (done != IntPtr.Zero) Marshal.WriteInt32(done, b.Length); return 0; }),
+            (HSeek)((self, pos, mode, result) =>
+            {
+                long to = mode == 0 ? pos : mode == 1 ? ms.Position + pos : ms.Length + pos;
+                if (to < 0) return InvalidArgument;
+                ms.Position = to; if (result != IntPtr.Zero) Marshal.WriteInt64(result, to); return 0;
+            }),
+            (HPtr)((self, pos) => { if (pos != IntPtr.Zero) Marshal.WriteInt64(pos, ms.Position); return 0; }));
+    }
+
+    static Native Message()
+    {
+        IntPtr id = IntPtr.Zero; var attrs = Attributes();
+        return new Native(IMessage,
+            (HGetPtr)(self => id),
+            (HSetStr)((self, s) => { id = Marshal.StringToHGlobalAnsi(s == IntPtr.Zero ? "" : Marshal.PtrToStringAnsi(s)); }),   // a copy: the caller's string may not live on
+            (HGetPtr)(self => attrs.Ptr));
+    }
+
+    static Native Attributes()
+    {
+        var d = new Dictionary<string, object>(); var bins = new Dictionary<string, IntPtr>();
+        Func<IntPtr, string> key = p => p == IntPtr.Zero ? "" : Marshal.PtrToStringAnsi(p);
+        return new Native(IAttributeList,
+            (HSetInt)((self, id, v) => { d[key(id)] = v; return 0; }),
+            (HGetInt)((IntPtr self, IntPtr id, out long v) => { object o; bool ok = d.TryGetValue(key(id), out o) && o is long; v = ok ? (long)o : 0; return ok ? 0 : ResultFalse; }),
+            (HSetFloat)((self, id, v) => { d[key(id)] = v; return 0; }),
+            (HGetFloat)((IntPtr self, IntPtr id, out double v) => { object o; bool ok = d.TryGetValue(key(id), out o) && o is double; v = ok ? (double)o : 0; return ok ? 0 : ResultFalse; }),
+            (HSetPtr)((self, id, s) => { d[key(id)] = s == IntPtr.Zero ? "" : Marshal.PtrToStringUni(s); return 0; }),
+            (HGetString)((self, id, buf, size) =>
+            {
+                object o; if (!d.TryGetValue(key(id), out o) || !(o is string)) return ResultFalse;
+                var s = (string)o; int n = Math.Min(s.Length, (int)size / 2 - 1); if (n < 0) return ResultFalse;
+                for (int i = 0; i < n; i++) Marshal.WriteInt16(buf, i * 2, s[i]); Marshal.WriteInt16(buf, n * 2, 0); return 0;
+            }),
+            (HSetBinary)((self, id, data, size) => { var b = new byte[size]; if (size > 0) Marshal.Copy(data, b, 0, (int)size); d[key(id)] = b; return 0; }),
+            (HGetBinary)((IntPtr self, IntPtr id, out IntPtr data, out uint size) =>
+            {
+                object o; string k = key(id); data = IntPtr.Zero; size = 0;
+                if (!d.TryGetValue(k, out o) || !(o is byte[])) return ResultFalse;
+                var b = (byte[])o; IntPtr old; if (bins.TryGetValue(k, out old)) Marshal.FreeHGlobal(old);
+                data = bins[k] = Marshal.AllocHGlobal(Math.Max(1, b.Length)); Marshal.Copy(b, 0, data, b.Length); size = (uint)b.Length; return 0;   // stays valid while the list lives
+            }));
+    }
+
+    // ---- one plugin instance
+    public string Name = "", Cid = "", FilePath; public bool IsInstrument;
+    IntPtr module, factory, comp, proc, ctrl, compCP, ctrlCP, inBufs, outBufs, data, context;
+    bool inited, ctrlSeparate, active, processing, hasEvents;
+    int nIn, nOut; int[] inCh, outCh; IntPtr[][] inPtr, outPtr;
+    PtrFn processFn;   // looked up once: the audio thread calls it every block
+    readonly Native handler, events, changes; readonly Native[] queues = new Native[64];
+    readonly int[] evKey = new int[512], evAt = new int[512]; readonly float[] evVel = new float[512]; readonly bool[] evOn = new bool[512]; int evCount;
+    readonly ConcurrentQueue<KeyValuePair<uint, double>> edits = new ConcurrentQueue<KeyValuePair<uint, double>>();   // knob moves in the editor
+    readonly uint[] pid = new uint[64]; readonly double[] pval = new double[64]; int pCount;
+    readonly float[] left = new float[MaxBlock], right = new float[MaxBlock], one = new float[1];
+    Form editor;
+
+    Vst3()
+    {
+        handler = new Native(IComponentHandler, (HId)((self, id) => 0), (HEdit)((self, id, v) => { edits.Enqueue(new KeyValuePair<uint, double>(id, v)); return 0; }),
+                             (HId)((self, id) => 0), (HInt)((self, flags) => 0));
+        events = new Native(IEventList, (HCount)(self => evCount), (HIndexPtr)GetEvent, (HPtr)((self, e) => ResultFalse));
+        for (int i = 0; i < queues.Length; i++)
+        {
+            int q = i;
+            queues[i] = new Native(IParamValueQueue, (HParamId)(self => pid[q]), (HCount)(self => 1),
+                (HGetPoint)((IntPtr self, int index, out int offset, out double value) => { offset = 0; value = pval[q]; return index == 0 ? 0 : InvalidArgument; }),
+                (HAddPoint)((IntPtr self, int offset, double value, out int index) => { index = 0; return ResultFalse; }));
+        }
+        changes = new Native(IParameterChanges, (HCount)(self => pCount), (HData)((self, i) => i >= 0 && i < pCount ? queues[i].Ptr : IntPtr.Zero),
+                             (HAddData)((IntPtr self, IntPtr id, out int index) => { index = 0; return IntPtr.Zero; }));
+    }
+
+    int GetEvent(IntPtr self, int i, IntPtr e)   // Event: bus, offset, ppq, flags, type, then the note at byte 24
+    {
+        if (i < 0 || i >= evCount) return InvalidArgument;
+        for (int b = 0; b < 48; b += 8) Marshal.WriteInt64(e, b, 0);
+        Marshal.WriteInt32(e, 4, evAt[i]); Marshal.WriteInt16(e, 18, (short)(evOn[i] ? 0 : 1)); Marshal.WriteInt16(e, 26, (short)evKey[i]);
+        one[0] = evVel[i]; Marshal.Copy(one, 0, IntPtr.Add(e, evOn[i] ? 32 : 28), 1);   // velocity: after tuning for note-on, before the id for note-off
+        Marshal.WriteInt32(e, evOn[i] ? 40 : 32, -1);   // no note id
+        return 0;
+    }
+
+    public void Note(int offset, int key, float velocity, bool on)   // from the engine's voice loop; sent with the next block
+    {
+        if (evCount >= evKey.Length) return;
+        evAt[evCount] = Math.Max(0, Math.Min(MaxBlock - 1, offset)); evKey[evCount] = key; evVel[evCount] = Math.Max(0, Math.Min(1, velocity)); evOn[evCount] = on; evCount++;
+    }
+
+    public static string Folder { get { return System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonProgramFiles), "VST3"); } }
+
+    public static List<string> Find()   // .vst3 files and bundles in the usual folders
+    {
+        var list = new List<string>();
+        foreach (var root in new[] { Folder, System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Common", "VST3") })
+            try { if (Directory.Exists(root)) Collect(root, list, 0); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+        return list;
+    }
+    static void Collect(string dir, List<string> list, int depth)
+    {
+        foreach (var d in Directory.GetDirectories(dir)) if (d.EndsWith(".vst3", StringComparison.OrdinalIgnoreCase)) list.Add(d); else if (depth < 3) Collect(d, list, depth + 1);
+        list.AddRange(Directory.GetFiles(dir, "*.vst3"));
+    }
+
+    static string Binary(string path)   // a bundle is a folder; its 64-bit DLL is inside
+    {
+        return Directory.Exists(path) ? System.IO.Path.Combine(path, "Contents", "x86_64-win", System.IO.Path.GetFileName(path)) : path;
+    }
+
+    static readonly Dictionary<string, Vst3> live = new Dictionary<string, Vst3>();   // by id: undo and export find the running instance
+
+    // The instance a project line names: the running one if there is one, otherwise loaded and given its saved state. UI thread.
+    public static Vst3 Attach(string id, string path, string cid, string state, out string error)
+    {
+        Vst3 v; error = null;
+        if (id != null && live.TryGetValue(id, out v)) return v;
+        v = Load(path, cid, state, out error);
+        if (v != null && id != null) live[id] = v;
+        return v;
+    }
+
+    public static void ShutdownAll() { foreach (var v in live.Values) v.Close(); live.Clear(); }
+
+    static Vst3 Load(string path, string cid, string state, out string error)
+    {
+        error = null;
+        string name = System.IO.Path.GetFileNameWithoutExtension(path ?? "");
+        if (IntPtr.Size != 8) { error = name + ": VST3 plugins need 64-bit Windows."; return null; }
+        if (path == null || !File.Exists(Binary(path))) { error = name + ": plugin not found at " + path; return null; }
+        var v = new Vst3 { FilePath = path, Name = name };
+        try { error = v.Open(Binary(path), cid, state); }
+        catch (Exception e) { error = e.Message; }
+        if (error == null) return v;
+        error = name + ": " + error; v.Close(); return null;
+    }
+
+    string Open(string bin, string wantCid, string state)
+    {
+        module = LoadLibraryEx(bin, IntPtr.Zero, 8);   // LOAD_WITH_ALTERED_SEARCH_PATH: DLLs it needs load from its own folder
+        if (module == IntPtr.Zero) return "Windows couldn't load it (error " + Marshal.GetLastWin32Error() + "). It may be 32-bit, or need something that isn't installed.";
+        IntPtr init = GetProcAddress(module, "InitDll"), get = GetProcAddress(module, "GetPluginFactory");
+        if (get == IntPtr.Zero) return "it isn't a VST3 plugin.";
+        if (init != IntPtr.Zero) ((InitDllFn)Marshal.GetDelegateForFunctionPointer(init, typeof(InitDllFn)))();
+        factory = ((FactoryFn)Marshal.GetDelegateForFunctionPointer(get, typeof(FactoryFn)))();
+        if (factory == IntPtr.Zero) return "it has no plugins in it.";
+        IntPtr f3 = Query(factory, IPluginFactory3), f2 = Query(factory, IPluginFactory2);
+        if (f3 != IntPtr.Zero) Fn<PtrFn>(f3, 9)(f3, HostApp.Ptr);
+        byte[] chosen = null; string sub = ""; IntPtr info = AllocZero(440);   // PClassInfo2 (PClassInfo is its first 116 bytes)
+        try
+        {
+            int count = Fn<VoidFn>(factory, 4)(factory);
+            for (int i = 0; i < count && chosen == null; i++)
+            {
+                if (Fn<IndexPtrFn>(factory, 5)(factory, i, info) != 0 || Text(IntPtr.Add(info, 20), 32) != "Audio Module Class") continue;
+                var id = new byte[16]; Marshal.Copy(info, id, 0, 16); string hex = BitConverter.ToString(id).Replace("-", "");
+                if (!string.IsNullOrEmpty(wantCid) && hex != wantCid) continue;
+                chosen = id; Cid = hex; Name = Text(IntPtr.Add(info, 52), 64);
+                if (f2 != IntPtr.Zero && Fn<IndexPtrFn>(f2, 7)(f2, i, info) == 0) sub = Text(IntPtr.Add(info, 120), 128);
+            }
+        }
+        finally { Marshal.FreeHGlobal(info); Release(f2); Release(f3); }
+        if (chosen == null) return string.IsNullOrEmpty(wantCid) ? "it has no audio plugin in it." : "the plugin in it isn't the one this project used.";
+        if (Fn<CreateFn>(factory, 6)(factory, chosen, IComponent, out comp) != 0 || comp == IntPtr.Zero) { comp = IntPtr.Zero; return "it wouldn't start."; }
+        if (Fn<PtrFn>(comp, 3)(comp, HostApp.Ptr) != 0) return "it wouldn't initialize.";
+        inited = true;
+        proc = Query(comp, IAudioProcessor);
+        if (proc == IntPtr.Zero) return "it doesn't process audio.";
+        ctrl = Query(comp, IEditController);   // one object for both, or a separate controller class
+        var cc = new byte[16];
+        if (ctrl == IntPtr.Zero && Fn<CidFn>(comp, 5)(comp, cc) == 0 && cc.Any(b => b != 0) && Fn<CreateFn>(factory, 6)(factory, cc, IEditController, out ctrl) == 0 && ctrl != IntPtr.Zero)
+        {
+            if (Fn<PtrFn>(ctrl, 3)(ctrl, HostApp.Ptr) != 0) { Release(ctrl); ctrl = IntPtr.Zero; }
+            else
+            {
+                ctrlSeparate = true; compCP = Query(comp, IConnectionPoint); ctrlCP = Query(ctrl, IConnectionPoint);
+                if (compCP != IntPtr.Zero && ctrlCP != IntPtr.Zero) { Fn<PtrFn>(compCP, 3)(compCP, ctrlCP); Fn<PtrFn>(ctrlCP, 3)(ctrlCP, compCP); }
+            }
+        }
+        if (ctrl != IntPtr.Zero) Fn<PtrFn>(ctrl, 16)(ctrl, handler.Ptr);
+        if (!string.IsNullOrEmpty(state)) SetState(state);
+        else if (ctrlSeparate) { var now = Save(comp, 13); Fn<PtrFn>(ctrl, 5)(ctrl, Stream(new MemoryStream(now)).Ptr); }   // the controller starts in step with the sound
+        hasEvents = Fn<BusCountFn>(comp, 7)(comp, 1, 0) > 0;
+        nIn = Fn<BusCountFn>(comp, 7)(comp, 0, 0); nOut = Fn<BusCountFn>(comp, 7)(comp, 0, 1);
+        IsInstrument = sub.Contains("Instrument") || sub == "" && hasEvents && nIn == 0;
+        if (nOut == 0) return "it has no audio output.";
+        var ia = new ulong[Math.Max(1, nIn)]; var oa = new ulong[nOut]; ulong arr;
+        for (int b = 0; b < nIn; b++) ia[b] = Fn<GetArrFn>(proc, 4)(proc, 0, b, out arr) == 0 ? arr : 3;
+        for (int b = 0; b < nOut; b++) oa[b] = Fn<GetArrFn>(proc, 4)(proc, 1, b, out arr) == 0 ? arr : 3;
+        ia[0] = oa[0] = 3;   // the main buses in stereo (left | right)
+        Fn<ArrangeFn>(proc, 3)(proc, ia, nIn, oa, nOut);   // a plugin that says no keeps its own layout, read back below
+        inCh = Channels(0, nIn); outCh = Channels(1, nOut);
+        if (hasEvents) Fn<BusActFn>(comp, 10)(comp, 1, 0, 0, 1);
+        if (nIn > 0) Fn<BusActFn>(comp, 10)(comp, 0, 0, 0, 1);
+        Fn<BusActFn>(comp, 10)(comp, 0, 1, 0, 1);
+        if (Fn<IntFn>(proc, 5)(proc, 0) != 0) return "it can't process 32-bit audio.";
+        IntPtr setup = AllocZero(24); Marshal.WriteInt32(setup, 8, MaxBlock); PutDouble(setup, 16, Engine.SR);   // realtime, 32-bit, block size, rate
+        int r = Fn<PtrFn>(proc, 7)(proc, setup); Marshal.FreeHGlobal(setup);
+        if (r != 0) return "it can't run at " + Engine.SR + " Hz.";
+        inBufs = Buses(inCh, out inPtr); outBufs = Buses(outCh, out outPtr); data = AllocZero(80); context = AllocZero(112);
+        if (Fn<ByteFn>(comp, 11)(comp, 1) != 0) return "it wouldn't switch on.";
+        active = true;
+        processFn = Fn<PtrFn>(proc, 9);
+        Fn<ByteFn>(proc, 8)(proc, 1); processing = true;
+        return null;
+    }
+
+    int[] Channels(int dir, int n)   // each audio bus's channel count (BusInfo.channelCount is at byte 8)
+    {
+        var r = new int[n]; IntPtr bi = AllocZero(276);
+        for (int b = 0; b < n; b++) r[b] = Fn<BusInfoFn>(comp, 8)(comp, 0, dir, b, bi) == 0 ? Math.Max(0, Math.Min(64, Marshal.ReadInt32(bi, 8))) : 0;
+        Marshal.FreeHGlobal(bi); return r;
+    }
+
+    static IntPtr Buses(int[] chans, out IntPtr[][] ptrs)   // AudioBusBuffers: channel count, silence flags, then a pointer to the channels' buffers
+    {
+        IntPtr arr = AllocZero(24 * Math.Max(1, chans.Length)); ptrs = new IntPtr[chans.Length][];
+        for (int b = 0; b < chans.Length; b++)
+        {
+            ptrs[b] = new IntPtr[chans[b]]; IntPtr list = AllocZero(IntPtr.Size * Math.Max(1, chans[b]));
+            for (int c = 0; c < chans[b]; c++) { ptrs[b][c] = AllocZero(4 * MaxBlock); Marshal.WriteIntPtr(list, c * IntPtr.Size, ptrs[b][c]); }
+            Marshal.WriteInt32(arr, 24 * b, chans[b]); Marshal.WriteIntPtr(arr, 24 * b + 16, list);
+        }
+        return arr;
+    }
+
+    // One block on the audio thread: input (interleaved stereo, null for none) through the plugin into output. No allocations.
+    public void Process(float[] input, float[] output, int frames, bool playing, double bpm, double quarters)
+    {
+        int n = Math.Min(frames, MaxBlock);   // shortcut: the engine's blocks are 1024 frames, so one call is always enough
+        if (processFn == null) { Array.Clear(output, 0, n * 2); evCount = 0; return; }
+        if (nIn > 0 && inCh[0] > 0)
+        {
+            for (int k = 0; k < n; k++) { left[k] = input == null ? 0 : input[2 * k]; right[k] = input == null ? 0 : input[2 * k + 1]; }
+            if (inCh[0] == 1) for (int k = 0; k < n; k++) left[k] = (left[k] + right[k]) * 0.5f;
+            Marshal.Copy(left, 0, inPtr[0][0], n); if (inCh[0] > 1) Marshal.Copy(right, 0, inPtr[0][1], n);
+        }
+        pCount = 0; KeyValuePair<uint, double> ed;
+        while (edits.TryDequeue(out ed))
+        {
+            int j = Array.IndexOf(pid, ed.Key, 0, pCount);
+            if (j < 0) { if (pCount == pid.Length) continue; j = pCount++; pid[j] = ed.Key; }
+            pval[j] = ed.Value;
+        }
+        Marshal.WriteInt32(data, 0, 0); Marshal.WriteInt32(data, 4, 0); Marshal.WriteInt32(data, 8, n); Marshal.WriteInt32(data, 12, nIn); Marshal.WriteInt32(data, 16, nOut);
+        Marshal.WriteIntPtr(data, 24, inBufs); Marshal.WriteIntPtr(data, 32, outBufs); Marshal.WriteIntPtr(data, 40, changes.Ptr); Marshal.WriteIntPtr(data, 48, IntPtr.Zero);
+        Marshal.WriteIntPtr(data, 56, hasEvents ? events.Ptr : IntPtr.Zero); Marshal.WriteIntPtr(data, 64, IntPtr.Zero); Marshal.WriteIntPtr(data, 72, context);
+        // ProcessContext: playing, tempo, time signature and position are valid (bits 1, 10, 13, 9)
+        Marshal.WriteInt32(context, 0, (playing ? 2 : 0) | 0x400 | 0x2000 | 0x200); PutDouble(context, 8, Engine.SR);
+        Marshal.WriteInt64(context, 16, (long)(quarters * 60 / Math.Max(1, bpm) * Engine.SR)); PutDouble(context, 40, quarters); PutDouble(context, 48, Math.Floor(quarters / 4) * 4);
+        PutDouble(context, 72, bpm); Marshal.WriteInt32(context, 80, 4); Marshal.WriteInt32(context, 84, 4);
+        processFn(proc, data);
+        evCount = 0; pCount = 0;
+        if (outCh[0] == 0) { Array.Clear(output, 0, n * 2); return; }
+        Marshal.Copy(outPtr[0][0], left, 0, n);
+        if (outCh[0] > 1) Marshal.Copy(outPtr[0][1], right, 0, n); else Array.Copy(left, right, n);
+        for (int k = 0; k < n; k++) { output[2 * k] = left[k]; output[2 * k + 1] = right[k]; }
+    }
+
+    static byte[] Save(IntPtr obj, int slot) { var ms = new MemoryStream(); Fn<PtrFn>(obj, slot)(obj, Stream(ms).Ptr); return ms.ToArray(); }
+
+    public string GetState()   // the sound's settings, then the controller's (only when it is a separate object), as base64 joined by "."
+    {
+        if (comp == IntPtr.Zero) return "";
+        return Convert.ToBase64String(Save(comp, 13)) + "." + (ctrlSeparate ? Convert.ToBase64String(Save(ctrl, 7)) : "");
+    }
+
+    public void SetState(string state)
+    {
+        var parts = state.Split('.'); var a = Convert.FromBase64String(parts[0]); var b = parts.Length > 1 ? Convert.FromBase64String(parts[1]) : new byte[0];
+        if (a.Length > 0) { Fn<PtrFn>(comp, 12)(comp, Stream(new MemoryStream(a)).Ptr); if (ctrlSeparate) Fn<PtrFn>(ctrl, 5)(ctrl, Stream(new MemoryStream(a)).Ptr); }
+        if (b.Length > 0 && ctrlSeparate) Fn<PtrFn>(ctrl, 6)(ctrl, Stream(new MemoryStream(b)).Ptr);
+    }
+
+    public void ShowEditor(IWin32Window owner)   // the plugin's own window, inside one of ours; it may resize it
+    {
+        if (editor != null && !editor.IsDisposed) { editor.Activate(); return; }
+        IntPtr view = ctrl == IntPtr.Zero ? IntPtr.Zero : Fn<ViewFn>(ctrl, 17)(ctrl, "editor");
+        if (view == IntPtr.Zero || Fn<StrFn>(view, 3)(view, "HWND") != 0)
+        {
+            Release(view); MessageBox.Show(owner, Name + " has no window of its own. It plays with its saved settings.", "MiniDAW"); return;
+        }
+        IntPtr rect = AllocZero(16); Fn<PtrFn>(view, 9)(view, rect);
+        bool sizable = Fn<VoidFn>(view, 13)(view) == 0, resizing = false;
+        var f = new Form { Text = Name, ShowInTaskbar = false, MaximizeBox = false, MinimizeBox = false, StartPosition = FormStartPosition.CenterScreen,
+                           FormBorderStyle = sizable ? FormBorderStyle.Sizable : FormBorderStyle.FixedSingle, BackColor = Color.Black };
+        Func<IntPtr, Size> size = r => new Size(Math.Max(100, Marshal.ReadInt32(r, 8) - Marshal.ReadInt32(r, 0)), Math.Max(60, Marshal.ReadInt32(r, 12) - Marshal.ReadInt32(r, 4)));
+        f.ClientSize = size(rect);
+        var frame = new Native(IPlugFrame, (HResize)((self, v, r) =>   // the plugin asks for a new size
+        {
+            if (f.IsDisposed) return ResultFalse;
+            resizing = true; f.ClientSize = size(r); resizing = false; Fn<PtrFn>(v, 10)(v, r); return 0;
+        }));
+        Fn<PtrFn>(view, 12)(view, frame.Ptr);
+        if (Fn<AttachFn>(view, 4)(view, f.Handle, "HWND") != 0)
+        {
+            Fn<PtrFn>(view, 12)(view, IntPtr.Zero); Release(view); Marshal.FreeHGlobal(rect); f.Dispose();
+            MessageBox.Show(owner, Name + "'s window couldn't open.", "MiniDAW"); return;
+        }
+        f.Resize += (s, e) =>   // the user drags the border: tell the plugin
+        {
+            if (resizing || !sizable) return;
+            Marshal.WriteInt32(rect, 0, 0); Marshal.WriteInt32(rect, 4, 0); Marshal.WriteInt32(rect, 8, f.ClientSize.Width); Marshal.WriteInt32(rect, 12, f.ClientSize.Height);
+            Fn<PtrFn>(view, 10)(view, rect);
+        };
+        f.FormClosed += (s, e) => { Fn<VoidFn>(view, 5)(view); Fn<PtrFn>(view, 12)(view, IntPtr.Zero); Release(view); Marshal.FreeHGlobal(rect); editor = null; };
+        editor = f; f.Show(owner);
+    }
+
+    public void Close()
+    {
+        if (editor != null && !editor.IsDisposed) editor.Close();
+        processFn = null;
+        if (processing) Fn<ByteFn>(proc, 8)(proc, 0);
+        if (active) Fn<ByteFn>(comp, 11)(comp, 0);
+        if (compCP != IntPtr.Zero && ctrlCP != IntPtr.Zero) { Fn<PtrFn>(compCP, 4)(compCP, ctrlCP); Fn<PtrFn>(ctrlCP, 4)(ctrlCP, compCP); }
+        Release(compCP); Release(ctrlCP);
+        if (ctrlSeparate) Fn<VoidFn>(ctrl, 4)(ctrl);
+        Release(ctrl); Release(proc);
+        if (inited) Fn<VoidFn>(comp, 4)(comp);
+        Release(comp);
+        processing = active = inited = false; comp = proc = ctrl = compCP = ctrlCP = IntPtr.Zero;   // the module stays loaded: unloading can crash a plugin's own threads
+    }
+
+    // For the self-test, without a plugin: our objects answered through their vtables. (Calling our own function pointers gives back
+    // our own delegates, so they are called with their own types here; a plugin's pointers are native and take the types above.)
+    internal static string SelfCheck()
+    {
+        IntPtr o; var bad = new List<string>(); Func<byte[], IntPtr> pin = b => { IntPtr q = Marshal.AllocHGlobal(16); Marshal.Copy(b, 0, q, 16); return q; };
+        if (!Iid("22888DDB-156E-45AE-8358-B34808190625").SequenceEqual(new byte[] { 0xDB, 0x8D, 0x88, 0x22, 0x6E, 0x15, 0xAE, 0x45, 0x83, 0x58, 0xB3, 0x48, 0x08, 0x19, 0x06, 0x25 })) bad.Add("id layout");
+        IntPtr h = HostApp.Ptr;
+        if (Fn<HQuery>(h, 0)(h, pin(IHostApplication), out o) != 0 || o != h || Fn<HQuery>(h, 0)(h, pin(IComponent), out o) != NoInterface) bad.Add("QueryInterface");
+        IntPtr s128 = AllocZero(256); Fn<HPtr>(h, 3)(h, s128); if (Marshal.PtrToStringUni(s128) != "MiniDAW") bad.Add("host name"); Marshal.FreeHGlobal(s128);
+        var ms = new MemoryStream(); IntPtr st = Stream(ms).Ptr, buf = AllocZero(16), cnt = AllocZero(8);
+        Marshal.Copy(new byte[] { 1, 2, 3, 4, 5 }, 0, buf, 5); Fn<HStreamIO>(st, 4)(st, buf, 5, cnt);
+        Fn<HSeek>(st, 5)(st, 1, 0, IntPtr.Zero); Fn<HStreamIO>(st, 3)(st, buf, 8, cnt); int got = Marshal.ReadInt32(cnt); var back = new byte[got]; Marshal.Copy(buf, back, 0, got);
+        Fn<HPtr>(st, 6)(st, cnt); if (!back.SequenceEqual(new byte[] { 2, 3, 4, 5 }) || Marshal.ReadInt64(cnt) != 5) bad.Add("stream");
+        IntPtr msgId = pin(IMessage); Fn<HCreate>(h, 4)(h, msgId, msgId, out o);
+        IntPtr attrs = o == IntPtr.Zero ? IntPtr.Zero : Fn<HGetPtr>(o, 5)(o); long iv = 0; IntPtr key = Marshal.StringToHGlobalAnsi("n");
+        if (attrs == IntPtr.Zero || Fn<HSetInt>(attrs, 3)(attrs, key, 42) != 0 || Fn<HGetInt>(attrs, 4)(attrs, key, out iv) != 0 || iv != 42) bad.Add("messages");
+        var v = new Vst3(); v.Note(5, 60, 0.5f, true); v.Note(9, 60, 0, false); IntPtr ev = AllocZero(48), el = v.events.Ptr;
+        bool evOk = Fn<HCount>(el, 3)(el) == 2 && Fn<HIndexPtr>(el, 4)(el, 0, ev) == 0 && Marshal.ReadInt32(ev, 4) == 5 && Marshal.ReadInt16(ev, 18) == 0 && Marshal.ReadInt16(ev, 26) == 60
+                    && BitConverter.ToSingle(BitConverter.GetBytes(Marshal.ReadInt32(ev, 32)), 0) == 0.5f && Marshal.ReadInt32(ev, 40) == -1
+                    && Fn<HIndexPtr>(el, 4)(el, 1, ev) == 0 && Marshal.ReadInt32(ev, 4) == 9 && Marshal.ReadInt16(ev, 18) == 1 && Marshal.ReadInt32(ev, 32) == -1;
+        if (!evOk) bad.Add("note events");
+        v.edits.Enqueue(new KeyValuePair<uint, double>(7, 0.25)); v.edits.Enqueue(new KeyValuePair<uint, double>(7, 0.75)); var quiet = new float[64]; quiet[0] = 1; v.Process(null, quiet, 32, false, 120, 0); if (quiet[0] != 0) bad.Add("silence without a plugin");
+        Marshal.FreeHGlobal(buf); Marshal.FreeHGlobal(cnt); Marshal.FreeHGlobal(ev); Marshal.FreeHGlobal(key);
+        return bad.Count == 0 ? null : string.Join(", ", bad);
+    }
+}
+
 class MidiInput
+
 {
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct MIDIINCAPS { public ushort wMid, wPid; public uint vDriverVersion; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szPname; public uint dwSupport; }
@@ -3565,7 +4091,11 @@ class MainForm : Form
         patBox.MouseUp += (s, e) => { if (e.Button == MouseButtons.Right) PatternMenu(); };
         Btn(bar, "+ Pattern", (s, e) => Edit(() => { lock (P) P.Patterns.Add(new Pattern { Name = "Pattern " + (P.Patterns.Count + 1) }); RefreshAll(P.Patterns.Count - 1); dirty = true; }));
         Button soundBtn = null;
-        soundBtn = Btn(bar, "+ Sound", (s, e) => SoundMenu(kind => AddChannel(new Channel { Kind = kind, Name = FreeName(Channel.Title(kind)) })).Show(soundBtn, 0, soundBtn.Height));
+        soundBtn = Btn(bar, "+ Sound", (s, e) =>
+        {
+            var m = SoundMenu(kind => AddChannel(new Channel { Kind = kind, Name = FreeName(Channel.Title(kind)) }));
+            m.Items.Add(new ToolStripSeparator()); m.Items.Add(PluginMenu(AddPluginChannel)); m.Show(soundBtn, 0, soundBtn.Height);
+        });
         Gap(soundBtn);
         Btn(bar, "+ Sample…", (s, e) => AddSample());
         Gap(Btn(bar, "New", (s, e) => { if (ConfirmDiscard()) { ClearAutosave(); eng.Proj = Project.Demo(); filePath = null; hist.Clear(); RefreshAll(0); dirty = false; } }));
@@ -3674,7 +4204,7 @@ class MainForm : Form
                 if (files != null) BeginInvoke((Action)(() => { if (onPlaylist) DropOnPlaylist(files, at); else OpenFiles(files); }));   // after the drop returns, so Explorer isn't held up by any dialog
             };
         }
-        FormClosing += (s, e) => { if (!ConfirmDiscard()) { e.Cancel = true; return; } if (!screenshotMode) ClearAutosave(); midi.Close(); eng.Stop(); };   // saved or knowingly discarded: nothing to recover
+        FormClosing += (s, e) => { if (!ConfirmDiscard()) { e.Cancel = true; return; } if (!screenshotMode) ClearAutosave(); midi.Close(); eng.Stop(); Vst3.ShutdownAll(); };   // saved or knowingly discarded: nothing to recover
         KeyPreview = true;   // the form sees letter keys before the focused control
         KeyDown += (s, e) => PianoKey(e, true);
         KeyUp += (s, e) => PianoKey(e, false);
@@ -4015,6 +4545,13 @@ class MainForm : Form
     void ShowSoundSettings()
     {
         if (P.Channels.Count == 0) return;
+        var pc = P.Channels[Math.Min(selCh, P.Channels.Count - 1)];
+        if (pc.Kind == "vst")   // a plugin: its own window
+        {
+            if (pc.Plugin != null) pc.Plugin.ShowEditor(this);
+            else MessageBox.Show(this, pc.Name + ": the plugin isn't loaded (" + (pc.PluginPath ?? "no file") + ").", "MiniDAW");
+            return;
+        }
         if (soundWin == null || soundWin.IsDisposed) { soundWin = new SoundWindow(this); soundWin.Show(this); }
         else soundWin.Activate();
         soundWin.view.Invalidate();
@@ -4275,6 +4812,8 @@ class MainForm : Form
         {
             if (d.ShowDialog(this) != DialogResult.OK) return;
             Cursor = Cursors.WaitCursor;
+            bool plugins = P.Channels.Any(c => c.Plugin != null) || P.Mixer.Any(m => m.Slots.Any(x => x != null && x.Plugin != null));
+            if (plugins) eng.Stop();   // a plugin can't play live and render the export at the same time
             try
             {
                 bool song = eng.SongMode; int pat = eng.CurPattern; float[] ever;
@@ -4293,7 +4832,7 @@ class MainForm : Form
                     + " " + Qualities(exportFormat)[exportQuality] + ") to\n" + d.FileName + (stems.Count > 0 ? "\n\nplus " + stems.Count + " stems next to it:\n" + string.Join("\n", stems) : ""), "MiniDAW");
             }
             catch (Exception ex) { MessageBox.Show(this, "Export failed:\n" + ex.Message, "MiniDAW"); }
-            finally { Cursor = Cursors.Default; }
+            finally { Cursor = Cursors.Default; if (plugins) eng.Start(); }
         }
     }
 
@@ -5349,13 +5888,14 @@ class MainForm : Form
                 var fx = ins.Slots[s]; float sy = SlotY(i, s, st); bool open = IsOpen(i, s);
                 Round(g, fx == null ? Color.FromArgb(38, 43, 52) : open ? Sel : Raised, sx + 2, sy, w - 4, HeadH - 2, 3);
                 bool mixing = fx != null && dragFx == fx && dragParam == Lane.FxMix;   // while its mix bar is dragged, the row shows the value
-                string label = fx == null ? "+ effect" : mixing ? "Wet/dry " + (int)Math.Round(fx.Mix * 100) + "%" : (open ? "▾ " : "▸ ") + fx.Type + (fx.Bypass ? " off" : "");
+                string label = fx == null ? "+ effect" : mixing ? "Wet/dry " + (int)Math.Round(fx.Mix * 100) + "%" : (open ? "▾ " : "▸ ") + fx.Name + (fx.Bypass ? " off" : "");
                 g.DrawString(label, Small, fx == null || fx.Bypass ? DimB : TxtB, new RectangleF(sx + 5, sy, fx == null ? w - 8 : w - 60, HeadH - 2), Fit);
                 if (fx == null) continue;
                 ValueBar(g, sx + w - 52, sy + 6, 30, 6, 0, fx.Mix, fx.Bypass ? Dim : Blue);   // wet/dry, left of the on/off dot
                 Led(g, sx + w - 16, sy + 4, 9, !fx.Bypass);
                 if (!open) continue;
                 if (fx.P.Length > 3) { PaintMiniEq(g, fx, new RectangleF(sx + 2, sy + HeadH + 1, w - 4, ParamsH - 3)); continue; }   // the Parametric EQ: its curve; a click opens the editor
+                if (fx.P.Length == 0) { g.DrawString(fx.Plugin != null ? "click: plugin window" : "not loaded", Small, DimB, new RectangleF(sx + 6, sy + HeadH + 14, w - 10, 14), Fit); continue; }   // a plugin keeps its own settings
                 for (int p = 0; p < 3; p++)
                 {
                     float py = sy + HeadH + 1 + p * 14;
@@ -5398,6 +5938,7 @@ class MainForm : Form
                 if (IsOpen(i, s) && e.Y >= sy + HeadH && e.Y < sy + HeadH + ParamsH)   // the open effect's settings
                 {
                     if (fx.P.Length > 3) { if (e.Button == MouseButtons.Left) ShowEq(i, s); return; }   // the Parametric EQ's curve: open its editor
+                    if (fx.P.Length == 0) { if (e.Button == MouseButtons.Left && fx.Plugin != null) fx.Plugin.ShowEditor(this); return; }   // a plugin: its window
                     int p = (int)((e.Y - sy - HeadH - 1) / 14);
                     if (p < 0 || p > 2) return;
                     if (e.Button == MouseButtons.Right) { AutomateControl(i, s, p); return; }
@@ -5837,8 +6378,46 @@ class MainForm : Form
             string t = type;   // foreach variables are shared between iterations in C# 5
             m.Items.Add(t, null, (s, e) => Edit(() => { P.Mixer[i].Slots[slot] = new Effect(t); openSlot[i] = slot; Changed(); }));   // new object = fresh effect state; show its settings
         }
+        m.Items.Add(new ToolStripSeparator()); m.Items.Add(PluginMenu(path => AddPluginEffect(i, slot, path)));
         m.Items.Add("(remove)", null, (s, e) => Edit(() => { P.Mixer[i].Slots[slot] = null; Changed(); }));
         m.Show(mixer, at);
+    }
+
+    // ---- VST3 plugins: the ones in the usual folders, or any .vst3 file; instruments become channels, effects fill mixer slots
+    ToolStripMenuItem PluginMenu(Action<string> pick)
+    {
+        var sub = new ToolStripMenuItem("VST3 plugin");
+        foreach (var path in Vst3.Find()) { string pth = path; sub.DropDownItems.Add(Path.GetFileNameWithoutExtension(pth), null, (s, e) => pick(pth)); }
+        if (sub.DropDownItems.Count == 0) sub.DropDownItems.Add(new ToolStripMenuItem("(none in " + Vst3.Folder + ")") { Enabled = false });
+        sub.DropDownItems.Add(new ToolStripSeparator());
+        sub.DropDownItems.Add("Browse…", null, (s, e) =>
+        {
+            using (var d = new OpenFileDialog { Filter = "VST3 plugin (*.vst3)|*.vst3", InitialDirectory = Directory.Exists(Vst3.Folder) ? Vst3.Folder : "" })
+                if (d.ShowDialog(this) == DialogResult.OK) pick(d.FileName);
+        });
+        return sub;
+    }
+
+    Vst3 LoadPlugin(string path, out string id)   // a fresh instance with its own id; null (after saying why) if it won't load
+    {
+        id = Guid.NewGuid().ToString("N"); string err; Cursor = Cursors.WaitCursor;
+        try { var pl = Vst3.Attach(id, path, "", "", out err); if (pl == null) MessageBox.Show(this, err, "MiniDAW"); return pl; }
+        finally { Cursor = Cursors.Default; }
+    }
+
+    void AddPluginChannel(string path)
+    {
+        string id; var pl = LoadPlugin(path, out id); if (pl == null) return;
+        if (!pl.IsInstrument && MessageBox.Show(this, pl.Name + " looks like an effect, not an instrument. Effects go in a mixer slot (click a slot → VST3 plugin).\n\nAdd it as a channel anyway?", "MiniDAW", MessageBoxButtons.YesNo) != DialogResult.Yes) return;
+        AddChannel(new Channel { Kind = "vst", Name = FreeName(pl.Name), PluginPath = path, PluginCid = pl.Cid, PluginId = id, Plugin = pl });
+        pl.ShowEditor(this);
+    }
+
+    void AddPluginEffect(int i, int slot, string path)
+    {
+        string id; var pl = LoadPlugin(path, out id); if (pl == null) return;
+        Edit(() => { P.Mixer[i].Slots[slot] = new Effect(Effect.PluginType) { Plugin = pl, PluginPath = path, PluginCid = pl.Cid, PluginId = id }; openSlot[i] = slot; Changed(); });
+        pl.ShowEditor(this);
     }
 
     // ---- playlist: up to 500 tracks of clips over up to 999 bars, scrolled and zoomed; a ruler with markers, time signatures and a loop region
@@ -7018,6 +7597,19 @@ class MainForm : Form
                 check(before == 0 && during > 0.2 && after < 1e-4 && Math.Abs(atStep17 / expectAt - 1) < 0.1 && midBuf.Max(x => Math.Abs(x)) > 0.1
                       && sb2.Clips.Count == 1 && sb2.Clips[0].Channel == 4 && sb2.Clips[0].Offset == 4 && sv2.Clips.Count == 0,
                     "audio clips: one at bar 2 trimmed 4 16ths in plays only its 8 16ths, from the right place in the audio (" + atStep17.ToString("0.00") + " vs " + expectAt.ToString("0.00") + "); playback starting inside it plays it from there; it saves, and goes with its channel");
+            }
+            {   // VST3 without a plugin: our side of the interfaces through their vtables; a plugin channel and slot save and load, and a missing plugin is a warning and silence
+                string host = Vst3.SelfCheck(), err;
+                var none = Vst3.Attach(null, @"C:\no\such\Plugin.vst3", "", "", out err);
+                var vp = Project.Demo(); vp.Channels.Add(new Channel { Kind = "vst", Name = "Synth X", PluginPath = @"C:\no\such\Synth X.vst3", PluginCid = "00112233445566778899AABBCCDDEEFF", PluginId = "abc123", PluginState = "AAEC." });
+                vp.Patterns[0].For(vp.Channels.Count - 1).Add(new Note { Step = 0, Key = 60, Len = 4 });
+                vp.Mixer[3].Slots[1] = new Effect(Effect.PluginType) { PluginPath = @"C:\no\such\Verb.vst3", PluginCid = "FFEEDDCCBBAA99887766554433221100", PluginId = "def456", PluginState = "", Bypass = true, Mix = 0.4f };
+                var vb = Project.Parse(vp.Lines().ToArray(), null); var vc = vb.Channels.Last(); var vf = vb.Mixer[3].Slots[1];
+                bool kept = vc.Kind == "vst" && vc.PluginPath == @"C:\no\such\Synth X.vst3" && vc.PluginCid == "00112233445566778899AABBCCDDEEFF" && vc.PluginId == "abc123" && vc.PluginState == "AAEC." && vc.Plugin == null
+                            && vf.Type == Effect.PluginType && vf.PluginPath == @"C:\no\such\Verb.vst3" && vf.Bypass && Math.Abs(vf.Mix - 0.4f) < 1e-6 && vf.Name == "Verb (missing)" && vb.Warnings.Count == 2;
+                var withPlug = Engine.Bounce(vb.ExportCopy(), false, 0); vb.Channels.RemoveAt(vb.Channels.Count - 1); vb.Mixer[3].Slots[1] = null; var without = Engine.Bounce(vb.ExportCopy(), false, 0);
+                check(host == null && none == null && err.Contains("not found") && kept && withPlug.SequenceEqual(without),
+                    "VST3: our host, streams, messages and note events answer through their vtables" + (host == null ? "" : " (not: " + host + ")") + "; a missing plugin says \"" + err + "\"; a plugin channel and a plugin slot save and load with their settings, and play as silence while missing");
             }
             {   // OGG Vorbis: the fast transform matches its definition; the pages carry valid checksums, the three headers, and the exact length at the end
                 var rnd = new Random(7); var xin = Enumerable.Range(0, 2048).Select(k => rnd.NextDouble() * 2 - 1).ToArray(); var fast = new double[1024]; Vorbis.Mdct(xin, fast); double worst = 0;

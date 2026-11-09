@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 154 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 155 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -150,6 +150,14 @@ Needs Windows 10 or 11.
 - Every sound starts at its built-in setting, so 100% means unchanged.
 - Switching a channel to another sound resets its settings.
 - Settings are saved with the project.
+
+## VST3 plugins
+
+- **Instruments:** **+ Sound → VST3 plugin**, then pick one. The list shows the plugins in `C:\Program Files\Common Files\VST3`; **Browse…** opens any other `.vst3` file. The plugin becomes a channel: write notes for it in the piano roll, play it from a MIDI or computer keyboard, and route it to a mixer insert like any other channel.
+- **Effects:** click an empty mixer slot → **VST3 plugin**. The slot's wet/dry bar and on/off dot work as for the built-in effects.
+- **Its window:** the plugin's own editor opens when you add it. Open it again by double-clicking the channel (or right-click → **Sound settings…**), or by clicking the open slot.
+- **Saving:** the project stores where each plugin is and all its settings, and puts them back when it opens. If a plugin is missing, the project still opens, says which one, and that channel or slot stays silent until the plugin is installed again.
+- Export plays plugins too; live playback pauses while exporting.
 
 ## Mixer
 
@@ -335,7 +343,7 @@ MiniDAW is open source under the [MIT License](LICENSE): use it, change it, shar
 - The pitch wheel (±2 semitones) and the vibrato (5.5 Hz, ±½ semitone) can't be adjusted, and they don't affect Pluck or the drums. The computer keyboard has no sustain, pitch or mod controls.
 - Sidechain drives the Compressor and the Vocoder. The Parametric EQ's settings can't be automated yet.
 - Mixer controls, rack volume/pan, sound settings and tempo can be automated, and linked to MIDI controllers. Mixer changes take effect once per audio block (about 23 ms).
-- No VST plugins.
+- VST3 plugins: 64-bit only, and no VST2. MiniDAW doesn't compensate for a plugin's delay (latency), and it can't automate a plugin's own settings yet. An effect gets its insert's stereo sound only (no sidechain input). A file with several plugins in it opens the first.
 - WASAPI always uses the default output device. Audio recording uses the classic Windows input (`waveIn`), not ASIO inputs.
 - Note recording works only in Pattern mode and only adds notes (overdub). Audio recording makes a new take each time.
 - MIDI import keeps timing to 1/96 of a beat; a song is placed on the playlist up to its 999-bar limit.
