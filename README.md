@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 150 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 153 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -189,6 +189,7 @@ The master stays on the left; the 125 inserts scroll beside it with the mouse wh
 | Multiband | Depth, Speed, Gain. Splits the sound at 200 Hz and 4 kHz and compresses each band on its own, like FL's Maximus: dense, even loudness. At zero depth it's perfectly transparent |
 | Beat FX | Mode (gate, stutter, half speed, reverse), Rate (1/4–1/32), Mix. Chops the sound in time with the song, after FL's Gross Beat. It only acts while the song plays |
 | Vocoder | Release, Bright, Mix. Put a synth on the insert and a voice (or any sound) on another insert, then set this insert's **sc** to that one: the synth "speaks". With no sidechain it does nothing |
+| Pitch correction | Scale (chromatic, or major or minor on any key), Speed (0 ms snaps hard for the robot effect; up to 200 ms glides more naturally), Amount. Pulls a single voice or instrument to the nearest note of the scale while keeping its tone, like an auto-tune or FL's Pitcher. It delays the sound by about 32 ms. Breaths, noise and chords pass through unchanged |
 ## Automation
 
 **Right-click any control that can change during a song:**

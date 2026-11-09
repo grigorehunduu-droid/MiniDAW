@@ -328,17 +328,17 @@ class Lane
 class Effect
 {
     public static readonly string[] Types = { "Delay", "Reverb", "Filter", "Distortion", "EQ", "Compressor", "Limiter", "Chorus", "Flanger", "Phaser",
-        "Parametric EQ", "Multiband", "Beat FX", "Vocoder" };
+        "Parametric EQ", "Multiband", "Beat FX", "Vocoder", "Pitch correction" };
     static readonly string[] BandNames = { "Low shelf", "Low mid", "Mid", "High mid", "High shelf" };
     static readonly string[][] Names = { new[] { "Time", "Feedback", "Mix" }, new[] { "Size", "Damp", "Mix" }, new[] { "Cutoff", "Reso", "Mode" }, new[] { "Drive", "Tone", "Mix" },
         new[] { "Low", "Mid", "High" }, new[] { "Threshold", "Ratio", "Gain" }, new[] { "Ceiling", "Release", "Gain" },
         new[] { "Depth", "Rate", "Mix" }, new[] { "Depth", "Rate", "Feedback" }, new[] { "Depth", "Rate", "Feedback" },
-        BandNames.SelectMany(n => new[] { n + " freq", n + " gain", n + " Q" }).ToArray(), new[] { "Depth", "Speed", "Gain" }, new[] { "Mode", "Rate", "Mix" }, new[] { "Release", "Bright", "Mix" } };
+        BandNames.SelectMany(n => new[] { n + " freq", n + " gain", n + " Q" }).ToArray(), new[] { "Depth", "Speed", "Gain" }, new[] { "Mode", "Rate", "Mix" }, new[] { "Release", "Bright", "Mix" }, new[] { "Scale", "Speed", "Amount" } };
     static readonly float[][] Defaults = { new[] { 0.35f, 0.4f, 0.35f }, new[] { 0.6f, 0.4f, 0.3f }, new[] { 0.6f, 0.2f, 0f }, new[] { 0.4f, 0.6f, 1f },
         new[] { 0.5f, 0.5f, 0.5f }, new[] { 0.25f, 3f / 19, 0.25f },   // EQ flat; compressor -12 dB, 4:1, +6 dB
         new[] { 0.025f, 0.35f, 0f }, new[] { 0.5f, 0.45f, 1f }, new[] { 0.6f, 0.3f, 0.5f }, new[] { 0.6f, 0.35f, 0.4f },   // limiter -0.3 dB, ~40 ms, +0 dB
         new[] { 0.159f, 0.5f, 0.245f, 0.366f, 0.5f, 0.347f, 0.566f, 0.5f, 0.347f, 0.767f, 0.5f, 0.347f, 0.926f, 0.5f, 0.245f },   // flat; 60 Hz, 250 Hz, 1 kHz, 4 kHz, 12 kHz
-        new[] { 0.4f, 0.5f, 0.2f }, new[] { 0f, 0.5f, 1f }, new[] { 0.3f, 0.3f, 1f } };
+        new[] { 0.4f, 0.5f, 0.2f }, new[] { 0f, 0.5f, 1f }, new[] { 0.3f, 0.3f, 1f }, new[] { 0f, 0.25f, 1f } };   // pitch correction: chromatic, 50 ms, full
     static readonly int[] CombLen = { 1116, 1188, 1277, 1356 }, ApLen = { 556, 441 };   // Freeverb tunings at 44.1 kHz
 
     public readonly string Type;
@@ -393,6 +393,8 @@ class Effect
         else if (t == 12 && i == 0) v = BeatModes[BeatMode()];
         else if (t == 12 && i == 1) v = new[] { "1/4", "1/8", "1/16", "1/32" }[Math.Min(3, (int)(P[1] * 4))];
         else if (t == 13 && i == 0) v = (int)Math.Round(10 + 190 * P[0]) + " ms";
+        else if (t == 14 && i == 0) v = ScaleName(PcScale());
+        else if (t == 14 && i == 1) v = P[1] < 0.005f ? "0 ms (robot)" : (int)Math.Round(P[1] * 200) + " ms";
         else v = (int)Math.Round(P[i] * 100) + "%";
         return Names[t][i] + "  " + v;
     }
@@ -548,6 +550,79 @@ class Effect
         return y;
     }
 
+    // ---- Pitch correction (like FL's Pitcher or an auto-tune, simply): YIN finds the pitch of a single voice on a copy reduced to
+    // about 11 kHz, the nearest note of the chosen scale is the target, and PSOLA re-spaces one-period grains to reach it, so the
+    // voice's tone is kept. It delays the sound by about 32 ms. Without a clear pitch (breaths, consonants, chords) it passes through.
+    static readonly string[] PcKeys = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" };
+    static readonly int[] MajorSteps = { 0, 2, 4, 5, 7, 9, 11 }, MinorSteps = { 0, 2, 3, 5, 7, 8, 10 };
+    int PcScale() { return Math.Min(24, (int)(P[0] * 25)); }   // 0 chromatic, 1-12 major on C..B, 13-24 minor on C..B
+    static string ScaleName(int sc) { return sc == 0 ? "Chromatic" : PcKeys[(sc - 1) % 12] + (sc <= 12 ? " major" : " minor"); }
+    bool InScale(int midi) { int sc = PcScale(); if (sc == 0) return true; int pc = ((midi - (sc - 1) % 12) % 12 + 12) % 12; return Array.IndexOf(sc <= 12 ? MajorSteps : MinorSteps, pc) >= 0; }
+
+    float[] pcL, pcR, pcAccL, pcAccR, pcW, pcDec; double[] pcD;
+    int pcMask, pcLat, pcDecim, pcDecN, pcDecCount, pcTauMax, pcWin; long pcNow; double pcDecSum, pcNext, pcLastC, pcT, pcCents;
+    public double DetectedHz, TargetHz;   // the latest analysis (0 = no clear pitch)
+
+    void PitchCorrect(float[] b, int n2)
+    {
+        if (pcL == null)
+        {
+            int t0max = Engine.SR / 80; pcLat = (int)(2.6 * t0max); int size = 1; while (size < pcLat + 3 * t0max + 64) size *= 2;
+            pcMask = size - 1; pcL = new float[size]; pcR = new float[size]; pcAccL = new float[size]; pcAccR = new float[size]; pcW = new float[size];
+            pcDecim = Math.Max(1, (int)Math.Round(Engine.SR / 11025.0)); double fa = Engine.SR / (double)pcDecim;
+            pcTauMax = (int)(fa / 80); pcWin = (int)(0.025 * fa); pcDec = new float[1024]; pcD = new double[pcTauMax + 1];
+            pcT = Engine.SR / 200.0; pcLastC = -pcLat;
+        }
+        for (int k = 0; k < n2; k += 2)
+        {
+            pcDecSum += (b[k] + b[k + 1]) * 0.5;
+            if (++pcDecCount == pcDecim) { pcDec[pcDecN++ & 1023] = (float)(pcDecSum / pcDecim); pcDecSum = 0; pcDecCount = 0; if ((pcDecN & 63) == 0) Analyse(); }
+            long n = pcNow++; int i = (int)(n & pcMask);
+            pcL[i] = b[k]; pcR[i] = b[k + 1];
+            for (int h = (int)Math.Round(pcT); pcNext - h <= n; h = (int)Math.Round(pcT)) Grain(n, h);
+            float w = Math.Max(pcW[i], 0.25f);   // the windows overlap to about 1; dividing by their sum keeps the level exact while grains re-space
+            b[k] = pcAccL[i] / w; b[k + 1] = pcAccR[i] / w; pcAccL[i] = pcAccR[i] = pcW[i] = 0;
+        }
+    }
+
+    void Grain(long n, int h)   // a Hann grain two periods long, taken from the input around the period mark nearest (its own time - the delay)
+    {
+        double c = pcLastC + pcT * Math.Round((pcNext - pcLat - pcLastC) / pcT);   // whole periods from the last grain: grains stay in phase
+        long si = (long)Math.Round(pcNext); double src = c + (si - pcNext); long ci = (long)Math.Floor(src); float fr = (float)(src - ci);   // read between samples, so the grain sits exactly on its mark
+        for (int j = -h; j <= h; j++)
+        {
+            long o = si + j; if (o < n) continue;   // already played
+            float wgt = (float)(0.5 + 0.5 * Math.Cos(Math.PI * j / h));
+            int io = (int)(o & pcMask), i0 = (int)((ci + j) & pcMask), i1 = (i0 + 1) & pcMask;
+            pcAccL[io] += wgt * (pcL[i0] + (pcL[i1] - pcL[i0]) * fr); pcAccR[io] += wgt * (pcR[i0] + (pcR[i1] - pcR[i0]) * fr); pcW[io] += wgt;
+        }
+        pcLastC = c; pcNext += pcT / Math.Pow(2, pcCents / 1200);   // closer grains = higher pitch
+    }
+
+    void Analyse()   // YIN on the last 25 ms of the reduced copy; sets the period and how many cents to move it
+    {
+        int W = pcWin, tm = pcTauMax, st = pcDecN - W - tm, best = -1; double fa = Engine.SR / (double)pcDecim, energy = 0;
+        for (int j = 0; j < W; j++) { double x = pcDec[(st + j) & 1023]; energy += x * x; }
+        if (energy / W > 1e-6)   // quieter than -60 dB: nothing to tune
+        {
+            double run = 0; pcD[0] = 1;
+            for (int tau = 1; tau <= tm; tau++)
+            {
+                double d = 0; for (int j = 0; j < W; j++) { double x = pcDec[(st + j) & 1023] - pcDec[(st + j + tau) & 1023]; d += x * x; }
+                run += d; pcD[tau] = run > 0 ? d * tau / run : 1;
+            }
+            for (int tau = Math.Max(2, (int)(fa / 1000)); tau < tm; tau++)
+                if (pcD[tau] < 0.15) { while (tau + 1 < tm && pcD[tau + 1] < pcD[tau]) tau++; best = tau; break; }
+        }
+        if (best < 0) { pcT = Engine.SR / 200.0; pcCents = 0; DetectedHz = TargetHz = 0; return; }
+        double a = pcD[best - 1], m0 = pcD[best], c1 = pcD[best + 1], den = a - 2 * m0 + c1, tauF = best + (den > 0 ? 0.5 * (a - c1) / den : 0);
+        double f = fa / tauF, midi = 69 + 12 * Math.Log(f / 440, 2), dist = 99, note = midi;
+        for (int m = (int)Math.Floor(midi) - 6; m <= (int)Math.Ceiling(midi) + 6; m++) if (InScale(m) && Math.Abs(m - midi) < dist) { dist = Math.Abs(m - midi); note = m; }
+        double target = (note - midi) * 100 * P[2], tc = P[1] * 0.2;
+        pcCents += (target - pcCents) * (tc < 0.001 ? 1 : 1 - Math.Exp(-64 / fa / tc));
+        pcT = Math.Max(Engine.SR / 1000.0, Math.Min(Engine.SR / 80.0, Engine.SR / f)); DetectedHz = f; TargetHz = f * Math.Pow(2, pcCents / 1200);
+    }
+
     public void Process(float[] b, int n2, float[] key = null)   // b = interleaved stereo, n2 = float count; key = sidechain input (Compressor only)
     {
         switch (t)
@@ -565,7 +640,8 @@ class Effect
             case 10: Peq(b, n2); break;
             case 11: Multi(b, n2); break;
             case 12: Beat(b, n2); break;
-            default: Vocode(b, n2, key); break;
+            case 13: Vocode(b, n2, key); break;
+            default: PitchCorrect(b, n2); break;
         }
     }
 
@@ -6765,6 +6841,22 @@ class MainForm : Form
                 Func<float[], float[], double> vrun = (key, car) => { var v2 = new Effect("Vocoder"); var y = (float[])car.Clone(); for (int at = 0; at < y.Length; at += 2048) { var bk = new float[Math.Min(2048, y.Length - at)]; var kk = new float[bk.Length]; Array.Copy(y, at, bk, 0, bk.Length); Array.Copy(key, at, kk, 0, kk.Length); v2.Process(bk, bk.Length, kk); Array.Copy(bk, 0, y, at, bk.Length); } return Math.Sqrt(y.Skip(y.Length / 2).Average(v => (double)v * v)); };
                 double silentOut = vrun(quietKey, carrier), talkOut = vrun(talkKey, carrier); var untouched = run3(voc, carrier);
                 check(silentOut < 1e-3 && talkOut > 0.05 && untouched.SequenceEqual(carrier), "Vocoder: a saw with a silent voice is silent (" + silentOut.ToString("0.0000") + "), with a noisy one it speaks (" + talkOut.ToString("0.000") + "); with no sidechain it leaves the sound alone");
+                Func<double, float, float, float[]> tuneRun = (hz, scale, amount) =>   // a 1.5 s voice-like tone (a few harmonics) through a fresh pitch correction
+                {
+                    var pc = new Effect("Pitch correction"); pc.P[0] = scale; pc.P[2] = amount; int tlen = Engine.SR * 3 / 2; var y = new float[tlen * 2];
+                    for (int k = 0; k < tlen; k++) { double tph = 2 * Math.PI * hz * k / Engine.SR; y[2 * k] = y[2 * k + 1] = (float)(0.3 * Math.Sin(tph) + 0.15 * Math.Sin(2 * tph) + 0.08 * Math.Sin(3 * tph)); }
+                    for (int at = 0; at < y.Length; at += 2048) { var bk = new float[Math.Min(2048, y.Length - at)]; Array.Copy(y, at, bk, 0, bk.Length); pc.Process(bk, bk.Length); Array.Copy(bk, 0, y, at, bk.Length); }
+                    return y;
+                };
+                Func<float[], double> tunedHz = y => { int a0 = y.Length / 4, a1 = y.Length / 2 - 10, cross = 0, first = -1, lastX = -1; for (int k = a0; k < a1; k++) if (y[2 * (k - 1)] < 0 && y[2 * k] >= 0) { cross++; if (first < 0) first = k; lastX = k; } return (cross - 1) * (double)Engine.SR / (lastX - first); };
+                Func<float[], double> tunedRms = y => Math.Sqrt(y.Skip(y.Length / 2).Average(v => (double)v * v));
+                var chrom = tuneRun(450, 0, 1); var cmaj = tuneRun(470, 1.5f / 25, 1); var fMaj = tuneRun(470, 6.5f / 25, 1); var off = tuneRun(450, 0, 0);
+                double hzChrom = tunedHz(chrom), hzMaj = tunedHz(cmaj), hzF = tunedHz(fMaj), hzOff = tunedHz(off), inRms = Math.Sqrt((0.09 + 0.0225 + 0.0064) / 2);
+                var breath = (float[])loudNoise.Clone(); var pcN = new Effect("Pitch correction"); for (int at = 0; at < breath.Length; at += 2048) { var bk = new float[Math.Min(2048, breath.Length - at)]; Array.Copy(breath, at, bk, 0, bk.Length); pcN.Process(bk, bk.Length); Array.Copy(bk, 0, breath, at, bk.Length); }
+                double noiseIn = Math.Sqrt(loudNoise.Skip(loudNoise.Length / 2).Average(v => (double)v * v)), noiseOut = tunedRms(breath);
+                check(Math.Abs(hzChrom - 440) < 1.5 && Math.Abs(hzMaj - 493.88) < 1.5 && Math.Abs(hzF - 466.16) < 1.5 && Math.Abs(hzOff - 450) < 1.5
+                      && Math.Abs(tunedRms(chrom) / inRms - 1) < 0.1 && Math.Abs(noiseOut / noiseIn - 1) < 0.15,
+                    "Pitch correction: 450 Hz is pulled to A (" + hzChrom.ToString("0.0") + " Hz); 470 Hz goes to B in C major (" + hzMaj.ToString("0.0") + ") but to B flat in F major (" + hzF.ToString("0.0") + "); at 0% it stays at " + hzOff.ToString("0.0") + "; the level holds (" + (tunedRms(chrom) / inRms).ToString("0.00") + "×) and noise passes (" + (noiseOut / noiseIn).ToString("0.00") + "×)");
             }
 
             {   // limiter: nothing past the ceiling, quiet sound untouched (just 5 ms late); chorus, flanger, phaser change the sound, not its level
