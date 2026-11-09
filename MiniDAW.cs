@@ -699,8 +699,8 @@ class Effect
             comb = new float[8][]; ap = new float[4][];
             for (int s = 0; s < 2; s++)
             {
-                for (int j = 0; j < 4; j++) comb[s * 4 + j] = new float[CombLen[j] + 23 * s];   // +23 samples on the right = stereo width
-                for (int j = 0; j < 2; j++) ap[s * 2 + j] = new float[ApLen[j] + 23 * s];
+                for (int j = 0; j < 4; j++) comb[s * 4 + j] = new float[(CombLen[j] + 23 * s) * Engine.SR / 44100];   // +23 samples on the right = stereo width; scaled so the room sounds the same at 48 or 96 kHz
+                for (int j = 0; j < 2; j++) ap[s * 2 + j] = new float[(ApLen[j] + 23 * s) * Engine.SR / 44100];
             }
         }
         float fb = 0.7f + P[0] * 0.28f, damp = P[1] * 0.4f, mix = P[2];
@@ -1283,6 +1283,20 @@ static class Wav
 
     public static byte[] Make16(float[] data, int rate, int chans) { return Make(data, rate, chans, 16); }
 
+    public static float[] Halve(float[] lr)   // interleaved stereo to half its rate, low-passed first (65-tap Blackman sinc) so nothing above the new Nyquist folds back
+    {
+        const int T = 32; var h = new double[2 * T + 1]; double sum = 0;
+        for (int k = -T; k <= T; k++) { h[k + T] = (k == 0 ? 0.5 : Math.Sin(Math.PI * k / 2) / (Math.PI * k)) * (0.42 + 0.5 * Math.Cos(Math.PI * k / T) + 0.08 * Math.Cos(2 * Math.PI * k / T)); sum += h[k + T]; }
+        int frames = lr.Length / 2, n = frames / 2; var o = new float[n * 2];
+        for (int i = 0; i < n; i++)
+            for (int c = 0; c < 2; c++)
+            {
+                double acc = 0; for (int k = -T; k <= T; k++) { int j = 2 * i + k; if (j >= 0 && j < frames) acc += h[k + T] * lr[2 * j + c]; }
+                o[2 * i + c] = (float)(acc / sum);
+            }
+        return o;
+    }
+
     public static byte[] Make(float[] data, int rate, int chans, int bits)   // 16 or 24-bit PCM, or 32-bit float; data is interleaved when chans > 1
     {
         int bps = bits / 8;
@@ -1842,9 +1856,9 @@ class Engine
     [DllImport("winmm.dll")] static extern int timeBeginPeriod(int ms);
     [DllImport("winmm.dll")] static extern int timeEndPeriod(int ms);
 
-    public const int SR = 44100;
+    public static int SR = 44100;   // set once at start-up from the audio settings (44.1, 48 or 96 kHz), before anything is made
     const int Frames = 1024, NBuf = 4, MaxVoices = 64;   // ~93 ms of buffered output
-    public static int OutputDelay { get { return Frames * NBuf + Frames / 2; } }   // frames between rendering a sound and hearing it: a recording is shifted back by this
+    public static int OutputDelay = Frames * NBuf + Frames / 2;   // frames between rendering a sound and hearing it (set by the output in use): a recording is shifted back by this
 
     public class Voice { public double[] Ph; public double Z3; public int StopAt; public bool Audio; public Channel Ch; public int Key, Age, Len, Wait, GlideAge, GlideLen; public float Gain = 1, NotePan; public double Phase, Pos, Rate, Z1, Z2, Detune = 1, Shift, ShiftFrom, ShiftTo; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Shift: semitones it's currently bent by (slides, glide), moving from ShiftFrom to ShiftTo over GlideLen samples   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; NotePan/Detune: the note's own pan and fine pitch; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)   // StopAt: an audio clip's end (samples); Audio: an audio clip, played at its own pitch
 
@@ -2307,7 +2321,7 @@ class Engine
         }
         else   // time-stretch: two overlapping 50 ms grains read at the note's pitch, while where they start moves Stretch times slower
         {
-            const int G = SR / 20;
+            int G = SR / 20;
             l = r = 0;
             for (int j = 0; j < 2; j++)
             {
@@ -2393,8 +2407,14 @@ class Engine
         v.Stereo = true; v.Right = (float)(r * vol * Math.Min(1, 1 + pan));
         return (float)(l * vol * Math.Min(1, 1 - pan));
     }
+    IOutput output;   // WASAPI or ASIO, when one of those is chosen instead of waveOut
+
     public string Start()
     {
+        Action<float[], int> render = (lr, n) => { try { Render(lr, n); } catch (Exception e) { LastError = e.Message; Array.Clear(lr, 0, n * 2); } };   // keep the app alive; UI shows the error
+        if (AudioSettings.Backend == "wasapi") { var w = new WasapiOut(render); if (w.Error != null) return "Couldn't start WASAPI output: " + w.Error; output = w; return null; }
+        if (AudioSettings.Backend == "asio") { string err2; output = AsioOut.Open(AudioSettings.Asio, render, out err2); return err2; }
+        OutputDelay = Frames * NBuf + Frames / 2;
         var fmt = new WAVEFORMATEX { wFormatTag = 1, nChannels = 2, nSamplesPerSec = SR, wBitsPerSample = 16, nBlockAlign = 4, nAvgBytesPerSec = SR * 4 };
         int err = waveOutOpen(out hwo, -1, ref fmt, IntPtr.Zero, IntPtr.Zero, 0);   // -1 = WAVE_MAPPER (default device)
         if (err != 0) return "Could not open the audio device (waveOutOpen error " + err + ").";
@@ -2406,6 +2426,7 @@ class Engine
 
     public void Stop()
     {
+        if (output != null) { output.Stop(); output = null; }
         if (thread == null) return;
         running = false; thread.Join(1000); thread = null;
     }
@@ -2692,6 +2713,197 @@ class AudioInput
         if (thread == null) return new float[0];
         running = false; thread.Join(2000); thread = null;
         lock (got) { var f = new float[got.Count]; for (int k = 0; k < f.Length; k++) f[k] = got[k] / 32768f; return f; }
+    }
+}
+
+// ---------------------------------------------------------------- audio outputs besides waveOut, and their settings
+static class AudioSettings   // which output and sample rate; kept per Windows user next to the recent list
+{
+    public static string Backend = "waveout", Asio = ""; public static int Rate = 44100;
+    internal static string FilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MiniDAW", "audio.txt");
+    public static void Load()
+    {
+        try
+        {
+            if (!File.Exists(FilePath)) return;
+            var f = File.ReadAllText(FilePath).Split('\t');
+            if (f.Length >= 3) { Backend = f[0] == "wasapi" || f[0] == "asio" ? f[0] : "waveout"; int r; Rate = int.TryParse(f[1], out r) && (r == 44100 || r == 48000 || r == 96000) ? r : 44100; Asio = f[2]; }
+        }
+        catch (IOException) { } catch (UnauthorizedAccessException) { }   // unreadable: the defaults
+    }
+    public static void Save()
+    {
+        try { Directory.CreateDirectory(Path.GetDirectoryName(FilePath)); File.WriteAllText(FilePath, Backend + "\t" + Rate + "\t" + Asio); }
+        catch (IOException) { } catch (UnauthorizedAccessException) { }
+    }
+}
+
+interface IOutput { void Stop(); }
+
+// WASAPI shared mode: Windows' own low-latency path (~20 ms), pulled from a thread of its own (an MTA, as COM audio wants). Windows
+// converts our float stereo at Engine.SR to the device's format, so any of the three rates works.
+class WasapiOut : IOutput
+{
+    [ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")] class MMDeviceEnumerator { }
+    [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDeviceEnumerator { void EnumAudioEndpoints(); [PreserveSig] int GetDefaultAudioEndpoint(int flow, int role, out IMMDevice dev); }
+    [ComImport, Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IMMDevice { [PreserveSig] int Activate([In] ref Guid iid, int ctx, IntPtr prm, [MarshalAs(UnmanagedType.IUnknown)] out object o); }
+    [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioClient
+    {
+        [PreserveSig] int Initialize(int shareMode, int flags, long duration, long period, ref WAVEFORMATEX fmt, IntPtr session);
+        [PreserveSig] int GetBufferSize(out int frames);
+        void GetStreamLatency();
+        [PreserveSig] int GetCurrentPadding(out int frames);
+        void IsFormatSupported(); void GetMixFormat(); void GetDevicePeriod();
+        [PreserveSig] int Start(); [PreserveSig] int Stop(); void Reset(); void SetEventHandle();
+        [PreserveSig] int GetService([In] ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object o);
+    }
+    [ComImport, Guid("F294ACFC-3146-4483-A7BF-ADDCA7C260E2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IAudioRenderClient { [PreserveSig] int GetBuffer(int frames, out IntPtr data); [PreserveSig] int ReleaseBuffer(int frames, int flags); }
+
+    readonly Thread thread; volatile bool running = true; readonly ManualResetEvent ready = new ManualResetEvent(false);
+    public string Error;
+    public int Blocks;   // buffers filled so far (the live check counts them)
+
+    public WasapiOut(Action<float[], int> render)
+    {
+        thread = new Thread(() => Loop(render)) { IsBackground = true, Priority = ThreadPriority.Highest, Name = "wasapi" };
+        thread.Start();
+        if (!ready.WaitOne(5000)) Error = "the audio device didn't answer";
+    }
+
+    static void Check(int hr, string what) { if (hr < 0) throw new InvalidOperationException(what + " failed (0x" + hr.ToString("X8") + ")"); }
+
+    void Loop(Action<float[], int> render)
+    {
+        IAudioClient ac = null;
+        try
+        {
+            var en = (IMMDeviceEnumerator)new MMDeviceEnumerator();
+            IMMDevice dev; Check(en.GetDefaultAudioEndpoint(0, 0, out dev), "Finding the default output");
+            object o; var iid = typeof(IAudioClient).GUID; Check(dev.Activate(ref iid, 23, IntPtr.Zero, out o), "Opening it"); ac = (IAudioClient)o;
+            var fmt = new WAVEFORMATEX { wFormatTag = 3, nChannels = 2, nSamplesPerSec = Engine.SR, wBitsPerSample = 32, nBlockAlign = 8, nAvgBytesPerSec = Engine.SR * 8 };
+            Check(ac.Initialize(0, unchecked((int)0x88000000), 400000, 0, ref fmt, IntPtr.Zero), "Setting it up");   // shared; Windows converts the format; 40 ms buffer
+            int size; Check(ac.GetBufferSize(out size), "GetBufferSize");
+            var rid = typeof(IAudioRenderClient).GUID; Check(ac.GetService(ref rid, out o), "GetService"); var rc = (IAudioRenderClient)o;
+            Engine.OutputDelay = size;
+            var buf = new float[size * 2];
+            Check(ac.Start(), "Starting it"); ready.Set();
+            while (running)
+            {
+                int pad; ac.GetCurrentPadding(out pad); int avail = size - pad;
+                if (avail < size / 4) { Thread.Sleep(2); continue; }   // refill in quarters: ~10 ms at a time
+                IntPtr p; if (rc.GetBuffer(avail, out p) < 0) { Thread.Sleep(2); continue; }
+                render(buf, avail); Marshal.Copy(buf, 0, p, avail * 2); rc.ReleaseBuffer(avail, 0); Blocks++;
+            }
+            ac.Stop();
+        }
+        catch (Exception e) { Error = e.Message; }
+        finally { ready.Set(); if (ac != null) Marshal.ReleaseComObject(ac); }
+    }
+
+    public void Stop() { running = false; thread.Join(1000); }
+}
+
+// ASIO: the driver's buffer callbacks pull from Engine.Render. The driver is made with CoCreateInstance (its CLSID doubles as the
+// interface id, as ASIO does) and called through its vtable; its callbacks are delegates we keep alive.
+class AsioOut : IOutput
+{
+    [DllImport("ole32.dll")] static extern int CoCreateInstance([In] ref Guid clsid, IntPtr outer, int ctx, [In] ref Guid iid, out IntPtr obj);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate int NoArgs(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate int PtrArg(IntPtr self, IntPtr p);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate int TwoOut(IntPtr self, out int a, out int b);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate int FourOut(IntPtr self, out int a, out int b, out int c, out int d);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate int RateArg(IntPtr self, double rate);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] delegate int Create(IntPtr self, IntPtr infos, int count, int size, IntPtr callbacks);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void SwitchFn(int index, int direct);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate void RateFn(double rate);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate int MessageFn(int selector, int value, IntPtr msg, IntPtr opt);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] delegate IntPtr TimeFn(IntPtr time, int index, int direct);
+    [StructLayout(LayoutKind.Sequential)] struct BufferInfo { public int IsInput, Channel; public IntPtr Buf0, Buf1; }
+    [StructLayout(LayoutKind.Sequential)] struct ChannelInfo { public int Channel, IsInput, IsActive, Group, Type; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 32)] public byte[] Name; }
+
+    public static List<string> Drivers()   // the ASIO drivers installed (HKLM\SOFTWARE\ASIO)
+    {
+        var list = new List<string>();
+        using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\ASIO")) if (k != null) list.AddRange(k.GetSubKeyNames());
+        return list;
+    }
+
+    IntPtr drv; T Fn<T>(int slot) where T : class { return Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(Marshal.ReadIntPtr(drv), slot * IntPtr.Size), typeof(T)) as T; }
+    SwitchFn onSwitch; RateFn onRate; MessageFn onMessage; TimeFn onTime;   // kept alive while the driver holds them
+    IntPtr callbacks, infos; BufferInfo[] bufs; int size, type; float[] lr; Action<float[], int> render;
+    public int Blocks;
+
+    public static AsioOut Open(string name, Action<float[], int> render, out string error)
+    {
+        var a = new AsioOut { render = render }; error = a.Init(name);
+        if (error == null) return a;
+        a.Stop(); return null;
+    }
+
+    string Init(string name)
+    {
+        string clsid;
+        using (var k = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SOFTWARE\ASIO\" + name)) clsid = k == null ? null : k.GetValue("CLSID") as string;
+        if (clsid == null) return "The ASIO driver \"" + name + "\" isn't installed.";
+        var id = new Guid(clsid);
+        if (CoCreateInstance(ref id, IntPtr.Zero, 1, ref id, out drv) < 0 || drv == IntPtr.Zero) { drv = IntPtr.Zero; return "Couldn't load the ASIO driver \"" + name + "\"."; }
+        if (Fn<PtrArg>(3)(drv, System.Diagnostics.Process.GetCurrentProcess().MainWindowHandle) != 1) return "The ASIO driver \"" + name + "\" didn't start (is another program using it?).";
+        int ins, outs; Fn<TwoOut>(9)(drv, out ins, out outs);
+        if (outs < 2) return "The ASIO driver has fewer than 2 outputs.";
+        if (Fn<RateArg>(12)(drv, Engine.SR) != 0) return "The ASIO driver can't run at " + Engine.SR + " Hz; pick another sample rate in Audio settings (F10).";
+        Fn<RateArg>(14)(drv, Engine.SR);
+        int min, max, pref, gran; Fn<FourOut>(11)(drv, out min, out max, out pref, out gran); size = pref;
+        var ci = new ChannelInfo { Channel = 0, IsInput = 0, Name = new byte[32] }; IntPtr cip = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(ChannelInfo)));
+        Marshal.StructureToPtr(ci, cip, false); Fn<PtrArg>(18)(drv, cip); type = ((ChannelInfo)Marshal.PtrToStructure(cip, typeof(ChannelInfo))).Type; Marshal.FreeHGlobal(cip);
+        if (type < 16 || type > 20) return "The ASIO driver uses a sample format MiniDAW doesn't write (" + type + ").";
+        onSwitch = Switch; onRate = r => { }; onMessage = Message; onTime = (t, i, d) => { Switch(i, d); return t; };
+        callbacks = Marshal.AllocHGlobal(4 * IntPtr.Size);
+        Marshal.WriteIntPtr(callbacks, 0, Marshal.GetFunctionPointerForDelegate(onSwitch)); Marshal.WriteIntPtr(callbacks, IntPtr.Size, Marshal.GetFunctionPointerForDelegate(onRate));
+        Marshal.WriteIntPtr(callbacks, 2 * IntPtr.Size, Marshal.GetFunctionPointerForDelegate(onMessage)); Marshal.WriteIntPtr(callbacks, 3 * IntPtr.Size, Marshal.GetFunctionPointerForDelegate(onTime));
+        int bsz = Marshal.SizeOf(typeof(BufferInfo)); infos = Marshal.AllocHGlobal(2 * bsz);
+        for (int c = 0; c < 2; c++) Marshal.StructureToPtr(new BufferInfo { IsInput = 0, Channel = c }, infos + c * bsz, false);
+        lr = new float[size * 2];
+        if (Fn<Create>(19)(drv, infos, 2, size, callbacks) != 0) return "The ASIO driver wouldn't make its buffers.";
+        bufs = new BufferInfo[2]; for (int c = 0; c < 2; c++) bufs[c] = (BufferInfo)Marshal.PtrToStructure(infos + c * bsz, typeof(BufferInfo));
+        int li, lo; Fn<TwoOut>(10)(drv, out li, out lo); Engine.OutputDelay = Math.Max(size, lo);
+        if (Fn<NoArgs>(7)(drv) != 0) return "The ASIO driver wouldn't start.";
+        return null;
+    }
+
+    int Message(int selector, int value, IntPtr msg, IntPtr opt)   // what we tell the driver we support: only the basics, so it uses plain buffer switches
+    {
+        if (selector == 1) return value == 1 || value == 2 ? 1 : 0;   // kAsioSelectorSupported: selector-supported and engine-version
+        return selector == 2 ? 2 : 0;                                  // kAsioEngineVersion: 2
+    }
+
+    void Switch(int index, int direct)   // the driver wants buffer half `index` filled
+    {
+        render(lr, size); Blocks++;
+        for (int c = 0; c < 2; c++) Write(index == 0 ? bufs[c].Buf0 : bufs[c].Buf1, c);
+    }
+
+    void Write(IntPtr dst, int side)   // one side of lr in the driver's sample format
+    {
+        for (int k = 0; k < size; k++)
+        {
+            double x = Math.Max(-1, Math.Min(1, lr[2 * k + side]));
+            if (type == 16) Marshal.WriteInt16(dst, k * 2, (short)(x * 32767));
+            else if (type == 17) { int v = (int)(x * 8388607); Marshal.WriteByte(dst, k * 3, (byte)v); Marshal.WriteByte(dst, k * 3 + 1, (byte)(v >> 8)); Marshal.WriteByte(dst, k * 3 + 2, (byte)(v >> 16)); }
+            else if (type == 18) Marshal.WriteInt32(dst, k * 4, (int)(x * 2147483647.0));
+            else if (type == 19) Marshal.WriteInt32(dst, k * 4, BitConverter.ToInt32(BitConverter.GetBytes((float)x), 0));
+            else Marshal.WriteInt64(dst, k * 8, BitConverter.DoubleToInt64Bits(x));
+        }
+    }
+
+    public void Stop()
+    {
+        if (drv != IntPtr.Zero) { Fn<NoArgs>(8)(drv); if (bufs != null) Fn<NoArgs>(20)(drv); Fn<NoArgs>(2)(drv); drv = IntPtr.Zero; }   // stop, dispose the buffers, release
+        if (callbacks != IntPtr.Zero) { Marshal.FreeHGlobal(callbacks); callbacks = IntPtr.Zero; }
+        if (infos != IntPtr.Zero) { Marshal.FreeHGlobal(infos); infos = IntPtr.Zero; }
     }
 }
 
@@ -3004,9 +3216,9 @@ class MainForm : Form
         updateBtn = Gap(Btn(bar, "Update", (s, e) => InstallUpdate()));   // shown only when GitHub has a newer release
         updateBtn.BackColor = updateBtn.FlatAppearance.BorderColor = Color.FromArgb(46, 140, 82); updateBtn.Font = Bold; updateBtn.Visible = false;
         updateBtn.FlatAppearance.MouseOverBackColor = Color.FromArgb(60, 165, 100);
-        var about = new PictureBox { Image = Logo.Draw(24), Size = new Size(28, 28), SizeMode = PictureBoxSizeMode.CenterImage, Cursor = Cursors.Hand, Margin = new Padding(8, 2, 0, 0) };
-        about.Click += (s, e) => ShowAbout();   // the banana at the end of the toolbar
-        new ToolTip().SetToolTip(about, "About MiniDAW (F1)");
+        about = new PictureBox { Image = Logo.Draw(24), Size = new Size(28, 28), SizeMode = PictureBoxSizeMode.CenterImage, Cursor = Cursors.Hand, Margin = new Padding(8, 2, 0, 0) };
+        about.MouseUp += (s, e) => { if (e.Button == MouseButtons.Right) AudioMenu(about); else ShowAbout(); };   // the banana at the end of the toolbar
+        new ToolTip().SetToolTip(about, "About MiniDAW (F1)  ·  right-click: audio settings (F10)");
         bar.Controls.Add(about);
 
         playlist.Dock = DockStyle.Bottom; playlist.Height = 220;
@@ -3074,7 +3286,13 @@ class MainForm : Form
         RefreshAll(0);
         dirty = false;
         string startErr = eng.Start();
-        if (startErr != null) MessageBox.Show(this, startErr + "\nThe editor works, but nothing will be heard.", "MiniDAW");
+        if (startErr != null && AudioSettings.Backend != "waveout")   // the saved WASAPI/ASIO output is gone or busy: fall back to plain Windows audio for this run
+        {
+            eng.Stop(); AudioSettings.Backend = "waveout";
+            startErr = eng.Start() == null ? startErr + "\nPlaying through Windows audio (waveOut) instead; F10 picks the output." : startErr;
+            MessageBox.Show(this, startErr, "MiniDAW");
+        }
+        else if (startErr != null) MessageBox.Show(this, startErr + "\nThe editor works, but nothing will be heard.", "MiniDAW");
         FillMidi();
     }
 
@@ -3233,6 +3451,7 @@ class MainForm : Form
         if (keyData == Keys.F9) { ToggleMixer(); return true; }
         if (keyData == Keys.F8) { ToggleBrowser(); return true; }
         if (keyData == Keys.F1) { ShowAbout(); return true; }
+        if (keyData == Keys.F10) { AudioMenu(about); return true; }
         if (keyData == Keys.Escape && learning != null) { eng.LearnTarget = null; learning = null; learnFor = null; Text = "MiniDAW" + (filePath != null ? " — " + Path.GetFileName(filePath) : ""); return true; }
         if (keyData == (Keys.Control | Keys.M)) { ToggleMetronome(); return true; }
         if (keyData == (Keys.Control | Keys.Z)) { UndoRedo(false); return true; }
@@ -3296,6 +3515,35 @@ class MainForm : Form
     }
 
     void ShowAbout() { using (var a = new AboutForm(false)) a.ShowDialog(this); }
+
+    PictureBox about;
+    void AudioMenu(Control at)   // F10 or right-click the banana: which output to play through, and the sample rate
+    {
+        var m = new ContextMenuStrip();
+        Action<string, string, string> output = (label, backend, asio) =>
+            ((ToolStripMenuItem)m.Items.Add(label, null, (s, e) => SetOutput(backend, asio))).Checked = AudioSettings.Backend == backend && (backend != "asio" || AudioSettings.Asio == asio);
+        output("Windows audio (waveOut, ~90 ms delay)", "waveout", "");
+        output("WASAPI (~40 ms delay)", "wasapi", "");
+        foreach (var d in AsioOut.Drivers()) output("ASIO: " + d, "asio", d);
+        m.Items.Add(new ToolStripSeparator());
+        foreach (int r in new[] { 44100, 48000, 96000 })
+        {
+            int rate = r; string label = (r / 1000.0).ToString("0.#", CultureInfo.InvariantCulture) + " kHz" + (r != Engine.SR && r == AudioSettings.Rate ? "  (when MiniDAW starts again)" : "");
+            ((ToolStripMenuItem)m.Items.Add(label, null, (s, e) => { AudioSettings.Rate = rate; AudioSettings.Save(); })).Checked = AudioSettings.Rate == r;
+        }
+        m.Show(at, 0, at.Height);
+    }
+
+    void SetOutput(string backend, string asio)   // switch now; if the new one won't start, go back to the old one and say why
+    {
+        string oldB = AudioSettings.Backend, oldA = AudioSettings.Asio;
+        eng.Stop(); AudioSettings.Backend = backend; AudioSettings.Asio = asio;
+        string err = eng.Start();
+        if (err == null) { AudioSettings.Save(); return; }
+        AudioSettings.Backend = oldB; AudioSettings.Asio = oldA; eng.Stop();
+        string err2 = eng.Start();
+        MessageBox.Show(this, err + (err2 == null ? "\n\nMiniDAW kept the previous output." : "\n\n" + err2), "MiniDAW", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
 
     // ---- autosave: every minute, unsaved work is copied to %APPDATA%\MiniDAW\autosave.mdaw. Saving, discarding or closing
     // normally deletes it, so finding one at start-up means the last session ended abruptly, and it's offered back.
@@ -3612,7 +3860,7 @@ class MainForm : Form
             fmt.SelectedIndexChanged += (s, e) => { q.Items.Clear(); q.Items.AddRange(Qualities(fmt.SelectedIndex)); q.SelectedIndex = fmt.SelectedIndex == 2 ? 3 : 0; };
             fmt.SelectedIndex = exportFormat; q.SelectedIndex = Math.Min(exportQuality, q.Items.Count - 1);
             var stems = new CheckBox { Text = "Also save each mixer insert as its own file (stems)", Left = 14, Top = 82, AutoSize = true, Checked = exportStems };
-            var what = new Label { Text = eng.SongMode ? "Exports the whole song (Song mode), 44.1 kHz stereo." : "Exports the current pattern (Pattern mode), 44.1 kHz stereo.", Left = 14, Top = 108, AutoSize = true, ForeColor = Dim };
+            var what = new Label { Text = (eng.SongMode ? "Exports the whole song (Song mode), " : "Exports the current pattern (Pattern mode), ") + (Engine.SR / 1000.0).ToString("0.#", CultureInfo.InvariantCulture) + " kHz stereo" + (Engine.SR > 48000 ? " (MP3: 48 kHz)." : "."), Left = 14, Top = 108, AutoSize = true, ForeColor = Dim };
             f.Controls.AddRange(new Control[] { new Label { Text = "Format", Left = 14, Top = 18, AutoSize = true }, fmt, new Label { Text = "Quality", Left = 14, Top = 50, AutoSize = true }, q, stems, what });
             var ok = Btn(f, "Export…", null); ok.DialogResult = DialogResult.OK; ok.AutoSize = false; ok.SetBounds(196, 138, 84, 28);
             var cancel = Btn(f, "Cancel", null); cancel.DialogResult = DialogResult.Cancel; cancel.AutoSize = false; cancel.SetBounds(286, 138, 78, 28);
@@ -3657,7 +3905,7 @@ class MainForm : Form
     {
         if (format == 0) File.WriteAllBytes(path, Wav.Make(lr, Engine.SR, 2, new[] { 16, 24, 32 }[quality]));
         else if (format == 1) File.WriteAllBytes(path, Flac.Encode(lr, Engine.SR, new[] { 16, 24 }[quality]));
-        else MediaFoundation.Mp3(path, lr, Engine.SR, new[] { 128, 192, 256, 320 }[quality]);
+        else MediaFoundation.Mp3(path, Engine.SR > 48000 ? Wav.Halve(lr) : lr, Engine.SR > 48000 ? Engine.SR / 2 : Engine.SR, new[] { 128, 192, 256, 320 }[quality]);   // MP3 tops out at 48 kHz
     }
 
     string InsertName(int i)   // "Insert 3 (Snare)", from the channels that feed it
@@ -5553,6 +5801,7 @@ class MainForm : Form
             return 0;
         }
         Application.EnableVisualStyles();
+        AudioSettings.Load(); Engine.SR = AudioSettings.Rate;   // before anything that sizes buffers by the rate is made
         if (args.Length >= 2 && args[0] == "--screenshot")   // the real window drawn to a PNG: built off-screen, never activated, then closed
         {
             screenshotMode = true;
@@ -6372,6 +6621,33 @@ class MainForm : Form
                 check(before == 0 && during > 0.2 && after < 1e-4 && Math.Abs(atStep17 / expectAt - 1) < 0.1 && midBuf.Max(x => Math.Abs(x)) > 0.1
                       && sb2.Clips.Count == 1 && sb2.Clips[0].Channel == 4 && sb2.Clips[0].Offset == 4 && sv2.Clips.Count == 0,
                     "audio clips: one at bar 2 trimmed 4 16ths in plays only its 8 16ths, from the right place in the audio (" + atStep17.ToString("0.00") + " vs " + expectAt.ToString("0.00") + "); playback starting inside it plays it from there; it saves, and goes with its channel");
+            }
+            {   // 48 and 96 kHz: a 44.1 kHz sample keeps its pitch; MP3's half-rate copy keeps 1 kHz and drops 40 kHz (which would fold to 8 kHz); the audio settings file round-trips
+                int keepSr = Engine.SR; string keepFile = AudioSettings.FilePath, keepB = AudioSettings.Backend, keepA = AudioSettings.Asio; int keepR = AudioSettings.Rate;
+                try
+                {
+                    var tone441 = Enumerable.Range(0, 22050).Select(k => (float)(0.5 * Math.Sin(2 * Math.PI * 440 * k / 44100))).ToArray();
+                    Func<int, double> pitchAt = rate =>
+                    {
+                        Engine.SR = rate; var pj = new Project(); pj.Channels.Add(new Channel { Kind = "sample", Name = "T", Insert = 1, Sample = tone441, SampleRate = 44100 });
+                        var pt = new Pattern { Name = "P" }; pt.SetBars(1); pj.Patterns.Add(pt); pt.For(0).Add(new Note { Step = 0, Key = 60, Len = 2 });
+                        var o = Engine.Bounce(pj, false, 0); int cross = 0, first = -1, last = -1;
+                        for (int k = rate / 20; k < rate / 5; k++) if (o[2 * (k - 1)] < 0 && o[2 * k] >= 0) { cross++; if (first < 0) first = k; last = k; }
+                        return (cross - 1) * (double)rate / (last - first);
+                    };
+                    double p48 = pitchAt(48000), p96 = pitchAt(96000); Engine.SR = keepSr;
+                    var mix = new float[96000 * 2]; for (int k = 0; k < 96000; k++) mix[2 * k] = mix[2 * k + 1] = (float)(0.4 * Math.Sin(2 * Math.PI * 1000 * k / 96000) + 0.4 * Math.Sin(2 * Math.PI * 40000 * k / 96000));
+                    var half = Wav.Halve(mix); double err = 0; for (int k = 1000; k < 47000; k++) err = Math.Max(err, Math.Abs(half[2 * k] - 0.4 * Math.Sin(2 * Math.PI * 1000 * k / 48000)));
+                    AudioSettings.FilePath = Path.Combine(Path.GetTempPath(), "minidaw_audio_test.txt");
+                    AudioSettings.Backend = "asio"; AudioSettings.Asio = "Some Driver"; AudioSettings.Rate = 96000; AudioSettings.Save();
+                    AudioSettings.Backend = "waveout"; AudioSettings.Asio = ""; AudioSettings.Rate = 44100; AudioSettings.Load();
+                    bool round = AudioSettings.Backend == "asio" && AudioSettings.Asio == "Some Driver" && AudioSettings.Rate == 96000;
+                    File.WriteAllText(AudioSettings.FilePath, "nonsense\t12345\t"); AudioSettings.Load(); bool bad = AudioSettings.Backend == "waveout" && AudioSettings.Rate == 44100;
+                    File.Delete(AudioSettings.FilePath);
+                    check(Math.Abs(p48 - 440) < 2 && Math.Abs(p96 - 440) < 2 && half.Length == 96000 && err < 0.01 && round && bad,
+                        "48 and 96 kHz: a 440 Hz sample plays at " + p48.ToString("0.0") + " and " + p96.ToString("0.0") + " Hz; halving 96 kHz for MP3 keeps a 1 kHz tone (off by " + err.ToString("0.0000") + ") and removes 40 kHz; the output and rate are saved and read back, and a bad file gives the defaults");
+                }
+                finally { Engine.SR = keepSr; AudioSettings.FilePath = keepFile; AudioSettings.Backend = keepB; AudioSettings.Asio = keepA; AudioSettings.Rate = keepR; }
             }
             {   // sampler options and the analog synth
                 int sr = Engine.SR;

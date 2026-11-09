@@ -1,4 +1,4 @@
-﻿# MiniDAW
+# MiniDAW
 
 ![MiniDAW's banana logo](banana.png)
 
@@ -26,7 +26,7 @@ Needs Windows 10 or 11.
   C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:winexe /win32icon:banana.ico /out:MiniDAW.exe MiniDAW.cs
   ```
 - **Logo:** the banana is drawn in code, so it's sharp at every size: in the title bar, the taskbar, and on `MiniDAW.exe` itself. [banana.ico](banana.ico) and [banana.png](banana.png) come from `MiniDAW.exe --logo banana.ico`. To build from scratch without them, leave out `/win32icon:banana.ico`; the window still gets its banana.
-- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 147 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
+- **Self-test:** `MiniDAW.exe --selftest result.txt` runs 150 checks and writes them to `result.txt`. The exit code is 0 when all of them pass.
 - **Installer:** [Setup.cs](Setup.cs) builds `MiniDAW-Setup.exe`, with `MiniDAW.exe`, this README and the logo embedded in it. Its build line is at the top of the file.
 - **Releasing a new version:**
   1. Raise `AboutForm.Version` in MiniDAW.cs, for example from 1.1 to 1.2, and commit.
@@ -90,6 +90,11 @@ Needs Windows 10 or 11.
 - **The ruler** (the bar numbers):
   - Drag along it to set a **loop region**; Song mode then plays just that part over and over. A click without a drag clears it.
   - Right-click it to add a **marker** with a name, or a **time signature** (2/4 to 7/4) from that point. The bar numbers, bar lines and the metronome's accents follow it.
+- **Audio clips:** drop WAV files on the playlist. Each one becomes a sample channel and a clip where you dropped it, drawn as its waveform.
+  - Move, trim (either edge), split (**Ctrl+click**) and delete them like pattern clips.
+  - They play at their own speed whatever the tempo, and Song mode plays them from wherever playback starts, even from the middle of a clip.
+  - Deleting the channel removes its clips.
+
 ## Sounds
 
 **Built-in sounds:** add one with **+ Sound**, or change a channel's sound with right-click its name → **Sound**. They are all made by code, with no sample files. [sounds_demo.wav](sounds_demo.wav) plays each one for a bar.
@@ -222,6 +227,15 @@ The menu offers:
 - **Record:** turn on **● Rec**, use **Pattern** mode, and press Play. Notes go into the current pattern on the selected channel. They snap to 16ths, and the app allows for the audio delay so they land where you heard them. Stopping playback ends the take.
   - **Count-in:** recording starts with one bar of metronome clicks, then the pattern begins. Keys you press during the count-in aren't recorded. Right-click the metronome button to turn the count-in off.
   - **Loop recording:** the pattern keeps looping while you record, and every pass adds its notes on top of the earlier ones, so you can build a part up layer by layer.
+- **Recording audio** (a microphone or line in): right-click **● Rec** and pick **Record audio from …** your input. Then turn on **● Rec** and press Play.
+  - Stopping playback ends the take. It's saved as a WAV in `Music\MiniDAW Recordings` and becomes a new channel with an audio clip on the first free playlist track.
+  - The clip starts at bar 1, or at the loop region's start in Song mode. That part of the song plays while you record, so you can sing or play along.
+  - The take is shifted by the output delay, so it lines up with what you heard. Takes shorter than 0.1 s are dropped.
+  - Right-click **● Rec** → **Record notes from MIDI and computer keyboards** goes back to recording notes.
+- **Audio editor** (right-click a sample channel → **Edit audio…**), a simple take on FL's Edison:
+  - Drag across the waveform to select part of it.
+  - Then **Trim** (keep only the selection), **Delete**, **Silence**, **Reverse**, **Normalize**, **Fade in** or **Fade out**. With nothing selected, an operation works on the whole sound.
+  - Each edit is saved as a new WAV in `Music\MiniDAW Recordings\Edits` and is one undo step. The original file is never changed.
 - **Metronome:** the button next to **● Rec** (or **Ctrl+M**) clicks on every beat, higher on the first beat of each bar. It's only for you: exports never include it, and the master fader doesn't change its volume.
 
 ## Export
@@ -234,7 +248,7 @@ The menu offers:
 | FLAC | 16-bit, 24-bit | Lossless: sounds exactly like the WAV at roughly half the size. MiniDAW encodes it itself |
 | MP3 | 128, 192, 256, 320 kbps | Uses the MP3 encoder built into Windows (on Windows "N" editions, install the Media Feature Pack) |
 
-Everything is 44.1 kHz stereo. Tick **stems** to also save every mixer insert that carries sound as its own file next to the main one, named like `song - Insert 2 (Snare).flac`. Each stem is that insert's output after its effects and fader, and all of them line up with the main file, so you can mix them elsewhere.
+Files are stereo at the sample rate you play at (see **Audio output** below), so 44.1, 48 or 96 kHz. MP3 can't go above 48 kHz, so a 96 kHz project's MP3 is filtered down to 48 kHz first. Tick **stems** to also save every mixer insert that carries sound as its own file next to the main one, named like `song - Insert 2 (Snare).flac`. Each stem is that insert's output after its effects and fader, and all of them line up with the main file, so you can mix them elsewhere.
 
 The export window remembers your choices until MiniDAW closes.
 ## MIDI files
@@ -251,6 +265,20 @@ The export window remembers your choices until MiniDAW closes.
   - Timing is kept to 1/96 of a beat, so triplets and swung playing survive. A note that crosses a 4-bar boundary is cut there.
   - The project keeps its own tempo; the summary tells you the file's.
 
+## Audio output
+
+Press **F10**, or right-click the banana at the end of the toolbar, for the audio menu:
+
+| Output | Delay | Notes |
+|---|---|---|
+| Windows audio (waveOut) | about 90 ms | Works everywhere. The default |
+| WASAPI | about 40 ms | Windows' newer audio path, through your default output device |
+| ASIO | depends on the driver, often 5 to 20 ms | Lists every ASIO driver installed, such as your audio interface's. Set its buffer size in the driver's own settings |
+
+- The output switches as soon as you pick it. If it won't start (for example, another program is using the ASIO driver), MiniDAW says why and keeps the previous one.
+- **Sample rate:** 44.1, 48 or 96 kHz. It takes effect the next time MiniDAW starts. Exports and recordings use it too.
+- Both choices are kept in `%APPDATA%\MiniDAW\audio.txt`. If the saved output is missing when MiniDAW starts, it plays through Windows audio instead and tells you.
+
 ## Shortcuts
 
 | Key | Action |
@@ -259,6 +287,7 @@ The export window remembers your choices until MiniDAW closes.
 | F9 | Mixer ↔ piano roll |
 | F8 | Browser |
 | F1 | About MiniDAW |
+| F10 | Audio output and sample rate |
 | Ctrl+M | Metronome on / off |
 | Ctrl+Z | Undo (each click or drag is one step, and a recording take is one step; up to 100 steps) |
 | Ctrl+Y or Ctrl+Shift+Z | Redo |
@@ -304,7 +333,7 @@ MiniDAW is open source under the [MIT License](LICENSE): use it, change it, shar
 - The pitch wheel (±2 semitones) and the vibrato (5.5 Hz, ±½ semitone) can't be adjusted, and they don't affect Pluck or the drums. The computer keyboard has no sustain, pitch or mod controls.
 - Sidechain drives the Compressor and the Vocoder. The Parametric EQ's settings can't be automated yet.
 - Mixer controls, rack volume/pan, sound settings and tempo can be automated, and linked to MIDI controllers. Mixer changes take effect once per audio block (about 23 ms).
-- No VST plugins. Export is 44.1 kHz only.
-- Audio uses the classic Windows `waveOut` output with about 0.1 s of delay. No ASIO.
-- Recording works only in Pattern mode and only adds notes (overdub).
+- No VST plugins.
+- WASAPI always uses the default output device. Audio recording uses the classic Windows input (`waveIn`), not ASIO inputs.
+- Note recording works only in Pattern mode and only adds notes (overdub). Audio recording makes a new take each time.
 - MIDI import keeps timing to 1/96 of a beat; a song is placed on the playlist up to its 999-bar limit.
