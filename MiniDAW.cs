@@ -1844,6 +1844,7 @@ class Engine
 
     public const int SR = 44100;
     const int Frames = 1024, NBuf = 4, MaxVoices = 64;   // ~93 ms of buffered output
+    public static int OutputDelay { get { return Frames * NBuf + Frames / 2; } }   // frames between rendering a sound and hearing it: a recording is shifted back by this
 
     public class Voice { public double[] Ph; public double Z3; public int StopAt; public bool Audio; public Channel Ch; public int Key, Age, Len, Wait, GlideAge, GlideLen; public float Gain = 1, NotePan; public double Phase, Pos, Rate, Z1, Z2, Detune = 1, Shift, ShiftFrom, ShiftTo; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Shift: semitones it's currently bent by (slides, glide), moving from ShiftFrom to ShiftTo over GlideLen samples   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; NotePan/Detune: the note's own pan and fine pitch; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)   // StopAt: an audio clip's end (samples); Audio: an audio clip, played at its own pitch
 
@@ -2620,6 +2621,80 @@ static class Updates
 }
 
 // MIDI keyboard input through winmm. The driver calls back on its own thread, so the callback only queues the raw message.
+// Audio input (a microphone or line in) through winmm's waveIn: 16-bit stereo at the engine's rate, gathered on its own thread.
+class AudioInput
+{
+    [DllImport("winmm.dll")] static extern int waveInGetNumDevs();
+    [DllImport("winmm.dll", EntryPoint = "waveInGetDevCapsW")] static extern int waveInGetDevCaps(IntPtr id, out WAVEINCAPS caps, int size);
+    [DllImport("winmm.dll")] static extern int waveInOpen(out IntPtr h, int dev, ref WAVEFORMATEX fmt, IntPtr cb, IntPtr inst, int flags);
+    [DllImport("winmm.dll")] static extern int waveInPrepareHeader(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveInUnprepareHeader(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveInAddBuffer(IntPtr h, IntPtr hdr, int size);
+    [DllImport("winmm.dll")] static extern int waveInStart(IntPtr h);
+    [DllImport("winmm.dll")] static extern int waveInReset(IntPtr h);
+    [DllImport("winmm.dll")] static extern int waveInClose(IntPtr h);
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct WAVEINCAPS { public ushort wMid, wPid; public uint vDriverVersion; [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szPname; public uint dwFormats; public ushort wChannels, wReserved1; }
+
+    public static List<string> Devices()
+    {
+        var list = new List<string>();
+        for (int i = 0; i < waveInGetNumDevs(); i++) { WAVEINCAPS c; list.Add(waveInGetDevCaps((IntPtr)i, out c, Marshal.SizeOf(typeof(WAVEINCAPS))) == 0 ? c.szPname : "Input " + (i + 1)); }
+        return list;
+    }
+
+    IntPtr h; Thread thread; volatile bool running; readonly List<short> got = new List<short>();
+    const int Frames = 2048, NBuf = 8;
+
+    public string Start(int dev)
+    {
+        var fmt = new WAVEFORMATEX { wFormatTag = 1, nChannels = 2, nSamplesPerSec = Engine.SR, wBitsPerSample = 16, nBlockAlign = 4, nAvgBytesPerSec = Engine.SR * 4 };
+        int err = waveInOpen(out h, dev, ref fmt, IntPtr.Zero, IntPtr.Zero, 0);
+        if (err != 0) return "Could not open the audio input (waveInOpen error " + err + ").";
+        lock (got) got.Clear();
+        running = true; thread = new Thread(Loop) { IsBackground = true, Name = "audio in" }; thread.Start();
+        return null;
+    }
+
+    void Loop()
+    {
+        int hsz = Marshal.SizeOf(typeof(WAVEHDR)), flagsOff = (int)Marshal.OffsetOf(typeof(WAVEHDR), "dwFlags"), lenOff = (int)Marshal.OffsetOf(typeof(WAVEHDR), "dwBytesRecorded");
+        var hdrs = new IntPtr[NBuf]; var data = new IntPtr[NBuf]; var pcm = new short[Frames * 2];
+        for (int i = 0; i < NBuf; i++)
+        {
+            data[i] = Marshal.AllocHGlobal(Frames * 4); hdrs[i] = Marshal.AllocHGlobal(hsz);
+            Marshal.StructureToPtr(new WAVEHDR { lpData = data[i], dwBufferLength = Frames * 4 }, hdrs[i], false);
+            waveInPrepareHeader(h, hdrs[i], hsz); waveInAddBuffer(h, hdrs[i], hsz);
+        }
+        waveInStart(h);
+        while (running)
+        {
+            bool any = false;
+            for (int i = 0; i < NBuf; i++)
+            {
+                int fl = Marshal.ReadInt32(hdrs[i], flagsOff);
+                if ((fl & 1) == 0) continue;   // still being filled
+                int bytes = Marshal.ReadInt32(hdrs[i], lenOff);
+                Marshal.Copy(data[i], pcm, 0, bytes / 2);
+                lock (got) for (int k = 0; k < bytes / 2; k++) got.Add(pcm[k]);
+                Marshal.WriteInt32(hdrs[i], flagsOff, fl & ~1); waveInAddBuffer(h, hdrs[i], hsz);
+                any = true;
+            }
+            if (!any) Thread.Sleep(5);
+        }
+        waveInReset(h);
+        for (int i = 0; i < NBuf; i++) { waveInUnprepareHeader(h, hdrs[i], hsz); Marshal.FreeHGlobal(hdrs[i]); Marshal.FreeHGlobal(data[i]); }
+        waveInClose(h);
+    }
+
+    public float[] Stop()   // everything captured, as interleaved stereo floats
+    {
+        if (thread == null) return new float[0];
+        running = false; thread.Join(2000); thread = null;
+        lock (got) { var f = new float[got.Count]; for (int k = 0; k < f.Length; k++) f[k] = got[k] / 32768f; return f; }
+    }
+}
+
 class MidiInput
 {
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -2903,7 +2978,18 @@ class MainForm : Form
         bar.Controls.Add(Gap(midiBox));   // the keyboard plays the selected channel, like FL
         midiBox.DropDown += (s, e) => FillMidi();   // re-list on open, so a keyboard plugged in later shows up
         midiBox.SelectedIndexChanged += (s, e) => OpenMidi();
-        recBtn = Btn(bar, "● Rec", (s, e) => { EndEdit(); recording = !recording; recBtn.BackColor = recording ? Color.FromArgb(200, 52, 60) : Raised; });
+        recBtn = Btn(bar, "● Rec", (s, e) => { EndEdit(); recording = !recording; recBtn.BackColor = recording ? Color.FromArgb(200, 52, 60) : Raised; if (!recording) FinishAudioTake(); });
+        recBtn.MouseUp += (s, e) =>   // right-click: what to record
+        {
+            if (e.Button != MouseButtons.Right) return;
+            var m = new ContextMenuStrip();
+            ((ToolStripMenuItem)m.Items.Add("Record notes from MIDI and computer keyboards", null, (s2, e2) => recAudioDev = -1)).Checked = recAudioDev < 0;
+            var devs = AudioInput.Devices();
+            if (devs.Count == 0) m.Items.Add("(no audio inputs found)").Enabled = false;
+            for (int k = 0; k < devs.Count; k++) { int dv = k; ((ToolStripMenuItem)m.Items.Add("Record audio from " + devs[k], null, (s2, e2) => recAudioDev = dv)).Checked = recAudioDev == k; }
+            m.Show(recBtn, 0, recBtn.Height);
+        };
+        new ToolTip().SetToolTip(recBtn, "Record (right-click: notes, or audio from a microphone or line in)");
         metroBtn = Btn(bar, "", (s, e) => ToggleMetronome());   // an icon button: a metronome drawn in code
         metroBtn.MinimumSize = new Size(30, 28); metroBtn.Paint += PaintMetronome;
         new ToolTip().SetToolTip(metroBtn, "Metronome (Ctrl+M) · right-click: count-in before recording");
@@ -3165,8 +3251,48 @@ class MainForm : Form
     void TogglePlay()   // ends a recording take's undo step
     {
         EndEdit();
-        eng.CountIn = countIn && recording && !eng.SongMode;   // read by the engine when playback starts
+        eng.CountIn = countIn && recording && !eng.SongMode && recAudioDev < 0;   // read by the engine when playback starts
         eng.Playing = !eng.Playing; playBtn.Text = eng.Playing ? "■ Stop" : "▶ Play";
+        if (eng.Playing && recording && recAudioDev >= 0)   // an audio take starts with playback
+        {
+            audioIn = new AudioInput(); string err = audioIn.Start(recAudioDev);
+            if (err != null) { audioIn = null; MessageBox.Show(this, err, "MiniDAW"); }
+            else takeStart = eng.SongMode && P.LoopTo > P.LoopFrom ? P.LoopFrom : 0;
+        }
+        if (!eng.Playing) FinishAudioTake();
+    }
+
+    // ---- audio recording: what was captured becomes a WAV in the recordings folder and an audio clip where playback started
+    int recAudioDev = -1; AudioInput audioIn; double takeStart;
+    internal static string RecordingsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "MiniDAW Recordings");
+
+    internal static float[] AlignTake(float[] captured, int delayFrames)   // you played along to sound that reached you delayFrames late: drop that much from the start
+    {
+        int skip = Math.Min(captured.Length, delayFrames * 2); var a = new float[captured.Length - skip]; Array.Copy(captured, skip, a, 0, a.Length); return a;
+    }
+
+    void FinishAudioTake()
+    {
+        if (audioIn == null) return;
+        var take = AlignTake(audioIn.Stop(), Engine.OutputDelay); audioIn = null;
+        if (take.Length < Engine.SR / 10) return;   // under 0.1 s: nothing worth keeping
+        string path = null;
+        try
+        {
+            Directory.CreateDirectory(RecordingsDir);
+            path = Path.Combine(RecordingsDir, "Recording " + DateTime.Now.ToString("yyyy-MM-dd HHmmss", CultureInfo.InvariantCulture) + ".wav");
+            File.WriteAllBytes(path, Wav.Make(take, Engine.SR, 2, 16));
+        }
+        catch (Exception e) { MessageBox.Show(this, "Couldn't save the recording:\n" + e.Message, "MiniDAW"); return; }
+        var c = new Channel { Kind = "sample", Name = FreeName("Recording") };
+        try { Wav.Load(path, c); } catch (InvalidDataException e) { MessageBox.Show(this, e.Message, "MiniDAW"); return; }
+        Edit(() =>
+        {
+            AddChannel1(c);
+            lock (P) P.Clips.Add(new Clip { Track = P.FreeTrack(), Start = takeStart, Channel = P.Channels.Count - 1, Pattern = -1, Len = Project.SixteenthsOf(c, P.Bpm) });
+            Changed();
+        });
+        Text = "MiniDAW — recorded " + (take.Length / 2.0 / Engine.SR).ToString("0.0") + " s to " + path;
     }
 
     void ShowAbout() { using (var a = new AboutForm(false)) a.ShowDialog(this); }
@@ -3945,6 +4071,7 @@ class MainForm : Form
         ((ToolStripMenuItem)colour.DropDownItems.Add("Default (orange)", Swatch(On), (s, e) => paint(0))).Checked = c.Color == 0;
         foreach (var sw in Swatches) { int argb = sw.ToArgb(); ((ToolStripMenuItem)colour.DropDownItems.Add("", Swatch(sw), (s, e) => paint(argb))).Checked = c.Color == argb; }
         m.Items.Add(colour);
+        if (c.Kind == "sample" && c.Sample != null) m.Items.Add("Edit audio…", null, (s, e) => ShowAudioEditor(P.Channels.IndexOf(c)));
         if (c.Kind == "sample" && c.Sample != null)   // slicing, like FL's Slicex
         {
             var slice = new ToolStripMenuItem("Slices" + (c.Slices != null ? " (" + c.Slices.Length + ")" : ""));
@@ -4725,7 +4852,115 @@ class MainForm : Form
         g.DrawString("click to edit", Small, DimB, r.Right - 64, r.Bottom - 14);
     }
 
-    void ShowAudioEditor(int ch) { Changed(false); }   // the audio editor comes next
+    AudioEditor audioWin;
+    internal void ShowAudioEditor(int ch)   // one audio editor at a time; it follows whichever sample channel opened it last
+    {
+        if (ch < 0 || ch >= P.Channels.Count || P.Channels[ch].Sample == null) return;
+        selCh = ch; Changed(false);
+        if (audioWin == null || audioWin.IsDisposed) audioWin = new AudioEditor(this);
+        audioWin.Target(P.Channels[ch]);
+        if (!audioWin.Visible) audioWin.Show(this); else audioWin.Activate();
+    }
+
+    internal static string EditsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "MiniDAW Recordings", "Edits");
+
+    // The audio editor's operations, on one side of a sample: s0..s1 is the selection (the whole sample when nothing is selected).
+    internal static float[] AudioOp(string op, float[] a, int s0, int s1)
+    {
+        s0 = Math.Max(0, Math.Min(a.Length, s0)); s1 = Math.Max(s0, Math.Min(a.Length, s1)); int n = s1 - s0;
+        if (op == "Trim") { var t = new float[n]; Array.Copy(a, s0, t, 0, n); return t; }
+        if (op == "Delete") { var d = new float[a.Length - n]; Array.Copy(a, 0, d, 0, s0); Array.Copy(a, s1, d, s0, a.Length - s1); return d; }
+        var b = (float[])a.Clone();
+        for (int k = 0; k < n; k++)
+        {
+            int i = s0 + k; float t = n > 1 ? k / (float)(n - 1) : 1;
+            if (op == "Silence") b[i] = 0;
+            else if (op == "Reverse") b[i] = a[s1 - 1 - k];
+            else if (op == "Fade in") b[i] = a[i] * t;
+            else if (op == "Fade out") b[i] = a[i] * (1 - t);
+        }
+        return b;
+    }
+
+    // Like FL's Edison, simply: the waveform, a selection to drag across, and the operations above. Each change is saved as a new
+    // WAV in the Edits folder and is one undo step (undo goes back to the earlier file, which is kept).
+    internal class AudioEditor : Form
+    {
+        readonly MainForm m; readonly Canvas view = new Canvas(); Channel key; int selA, selB; bool dragging;
+        static readonly string[] Ops = { "Trim", "Delete", "Silence", "Reverse", "Normalize", "Fade in", "Fade out" };
+        const int X0 = 12, Y0 = 34;
+        public AudioEditor(MainForm main)
+        {
+            m = main; FormBorderStyle = FormBorderStyle.SizableToolWindow; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterParent;
+            ClientSize = new Size(820, 280); MinimumSize = new Size(560, 200); Font = main.Font;
+            view.Dock = DockStyle.Fill; Controls.Add(view); view.Paint += PaintView;
+            view.MouseDown += (s, e) =>
+            {
+                var c = Ch(); if (c == null) return;
+                if (e.Y < Y0 - 4) { int k = (e.X - X0) / 92; if (k >= 0 && k < Ops.Length) Apply(Ops[k]); return; }
+                selA = selB = Frame(e.X); dragging = true; view.Invalidate();
+            };
+            view.MouseMove += (s, e) => { if (dragging) { selB = Frame(e.X); view.Invalidate(); } };
+            view.MouseUp += (s, e) => dragging = false;
+            HandleCreated += (s, e) => DarkTitle(Handle);
+            KeyPreview = true; KeyDown += (s, e) => m.PianoKey(e, true); KeyUp += (s, e) => m.PianoKey(e, false);
+        }
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData) { return m.ProcessCmdKey(ref msg, keyData); }
+        public void Target(Channel c) { key = c; selA = selB = 0; view.Invalidate(); }
+        Channel Ch() { return key != null && m.P.Channels.Contains(key) && key.Sample != null ? key : m.P.Channels.FirstOrDefault(c => c.Sample != null && key != null && c.SamplePath == key.SamplePath); }   // undo replaces channel objects
+        float W { get { return view.Width - 2 * X0; } }
+        int Frame(int x) { var c = Ch(); return c == null ? 0 : (int)Math.Max(0, Math.Min(c.Sample.Length, (x - X0) / W * c.Sample.Length)); }
+
+        void Apply(string op)
+        {
+            var c = Ch(); if (c == null) return;
+            int a = Math.Min(selA, selB), b = Math.Max(selA, selB); if (b - a < 2) { a = 0; b = c.Sample.Length; }   // no selection: all of it
+            float[] l, r = null;
+            if (op == "Normalize")
+            {
+                float peak = 1e-9f; for (int k = a; k < b; k++) { peak = Math.Max(peak, Math.Abs(c.Sample[k])); if (c.SampleR != null) peak = Math.Max(peak, Math.Abs(c.SampleR[k])); }
+                float g = 0.99f / peak; l = (float[])c.Sample.Clone(); for (int k = a; k < b; k++) l[k] *= g;
+                if (c.SampleR != null) { r = (float[])c.SampleR.Clone(); for (int k = a; k < b; k++) r[k] *= g; }
+            }
+            else { l = AudioOp(op, c.Sample, a, b); if (c.SampleR != null) r = AudioOp(op, c.SampleR, a, b); }
+            if (l.Length < 2) return;
+            string path;
+            try
+            {
+                Directory.CreateDirectory(EditsDir);
+                path = Path.Combine(EditsDir, c.Name + " " + op.ToLowerInvariant() + " " + DateTime.Now.ToString("HHmmss-fff", CultureInfo.InvariantCulture) + ".wav");
+                var inter = new float[l.Length * (r != null ? 2 : 1)];
+                for (int k = 0; k < l.Length; k++) { if (r != null) { inter[2 * k] = l[k]; inter[2 * k + 1] = r[k]; } else inter[k] = l[k]; }
+                File.WriteAllBytes(path, Wav.Make(inter, c.SampleRate, r != null ? 2 : 1, 32));   // 32-bit float: edits don't lose quality
+            }
+            catch (Exception e) { MessageBox.Show(this, "Couldn't save the edited audio:\n" + e.Message, "MiniDAW"); return; }
+            m.Edit(() => { c.Sample = l; c.SampleR = r; c.SamplePath = path; m.dirty = true; });
+            if (op == "Trim" || op == "Delete") selA = selB = 0;
+            m.Changed(); view.Invalidate();
+        }
+
+        void PaintView(object sender, PaintEventArgs e)
+        {
+            var g = e.Graphics; var c = Ch();
+            Text = c == null ? "Audio editor" : "Audio editor — " + c.Name;
+            if (c == null) { g.DrawString("This sample isn't in the project any more.", Font, DimB, 16, 16); return; }
+            for (int k = 0; k < Ops.Length; k++) RouteBox(g, X0 + k * 92, 8, 86, Ops[k], false);
+            float h = view.Height - Y0 - 22, mid = Y0 + h / 2;
+            Round(g, Well, X0, Y0, W, h, 4);
+            int a = Math.Min(selA, selB), b = Math.Max(selA, selB), len = c.Sample.Length;
+            if (b - a >= 2) using (var br = new SolidBrush(Color.FromArgb(60, Blue))) g.FillRectangle(br, X0 + a / (float)len * W, Y0, (b - a) / (float)len * W, h);
+            using (var pen = new Pen(On))
+                for (int x = 0; x < (int)W; x++)
+                {
+                    int k0 = (int)((long)x * len / (int)W), k1 = Math.Max(k0 + 1, (int)((long)(x + 1) * len / (int)W)); float lo = 0, hi = 0;
+                    for (int k = k0; k < k1 && k < len; k++) { lo = Math.Min(lo, c.Sample[k]); hi = Math.Max(hi, c.Sample[k]); }
+                    g.DrawLine(pen, X0 + x, mid - hi * h / 2, X0 + x, mid - lo * h / 2 + 0.5f);
+                }
+            double secs = len / (double)c.SampleRate;
+            g.DrawString(secs.ToString("0.00", CultureInfo.InvariantCulture) + " s" + (b - a >= 2 ? "  ·  selected " + ((b - a) / (double)c.SampleRate).ToString("0.00", CultureInfo.InvariantCulture) + " s" : "  ·  drag to select; with nothing selected, an operation works on all of it"),
+                Small, DimB, X0, Y0 + h + 4);
+        }
+    }
 
     AutoWindow autoWin;
     internal void ShowAutomation(int k)   // one automation editor at a time; it follows whichever lane opened it last
@@ -6113,6 +6348,14 @@ class MainForm : Form
                     "saved and opened again: a triplet note's exact position and length, the slide flag, and the channel's glide");
             }
 
+            {   // audio editor operations, and lining a recording up with what was heard
+                var x8 = new float[] { 1, 2, 3, 4, 5, 6, 7, 8 };
+                Func<float[], string> str = arr => string.Join(",", arr.Select(v => v.ToString("0.##", CultureInfo.InvariantCulture)));
+                string trim = str(AudioOp("Trim", x8, 2, 5)), del = str(AudioOp("Delete", x8, 2, 5)), sil = str(AudioOp("Silence", x8, 2, 5)), rv = str(AudioOp("Reverse", x8, 2, 5)), fi = str(AudioOp("Fade in", x8, 0, 5)), fo = str(AudioOp("Fade out", x8, 4, 8));
+                var aligned = AlignTake(new float[] { 9, 9, 9, 9, 1, 2, 3, 4 }, 2); int ins = AudioInput.Devices().Count;
+                check(trim == "3,4,5" && del == "1,2,6,7,8" && sil == "1,2,0,0,0,6,7,8" && rv == "1,2,5,4,3,6,7,8" && fi == "0,0.5,1.5,3,5,6,7,8" && fo == "1,2,3,4,5,4,2.33,0" && str(aligned) == "1,2,3,4" && str(x8) == "1,2,3,4,5,6,7,8",
+                    "audio editor: trim, delete, silence, reverse, fade in and out change just the selection; a take drops the first " + Engine.OutputDelay + " frames (the output delay) so it lines up with what you heard; " + ins + " audio inputs found");
+            }
             {   // audio clips: a recording placed on the playlist, trimmed, played at its own speed from wherever playback starts
                 int sr2 = Engine.SR; double p16 = 60.0 / 128 / 4 * sr2;
                 var swell = Enumerable.Range(0, sr2 * 2).Select(k => (float)(0.5 * Math.Sin(2 * Math.PI * 300 * k / sr2) * (1 + k / (double)sr2))).ToArray();   // a swelling swell: position in it shows in its loudness
