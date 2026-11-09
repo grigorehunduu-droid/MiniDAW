@@ -74,6 +74,27 @@ class Channel
         new[] { .25f, .5f, .8f, .25f, .5f, .6f, .7f, .25f, .75f, .3f, 0f, .72f, .15f, .6f, .08f, .5f, .75f, .4f, .05f, .5f, .5f, .4f, 0f, 0f, 0f, 1f, .55f, .45f } };
     public float S(int i) { return (Syn ?? SynPresets[0])[i]; }
 
+    // Where the hits in a sample start, like FL's Slicex: a 512-sample window whose energy jumps to 4× the windows before it,
+    // at least 100 ms after the last start. The first slice always starts at 0.
+    public static int[] Transients(float[] x, int rate)
+    {
+        const int Hop = 512; var e = new List<double>();
+        for (int i = 0; i + Hop <= x.Length; i += Hop) { double sum = 0; for (int k = i; k < i + Hop; k++) sum += x[k] * x[k]; e.Add(sum / Hop); }
+        var starts = new List<int> { 0 }; double floor = e.Count > 0 ? e.Max() * 1e-3 : 0;
+        for (int f = 1; f < e.Count; f++)
+        {
+            double before = 0; int n = 0;
+            for (int k = Math.Max(0, f - 4); k < f; k++) { before += e[k]; n++; }
+            if (!(e[f] > floor && e[f] > 4 * before / n)) continue;
+            int lo = Math.Max(0, (f - 1) * Hop), hi = Math.Min(x.Length, (f + 1) * Hop); float peak = 0;
+            for (int k = lo; k < hi; k++) peak = Math.Max(peak, Math.Abs(x[k]));
+            int at = lo; while (at < hi && Math.Abs(x[at]) < 0.1f * peak) at++;   // the hit's first loud sample,
+            at = Math.Max(0, at - 32);                                             // just before it
+            if (at - starts[starts.Count - 1] >= rate / 10) starts.Add(at);
+        }
+        return starts.ToArray();
+    }
+
     public string SynLabel(int i)   // a synth setting with its value in words
     {
         float v = S(i);
@@ -3204,37 +3225,44 @@ class MainForm : Form
         soundWin.view.Invalidate();
     }
 
+    // A list of rows (section headings and bars), laid out in columns: the sound's own settings, the analog synth's 28, the sampler's
+    // options, then glide and the arpeggiator. Right-click a bar that can move with the song: automation clip or MIDI link.
     class SoundWindow : Form
     {
-        const int BarsTop = 30, RowH = 30, BarX = 12, BarW = 296, ArpTop = BarsTop + 4 * RowH + 26, PlayRows = 5;   // "playing" rows: glide, then the arpeggiator's four
+        const int RowH = 28, ColW = 300, X0 = 12, RowsTop = 30, HeadH = 22, MaxColH = 560;
         readonly MainForm m;
         public readonly Canvas view = new Canvas();
-        int drag = -1, arpDrag = -1;   // the sound setting or arpeggiator row being dragged
+        Row dragRow;
+
+        class Row
+        {
+            public string Head;                                     // a section heading instead of a bar
+            public Func<Channel, float> Get; public Action<Channel, float> Set; public Func<Channel, string> Label;
+            public int Lane = -1;                                   // the channel-lane Param it can be automated as; -1 = none
+            public bool Toggle;                                     // on / off: a click flips it
+            public Color Col; public Func<Channel, bool> Live;      // greyed out while it doesn't matter
+            public RectangleF At;
+        }
 
         public SoundWindow(MainForm main)
         {
             m = main;
             FormBorderStyle = FormBorderStyle.FixedToolWindow; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterParent;
-            ClientSize = new Size(BarX * 2 + BarW, ArpTop + PlayRows * RowH + 4); Font = main.Font;
-            view.Dock = DockStyle.Fill; Controls.Add(view);
+            Font = main.Font; view.Dock = DockStyle.Fill; Controls.Add(view);
             view.Paint += PaintView;
             view.MouseDown += (s, e) =>
             {
-                var c = Ch(); if (c == null || e.Y < BarsTop) return;
-                if (e.Y >= ArpTop)   // arpeggiator rows (not for drums)
-                {
-                    int ar = (e.Y - ArpTop) / RowH;
-                    if (c.IsDrum || ar >= PlayRows || e.Button != MouseButtons.Left) return;
-                    m.BeginEdit(); arpDrag = ar; SetArp(e); return;
-                }
-                var shown = c.KnobsShown(); int r = (e.Y - BarsTop) / RowH;
-                if (r >= shown.Length) return;
-                if (e.Button == MouseButtons.Right) { var l = new Lane { Ch = m.P.Channels.IndexOf(c), Param = shown[r] }; m.ControlMenu(l, view, e.Location); return; }   // automation clip or MIDI link
+                var c = Ch(); if (c == null) return;
+                if (e.Y < RowsTop - 4) { if (c.Kind == "analog" && e.X > view.Width - 130) PresetMenu(c); return; }
+                var row = Place(c).FirstOrDefault(r => r.Head == null && r.At.Contains(e.Location));
+                if (row == null) return;
+                if (e.Button == MouseButtons.Right) { if (row.Lane >= 0) m.ControlMenu(new Lane { Ch = m.P.Channels.IndexOf(c), Param = row.Lane }, view, e.Location); return; }
                 if (e.Button != MouseButtons.Left) return;
-                m.BeginEdit(); drag = shown[r]; Set(e);   // one drag = one undo step
+                if (row.Toggle) { m.Edit(() => row.Set(c, row.Get(c) > 0.5f ? 0 : 1)); m.dirty = true; view.Invalidate(); return; }
+                m.BeginEdit(); dragRow = row; SetFrom(e);   // one drag = one undo step
             };
-            view.MouseMove += (s, e) => { if (drag >= 0 && e.Button == MouseButtons.Left) Set(e); if (arpDrag >= 0 && e.Button == MouseButtons.Left) SetArp(e); };
-            view.MouseUp += (s, e) => { if (drag >= 0 || arpDrag >= 0) { drag = arpDrag = -1; m.EndEdit(); } };
+            view.MouseMove += (s, e) => { if (dragRow != null && e.Button == MouseButtons.Left) SetFrom(e); };
+            view.MouseUp += (s, e) => { if (dragRow != null) { dragRow = null; m.EndEdit(); } };
             HandleCreated += (s, e) => DarkTitle(Handle);
             KeyPreview = true;   // keep the computer-keyboard piano playing while this window has focus
             KeyDown += (s, e) => m.PianoKey(e, true);
@@ -3245,24 +3273,72 @@ class MainForm : Form
 
         Channel Ch() { var ch = m.P.Channels; return ch.Count == 0 ? null : ch[Math.Max(0, Math.Min(m.selCh, ch.Count - 1))]; }
 
-        void Set(MouseEventArgs e)
+        static void SetKnob(Channel c, int k, float v) { var a = (float[])(c.Knob ?? Channel.BuiltIn(c.Kind)).Clone(); a[k] = v; c.Knob = a; }        // a new array: the audio thread never sees half a change
+        static void SetSyn(Channel c, int k, float v) { var a = (float[])(c.Syn ?? Channel.SynPresets[0]).Clone(); a[k] = v; c.Syn = a; }
+
+        static Row Bar(Func<Channel, float> get, Action<Channel, float> set, Func<Channel, string> label, Color col, Func<Channel, bool> live = null) { return new Row { Get = get, Set = set, Label = label, Col = col, Live = live }; }
+
+        static List<Row> Rows(Channel c)
         {
-            var c = Ch(); if (c == null) return;
-            if (c.Knob == null) c.Knob = (float[])Channel.BuiltIn(c.Kind).Clone();
-            c.Knob[drag] = Clamp01((e.X - BarX) / (float)BarW);   // the audio thread reads it on its next sample
+            var rows = new List<Row> { new Row { Head = "SOUND  ·  " + Channel.Title(c.Kind) } };
+            foreach (int k in c.KnobsShown()) { int kk = k; var r = Bar(ch => ch.K(kk), (ch, v) => SetKnob(ch, kk, v), ch => ch.KnobLabel(kk), DeepBlue); r.Lane = kk; rows.Add(r); }
+            if (c.Kind == "analog")
+            {
+                var heads = new Dictionary<int, string> { { 0, "OSCILLATORS" }, { 10, "FILTER" }, { 14, "AMP ENVELOPE" }, { 18, "FILTER ENVELOPE" }, { 22, "LFO" }, { 25, "UNISON AND VOLUME" } };
+                for (int i = 0; i < Channel.SynNames.Length; i++)
+                {
+                    if (heads.ContainsKey(i)) rows.Add(new Row { Head = heads[i] });
+                    int ii = i; var r = Bar(ch => ch.S(ii), (ch, v) => SetSyn(ch, ii, v), ch => ch.SynLabel(ii), Color.FromArgb(196, 116, 56)); r.Lane = Channel.LaneSyn + ii; rows.Add(r);
+                }
+            }
+            if (c.Kind == "sample")
+            {
+                var col = Color.FromArgb(52, 150, 132);
+                rows.Add(new Row { Head = "SAMPLE" + (c.Slices != null ? "  ·  " + c.Slices.Length + " slices from C5 up" : "") });
+                rows.Add(Bar(ch => (ch.Stretch - 0.5f) / 1.5f, (ch, v) => ch.Stretch = Math.Abs(v - 1 / 3f) < 0.02f ? 1 : 0.5f + v * 1.5f,
+                    ch => "Stretch  " + (Math.Abs(ch.Stretch - 1) < 1e-3 ? "off" : ch.Stretch.ToString("0.00", CultureInfo.InvariantCulture) + "× as long, same pitch"), col));
+                rows.Add(new Row { Get = ch => ch.Reverse ? 1 : 0, Set = (ch, v) => ch.Reverse = v > 0.5f, Label = ch => "Reverse  " + (ch.Reverse ? "on" : "off"), Col = col, Toggle = true });
+                rows.Add(new Row { Get = ch => ch.Loop ? 1 : 0, Set = (ch, v) => ch.Loop = v > 0.5f, Label = ch => "Loop while held  " + (ch.Loop ? "on" : "off"), Col = col, Toggle = true });
+                rows.Add(Bar(ch => ch.LoopStart, (ch, v) => ch.LoopStart = Math.Min(v, ch.LoopEnd - 0.01f), ch => "Loop start  " + (int)Math.Round(ch.LoopStart * 100) + "%", col, ch => ch.Loop));
+                rows.Add(Bar(ch => ch.LoopEnd, (ch, v) => ch.LoopEnd = Math.Max(v, ch.LoopStart + 0.01f), ch => "Loop end  " + (int)Math.Round(ch.LoopEnd * 100) + "%", col, ch => ch.Loop));
+            }
+            if (!c.IsDrum)
+            {
+                rows.Add(new Row { Head = "PLAYING  ·  glide and arpeggiator" });
+                rows.Add(Bar(ch => ch.Glide, (ch, v) => ch.Glide = v < 0.02f ? 0 : v, ch => "Glide  " + (ch.Glide == 0 ? "off" : (int)Math.Round(ch.Glide * 500) + " ms, one note at a time"), Color.FromArgb(46, 140, 120), ch => ch.Glide > 0));
+                var arp = Color.FromArgb(150, 104, 224);
+                rows.Add(Bar(ch => ch.ArpDir / (float)(Channel.ArpDirs.Length - 1), (ch, v) => ch.ArpDir = (int)Math.Round(v * (Channel.ArpDirs.Length - 1)), ch => "Arpeggio  " + Channel.ArpDirs[ch.ArpDir], arp));
+                rows.Add(Bar(ch => (ch.ArpRange - 1) / 3f, (ch, v) => ch.ArpRange = 1 + (int)Math.Round(v * 3), ch => "Range  " + ch.ArpRange + (ch.ArpRange == 1 ? " octave" : " octaves"), arp, ch => ch.ArpDir != 0));
+                rows.Add(Bar(ch => ch.ArpTime / (float)(Channel.ArpTimes.Length - 1), (ch, v) => ch.ArpTime = (int)Math.Round(v * (Channel.ArpTimes.Length - 1)), ch => "Time  " + Channel.ArpTimeNames[ch.ArpTime] + " notes", arp, ch => ch.ArpDir != 0));
+                rows.Add(Bar(ch => ch.ArpGate, (ch, v) => ch.ArpGate = Math.Max(0.05f, v), ch => "Gate  " + (int)Math.Round(ch.ArpGate * 100) + "% of each note", arp, ch => ch.ArpDir != 0));
+            }
+            return rows;
+        }
+
+        List<Row> Place(Channel c)   // rows placed down a column, starting a new one when it gets too tall
+        {
+            var rows = Rows(c); float x = X0, y = RowsTop;
+            foreach (var r in rows)
+            {
+                float h = r.Head != null ? HeadH : RowH;
+                if (y + h > RowsTop + MaxColH && r.Head == null && y > RowsTop) { x += ColW + X0; y = RowsTop; }
+                r.At = new RectangleF(x, y, ColW, h - (r.Head != null ? 0 : 6)); y += h;
+            }
+            return rows;
+        }
+
+        void SetFrom(MouseEventArgs e)
+        {
+            var c = Ch(); if (c == null || dragRow == null) return;
+            dragRow.Set(c, Clamp01((e.X - dragRow.At.X) / dragRow.At.Width));   // the audio thread reads it on its next sample
             m.dirty = true; view.Invalidate();
         }
 
-        void SetArp(MouseEventArgs e)   // the arpeggiator's rows are bars with steps: direction, range, time, gate
+        void PresetMenu(Channel c)   // the analog synth's presets
         {
-            var c = Ch(); if (c == null) return;
-            float v = Clamp01((e.X - BarX) / (float)BarW);
-            if (arpDrag == 0) c.Glide = v < 0.02f ? 0 : v;
-            else if (arpDrag == 1) c.ArpDir = (int)Math.Round(v * (Channel.ArpDirs.Length - 1));
-            else if (arpDrag == 2) c.ArpRange = 1 + (int)Math.Round(v * 3);
-            else if (arpDrag == 3) c.ArpTime = (int)Math.Round(v * (Channel.ArpTimes.Length - 1));
-            else c.ArpGate = Math.Max(0.05f, v);
-            m.dirty = true; view.Invalidate();
+            var menu = new ContextMenuStrip();
+            for (int k = 0; k < Channel.PresetNames.Length; k++) { int kk = k; menu.Items.Add(Channel.PresetNames[k], null, (s, e) => { m.Edit(() => c.Syn = (float[])Channel.SynPresets[kk].Clone()); m.dirty = true; view.Invalidate(); }); }
+            menu.Show(view, view.Width - 130, RowsTop - 6);
         }
 
         void PaintView(object sender, PaintEventArgs e)
@@ -3270,28 +3346,20 @@ class MainForm : Form
             var g = e.Graphics; var c = Ch();
             if (c == null) return;
             Text = c.Name + " — sound settings";
-            g.DrawString(Channel.Title(c.Kind) + "  ·  drag a bar · right-click: automate it in the playlist", Small, DimB, BarX, 9);
-            var shown = c.KnobsShown();
-            for (int r = 0; r < shown.Length; r++)
+            var rows = Place(c);
+            var size = new Size((int)rows.Max(r => r.At.Right) + X0, (int)rows.Max(r => r.At.Bottom) + 12);
+            if (ClientSize != size) ClientSize = size;   // the window fits this channel's rows
+            g.DrawString("drag a bar · click on / off · right-click: automation clip or MIDI link", Small, DimB, X0, 9);
+            if (c.Kind == "analog") RouteBox(g, view.Width - 130, 7, 118, "preset  ▾", false);
+            foreach (var r in rows)
             {
-                float y = BarsTop + r * RowH;
-                ValueBar(g, BarX, y, BarW, RowH - 8, 0, c.K(shown[r]), DeepBlue);
-                g.DrawString(c.KnobLabel(shown[r]), Font, TxtB, new RectangleF(BarX + 8, y, BarW - 12, RowH - 8), Fit);
-            }
-            g.DrawString("PLAYING  ·  glide between notes, and the arpeggiator", Small, DimB, BarX, ArpTop - 19);
-            if (c.IsDrum) { g.DrawString("Not for drums.", Font, DimB, BarX, ArpTop + 4); return; }
-            float[] vals = { c.Glide, c.ArpDir / (float)(Channel.ArpDirs.Length - 1), (c.ArpRange - 1) / 3f, c.ArpTime / (float)(Channel.ArpTimes.Length - 1), c.ArpGate };
-            string[] labels = { "Glide  " + (c.Glide == 0 ? "off" : (int)Math.Round(c.Glide * 500) + " ms, one note at a time"), "Arpeggio  " + Channel.ArpDirs[c.ArpDir],
-                                "Range  " + c.ArpRange + (c.ArpRange == 1 ? " octave" : " octaves"), "Time  " + Channel.ArpTimeNames[c.ArpTime] + " notes", "Gate  " + (int)Math.Round(c.ArpGate * 100) + "% of each note" };
-            for (int r = 0; r < PlayRows; r++)
-            {
-                float y = ArpTop + r * RowH; bool live = r == 0 ? c.Glide > 0 : c.ArpDir != 0 || r == 1;   // the arpeggiator's other rows matter only once it's on
-                ValueBar(g, BarX, y, BarW, RowH - 8, 0, vals[r], !live ? Raised : r == 0 ? Color.FromArgb(46, 140, 120) : Color.FromArgb(150, 104, 224));
-                g.DrawString(labels[r], Font, live ? TxtB : DimB, new RectangleF(BarX + 8, y, BarW - 12, RowH - 8), Fit);
+                if (r.Head != null) { g.DrawString(r.Head, Small, DimB, r.At.X, r.At.Y + 6); continue; }
+                bool live = r.Live == null || r.Live(c);
+                ValueBar(g, r.At.X, r.At.Y, r.At.Width, r.At.Height, 0, r.Toggle ? (r.Get(c) > 0.5f ? 1 : 0) : r.Get(c), live ? r.Col : Raised);
+                g.DrawString(r.Label(c), Font, live ? TxtB : DimB, new RectangleF(r.At.X + 8, r.At.Y, r.At.Width - 12, r.At.Height), Fit);
             }
         }
     }
-
     void RefreshAll(int pattern)
     {
         patBox.Items.Clear();
@@ -3691,6 +3759,22 @@ class MainForm : Form
         return m;
     }
 
+    void SlicesToPattern(Channel c)   // each slice as a note where it falls at the song's tempo, so the loop plays back as it was (replaces this channel's notes)
+    {
+        int i = P.Channels.IndexOf(c); if (i < 0 || c.Slices == null) return;
+        double sixteenth = 60.0 / P.Bpm / 4 * c.SampleRate;   // samples per 16th at the song's tempo
+        lock (P)
+        {
+            var list = CurPat.For(i); list.Clear();
+            for (int k = 0; k < c.Slices.Length && k < 68; k++)
+            {
+                double at = c.Slices[k] / sixteenth, end = (k + 1 < c.Slices.Length ? c.Slices[k + 1] : c.Sample.Length) / sixteenth;
+                if (at >= CurPat.Length) break;
+                list.Add(new Note { Step = Math.Round(at * 24) / 24, Key = 60 + k, Len = Math.Max(1 / 24.0, Math.Min(CurPat.Length - at, end - at)) });
+            }
+        }
+    }
+
     static Bitmap Swatch(Color c)   // a colour chip for the Colour menu
     {
         var b = new Bitmap(16, 16);
@@ -3733,6 +3817,20 @@ class MainForm : Form
         ((ToolStripMenuItem)colour.DropDownItems.Add("Default (orange)", Swatch(On), (s, e) => paint(0))).Checked = c.Color == 0;
         foreach (var sw in Swatches) { int argb = sw.ToArgb(); ((ToolStripMenuItem)colour.DropDownItems.Add("", Swatch(sw), (s, e) => paint(argb))).Checked = c.Color == argb; }
         m.Items.Add(colour);
+        if (c.Kind == "sample" && c.Sample != null)   // slicing, like FL's Slicex
+        {
+            var slice = new ToolStripMenuItem("Slices" + (c.Slices != null ? " (" + c.Slices.Length + ")" : ""));
+            Action<int[]> cut = starts => Edit(() => { c.Slices = starts; dirty = true; Changed(); });
+            slice.DropDownItems.Add("Slice at the hits (transients)", null, (s, e) => cut(Channel.Transients(c.Sample, c.SampleRate)));
+            foreach (int n in new[] { 4, 8, 16 }) { int parts = n; slice.DropDownItems.Add("Slice into " + n + " equal parts", null, (s, e) => cut(Enumerable.Range(0, parts).Select(k => (int)((long)c.Sample.Length * k / parts)).ToArray())); }
+            if (c.Slices != null)
+            {
+                slice.DropDownItems.Add(new ToolStripSeparator());
+                slice.DropDownItems.Add("Put the slices in this pattern (C5 up, at the song's tempo)", null, (s, e) => Edit(() => { SlicesToPattern(c); dirty = true; Changed(); }));
+                slice.DropDownItems.Add("No slices (play the whole sample)", null, (s, e) => cut(null));
+            }
+            m.Items.Add(slice);
+        }
         var group = new ToolStripMenuItem("Group");
         Action<string> join = name => { if (P.Channels.Contains(c)) Edit(() => { c.Group = name; dirty = true; RefreshAll(patBox.SelectedIndex); }); };
         ((ToolStripMenuItem)group.DropDownItems.Add("None", null, (s, e) => join(null))).Checked = c.Group == null;
@@ -5832,6 +5930,39 @@ class MainForm : Form
                     "saved and opened again: a triplet note's exact position and length, the slide flag, and the channel's glide");
             }
 
+            {   // sampler options and the analog synth
+                int sr = Engine.SR;
+                Func<float[], Channel> sampleCh = data => new Channel { Kind = "sample", Name = "S", Insert = 1, Sample = data, SampleRate = sr };
+                Func<Channel, int, double, float[]> playSmp = (smpCh, key, len16) => { var pj = new Project(); pj.Channels.Add(smpCh); var pt = new Pattern { Name = "P" }; pt.SetBars(4); pj.Patterns.Add(pt);
+                    pt.For(0).Add(new Note { Step = 0, Key = key, Len = len16 }); return Engine.Bounce(pj, false, 0); };
+                var ramp = Enumerable.Range(0, sr / 4).Select(k => 0.5f * k / (sr / 4)).ToArray();
+                var fwd = playSmp(sampleCh(ramp), 60, 1); var rch = sampleCh(ramp); rch.Reverse = true; var revOut = playSmp(rch, 60, 1);
+                bool reversed = fwd[2 * 10000] > 20 * fwd[2 * 100] && revOut[2 * 100] > 20 * fwd[2 * 100] && revOut[2 * 10000] < 0.2f * revOut[2 * 100];   // the faders (0.8 × 0.8) scale everything: compare, don't measure
+                var lch = sampleCh(Enumerable.Range(0, sr / 4).Select(k => (float)(0.4 * Math.Sin(2 * Math.PI * 220 * k / sr))).ToArray()); lch.Loop = true;
+                double s16 = 60.0 / 128 / 4 * sr; var looped = playSmp(lch, 60, 8);   // held 8 16ths (~0.94 s): four times the sample's length
+                Func<float[], int> soundEnd = a => { int k = a.Length / 2 - 1; while (k > 0 && Math.Abs(a[2 * k]) < 1e-4) k--; return k; };   // the test pattern is 4 bars: find where the sound itself stops
+                bool loopOk = looped.Skip((int)(0.8 * sr) * 2).Take(2000).Max(x => Math.Abs(x)) > 0.15 && soundEnd(looped) < 8 * s16 + sr / 30 + 64;
+                var sine440 = Enumerable.Range(0, sr / 2).Select(k => (float)(0.4 * Math.Sin(2 * Math.PI * 440 * k / sr))).ToArray();
+                var sch = sampleCh(sine440); sch.Stretch = 2; var st = playSmp(sch, 60, 1);
+                int cross = 0, first = -1, last = -1; for (int k = sr / 10; k < sr * 9 / 10; k++) if (st[2 * (k - 1)] < 0 && st[2 * k] >= 0) { cross++; if (first < 0) first = k; last = k; }
+                double stHz = (cross - 1) * (double)sr / (last - first), stLen = soundEnd(st) / (double)sr;
+                check(reversed && loopOk && Math.Abs(stLen - 1.0) < 0.05 && Math.Abs(stHz / 440 - 1) < 0.02,
+                    "sampler: reverse plays a rising ramp falling; a looped 1/4 s sample keeps going while held and stops 30 ms after; stretched 2× a 1/2 s 440 Hz tone lasts " + stLen.ToString("0.00") + " s at " + stHz.ToString("0") + " Hz");
+                var hits = new float[sr]; foreach (double t0 in new[] { 0, 0.25, 0.5, 0.75 }) for (int k = 0; k < 2000; k++) hits[(int)(t0 * sr) + k] = (float)(0.8 * Math.Exp(-k / 300.0) * Math.Sin(k * 0.3));
+                var found = Channel.Transients(hits, sr); var slc = sampleCh(hits); slc.Slices = found; var second = playSmp(slc, 61, 1); var none = playSmp(slc, 59, 1);
+                check(found.Length == 4 && found.Zip(new[] { 0, sr / 4, sr / 2, sr * 3 / 4 }, (fs, ws) => Math.Abs(fs - ws) <= 64).All(b => b) && second.Take(400).Max(x => Math.Abs(x)) > 0.3 && soundEnd(second) <= sr / 4 && none.All(x => x == 0),
+                    "slicing: the 4 hits in a sample are found (at " + string.Join(", ", found) + "); C#5 plays the 2nd slice alone; notes below C5 play nothing");
+                var an = new Project(); an.Channels.Add(new Channel { Kind = "analog", Name = "A", Insert = 1, Syn = (float[])Channel.SynPresets[3].Clone() }); var apt = new Pattern { Name = "P" }; an.Patterns.Add(apt);
+                apt.For(0).Add(new Note { Step = 0, Key = 57, Len = 8 }); var ao = Engine.Bounce(an, false, 0);
+                Func<int, double> brightAt = frame => { double d = 0, en = 0; for (int k = frame; k < frame + 2000; k++) { double x = ao[2 * k], y = ao[2 * k - 2]; d += (x - y) * (x - y); en += x * x; } return d / (en + 1e-12); };
+                var wide = new Project(); wide.Channels.Add(new Channel { Kind = "analog", Name = "W", Insert = 1, Syn = (float[])Channel.SynPresets[5].Clone() }); var wpt = new Pattern { Name = "P" }; wide.Patterns.Add(wpt);
+                wpt.For(0).Add(new Note { Step = 0, Key = 60, Len = 8 }); var wo = Engine.Bounce(wide, false, 0); double lrDiff = 0; for (int k = 8000; k < 20000; k++) lrDiff = Math.Max(lrDiff, Math.Abs(wo[2 * k] - wo[2 * k + 1]));
+                var keep3 = Project.Demo(); var kc3 = new Channel { Kind = "sample", Name = "Loop", SamplePath = null, Loop = true, Reverse = true, LoopStart = 0.2f, LoopEnd = 0.7f, Stretch = 1.5f, Slices = new[] { 0, 100, 900 } };
+                keep3.Channels.Add(kc3); keep3.Channels[3].Kind = "analog"; keep3.Channels[3].Syn = (float[])Channel.SynPresets[4].Clone(); keep3.Channels[3].Syn[11] = 0.123f;
+                var kb3 = Project.Parse(keep3.Lines().ToArray(), null); var k4 = kb3.Channels[4];
+                check(brightAt(400) > 2 * brightAt(Engine.SR / 2) && lrDiff > 0.01 && k4.Loop && k4.Reverse && k4.LoopStart == 0.2f && k4.LoopEnd == 0.7f && k4.Stretch == 1.5f && k4.Slices.SequenceEqual(new[] { 0, 100, 900 }) && kb3.Channels[3].Syn[11] == 0.123f,
+                    "analog synth: the Pluck preset starts bright and darkens as its filter envelope closes; Supersaw unison is wider than mono; synth settings and sampler options save and load");
+            }
             {   // automation clips: they act only where they sit; points with bentMid curves; the LFO tool; MIDI controller links
                 Func<double, float[]> silenceAt = start =>
                 {
