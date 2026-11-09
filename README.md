@@ -158,6 +158,7 @@ Needs Windows 10 or 11.
 - **Its window:** the plugin's own editor opens when you add it. Open it again by double-clicking the channel (or right-click → **Sound settings…**), or by clicking the open slot.
 - **Saving:** the project stores where each plugin is and all its settings, and puts them back when it opens. If a plugin is missing, the project still opens, says which one, and that channel or slot stays silent until the plugin is installed again.
 - Export plays plugins too; live playback pauses while exporting.
+- Tested with Dexed (an FM synth) and Dragonfly Hall Reverb: notes, knob moves in their windows, saving and loading, and export.
 
 ## Mixer
 

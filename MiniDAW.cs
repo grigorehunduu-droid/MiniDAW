@@ -3006,7 +3006,7 @@ static class Recent
 // The start-up splash (splash = true) and the About window (F1, or the banana at the end of the toolbar).
 class AboutForm : Form
 {
-    public const string Version = "1.1";   // bump for every release: running copies compare it with the latest GitHub release
+    public const string Version = "1.2";   // bump for every release: running copies compare it with the latest GitHub release
     static readonly Color Bg = MainForm.PanelBg, Dim = MainForm.Dim;
     readonly bool splash;
     readonly Font big = new Font("Segoe UI", 26, FontStyle.Bold), text = new Font("Segoe UI", 9.5f);
@@ -3045,10 +3045,10 @@ class AboutForm : Form
             g.DrawString("Version " + Version + "  ·  built " + built, text, Brushes.Gainsboro, x + 4, 104);
             string[] lines =
             {
-                "Channel rack, patterns, playlist, mixer with 8 effects per insert, automation,",
-                "MIDI keyboard, recording and WAV export, all in one small program.",
+                "Channel rack, patterns, playlist, mixer, automation, VST3 plugins, MIDI keyboard,",
+                "audio and note recording, WAV/FLAC/MP3/OGG export, all in one small program.",
                 "",
-                "Space  play / stop     F9  mixer     F1  this window     Ctrl+Z / Ctrl+Y  undo / redo",
+                "Space  play / stop    F9  mixer    F8  browser    F10  audio    F1  this window",
                 "The full guide is README.md, next to MiniDAW.exe.",
                 "",
                 "Workflow inspired by FL Studio. Not affiliated with or endorsed by Image-Line.",
@@ -3528,7 +3528,7 @@ sealed class Vst3
     bool inited, ctrlSeparate, active, processing, hasEvents;
     int nIn, nOut; int[] inCh, outCh; IntPtr[][] inPtr, outPtr;
     PtrFn processFn;   // looked up once: the audio thread calls it every block
-    readonly Native handler, events, changes; readonly Native[] queues = new Native[64];
+    readonly Native handler, events, changes, outChanges, outQueue, outEvents; readonly Native[] queues = new Native[64];
     readonly int[] evKey = new int[512], evAt = new int[512]; readonly float[] evVel = new float[512]; readonly bool[] evOn = new bool[512]; int evCount;
     readonly ConcurrentQueue<KeyValuePair<uint, double>> edits = new ConcurrentQueue<KeyValuePair<uint, double>>();   // knob moves in the editor
     readonly uint[] pid = new uint[64]; readonly double[] pval = new double[64]; int pCount;
@@ -3549,6 +3549,12 @@ sealed class Vst3
         }
         changes = new Native(IParameterChanges, (HCount)(self => pCount), (HData)((self, i) => i >= 0 && i < pCount ? queues[i].Ptr : IntPtr.Zero),
                              (HAddData)((IntPtr self, IntPtr id, out int index) => { index = 0; return IntPtr.Zero; }));
+        // what the plugin reports back (meters, its own parameter moves, MIDI out): some plugins insist on somewhere to write it; it's dropped
+        outQueue = new Native(IParamValueQueue, (HParamId)(self => 0), (HCount)(self => 0),
+            (HGetPoint)((IntPtr self, int index, out int offset, out double value) => { offset = 0; value = 0; return InvalidArgument; }),
+            (HAddPoint)((IntPtr self, int offset, double value, out int index) => { index = 0; return 0; }));
+        outChanges = new Native(IParameterChanges, (HCount)(self => 0), (HData)((self, i) => IntPtr.Zero), (HAddData)((IntPtr self, IntPtr id, out int index) => { index = 0; return outQueue.Ptr; }));
+        outEvents = new Native(IEventList, (HCount)(self => 0), (HIndexPtr)((self, i, e) => InvalidArgument), (HPtr)((self, e) => 0));
     }
 
     int GetEvent(IntPtr self, int i, IntPtr e)   // Event: bus, offset, ppq, flags, type, then the note at byte 24
@@ -3722,8 +3728,8 @@ sealed class Vst3
             pval[j] = ed.Value;
         }
         Marshal.WriteInt32(data, 0, 0); Marshal.WriteInt32(data, 4, 0); Marshal.WriteInt32(data, 8, n); Marshal.WriteInt32(data, 12, nIn); Marshal.WriteInt32(data, 16, nOut);
-        Marshal.WriteIntPtr(data, 24, inBufs); Marshal.WriteIntPtr(data, 32, outBufs); Marshal.WriteIntPtr(data, 40, changes.Ptr); Marshal.WriteIntPtr(data, 48, IntPtr.Zero);
-        Marshal.WriteIntPtr(data, 56, hasEvents ? events.Ptr : IntPtr.Zero); Marshal.WriteIntPtr(data, 64, IntPtr.Zero); Marshal.WriteIntPtr(data, 72, context);
+        Marshal.WriteIntPtr(data, 24, inBufs); Marshal.WriteIntPtr(data, 32, outBufs); Marshal.WriteIntPtr(data, 40, changes.Ptr); Marshal.WriteIntPtr(data, 48, outChanges.Ptr);
+        Marshal.WriteIntPtr(data, 56, hasEvents ? events.Ptr : IntPtr.Zero); Marshal.WriteIntPtr(data, 64, outEvents.Ptr); Marshal.WriteIntPtr(data, 72, context);
         // ProcessContext: playing, tempo, time signature and position are valid (bits 1, 10, 13, 9)
         Marshal.WriteInt32(context, 0, (playing ? 2 : 0) | 0x400 | 0x2000 | 0x200); PutDouble(context, 8, Engine.SR);
         Marshal.WriteInt64(context, 16, (long)(quarters * 60 / Math.Max(1, bpm) * Engine.SR)); PutDouble(context, 40, quarters); PutDouble(context, 48, Math.Floor(quarters / 4) * 4);
@@ -3751,6 +3757,18 @@ sealed class Vst3
         if (b.Length > 0 && ctrlSeparate) Fn<PtrFn>(ctrl, 6)(ctrl, Stream(new MemoryStream(b)).Ptr);
     }
 
+    internal static Point? EditorAt = null;   // tests: open plugin windows here (off-screen) instead of centred
+
+    internal uint FindParam(string title)   // tests: a parameter's id by its name (ParameterInfo: id, then the title as UTF-16)
+    {
+        IntPtr pi = AllocZero(792); uint found = uint.MaxValue;
+        for (int i = 0, n = ctrl == IntPtr.Zero ? 0 : Fn<VoidFn>(ctrl, 8)(ctrl); i < n && found == uint.MaxValue; i++)
+            if (Fn<IndexPtrFn>(ctrl, 9)(ctrl, i, pi) == 0 && Marshal.PtrToStringUni(IntPtr.Add(pi, 4)) == title) found = (uint)Marshal.ReadInt32(pi, 0);
+        Marshal.FreeHGlobal(pi); return found;
+    }
+    internal void TestEdit(uint id, double value) { Fn<HEdit>(handler.Ptr, 4)(handler.Ptr, id, value); }   // as the plugin's window does when a knob moves
+    internal Form Editor { get { return editor; } }
+
     public void ShowEditor(IWin32Window owner)   // the plugin's own window, inside one of ours; it may resize it
     {
         if (editor != null && !editor.IsDisposed) { editor.Activate(); return; }
@@ -3765,6 +3783,7 @@ sealed class Vst3
                            FormBorderStyle = sizable ? FormBorderStyle.Sizable : FormBorderStyle.FixedSingle, BackColor = Color.Black };
         Func<IntPtr, Size> size = r => new Size(Math.Max(100, Marshal.ReadInt32(r, 8) - Marshal.ReadInt32(r, 0)), Math.Max(60, Marshal.ReadInt32(r, 12) - Marshal.ReadInt32(r, 4)));
         f.ClientSize = size(rect);
+        if (EditorAt.HasValue) { f.StartPosition = FormStartPosition.Manual; f.Location = EditorAt.Value; }
         var frame = new Native(IPlugFrame, (HResize)((self, v, r) =>   // the plugin asks for a new size
         {
             if (f.IsDisposed) return ResultFalse;
