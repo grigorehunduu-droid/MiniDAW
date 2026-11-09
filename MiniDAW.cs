@@ -763,6 +763,7 @@ class Clip
 {
     public int Track, Pattern;
     public int Lane = -1;          // >= 0: an automation clip playing that lane (Project.Automation) instead of a pattern
+    public int Channel = -1;       // >= 0: an audio clip playing that sample channel's audio, from Offset 16ths in, at its own speed
     public double Start, Offset;   // in 16ths
     public double Len = -1;        // in 16ths; -1 = as long as its pattern (and it follows the pattern's length until resized)
     public double Length(Project p) { return Len > 0 ? Len : Lane < 0 && Pattern >= 0 && Pattern < p.Patterns.Count ? p.Patterns[Pattern].Length : Project.Steps; }
@@ -834,6 +835,8 @@ class Project
         foreach (var c in Clips) if (c.Lane > k) c.Lane--;
     }
 
+    public static double SixteenthsOf(Channel c, int bpm) { return c.Sample == null ? Steps : c.Sample.Length / (double)c.SampleRate / (60.0 / bpm / 4); }   // a sample's length at a tempo
+
     public int FreeTrack()   // the first playlist track with nothing on it
     {
         for (int t = 0; t < Tracks; t++) if (!Clips.Any(c => c.Track == t)) return t;
@@ -851,7 +854,7 @@ class Project
         foreach (var c in Clips)
         {
             double rel = abs - c.Start;
-            if (c.Lane >= 0 || rel < -1e-9 || rel >= c.Length(this) - 1e-9 || c.Pattern < 0 || c.Pattern >= Patterns.Count || TrackMuted(c.Track)) continue;
+            if (c.Lane >= 0 || c.Channel >= 0 || rel < -1e-9 || rel >= c.Length(this) - 1e-9 || c.Pattern < 0 || c.Pattern >= Patterns.Count || TrackMuted(c.Track)) continue;
             var pat = Patterns[c.Pattern];
             hits.Add(new KeyValuePair<Pattern, int>(pat, (int)Math.Floor((rel + c.Offset) % pat.Length + 1e-6) % pat.Length));
         }
@@ -962,6 +965,8 @@ class Project
         Channels.RemoveAt(i);
         foreach (var pat in Patterns) if (i < pat.Notes.Count) pat.Notes.RemoveAt(i);
         for (int k = Automation.Count - 1; k >= 0; k--) if (Automation[k].Ch == i) RemoveLane(k);   // its lanes go, with their clips
+        Clips.RemoveAll(c => c.Channel == i);                                                        // and its audio clips
+        foreach (var c in Clips) if (c.Channel > i) c.Channel--;
         foreach (var l in Automation) if (l.Ch > i) l.Ch--;
         Links.RemoveAll(lk => lk.Target.Ch == i);
         foreach (var lk in Links) if (lk.Target.Ch > i) lk.Target.Ch--;
@@ -1032,7 +1037,7 @@ class Project
             for (int ch = 0; ch < pat.Notes.Count; ch++)
                 foreach (var n in pat.Notes[ch]) w.Add(string.Join("\t", "n", ch, n.Step.ToString("R"), n.Key, n.Len.ToString("R"), n.Vel, n.Pan.ToString("R"), n.Fine, n.Slide ? "1" : "0"));
         }
-        foreach (var c in Clips) w.Add(string.Join("\t", "clip", c.Track, c.Start.ToString("R"), c.Pattern, c.Len.ToString("R"), c.Offset.ToString("R"), c.Lane));
+        foreach (var c in Clips) w.Add(string.Join("\t", "clip", c.Track, c.Start.ToString("R"), c.Pattern, c.Len.ToString("R"), c.Offset.ToString("R"), c.Lane, c.Channel));
 
         foreach (var lk in Links) w.Add(string.Join("\t", "link", lk.Cc, lk.Target.Tempo ? "1" : "0", lk.Target.Ch, lk.Target.Ins, lk.Target.Slot, lk.Target.Param));
         for (int t = 0; t < Tracks; t++)
@@ -1174,7 +1179,7 @@ class Project
                 if (f.Length < 6) throw new InvalidDataException("Bad playlist clip on line " + (li + 1));
                 double len = double.Parse(f[4], CultureInfo.InvariantCulture);
                 p.Clips.Add(new Clip { Track = Int(f[1], 0, Tracks - 1), Start = Dbl(f[2], 0, MaxBars * Steps), Pattern = Int(f[3], -1, int.MaxValue),
-                                       Len = len < 0 ? -1 : Dbl(f[4], 1e-6, MaxBars * Steps), Offset = Dbl(f[5], 0, MaxBars * Steps), Lane = f.Length > 6 ? Int(f[6], -1, int.MaxValue) : -1 });
+                                       Len = len < 0 ? -1 : Dbl(f[4], 1e-6, MaxBars * Steps), Offset = Dbl(f[5], 0, MaxBars * Steps), Lane = f.Length > 6 ? Int(f[6], -1, int.MaxValue) : -1, Channel = f.Length > 7 ? Int(f[7], -1, p.Channels.Count - 1) : -1 });
             }
             else if (f[0] == "pts")
             {
@@ -1229,7 +1234,8 @@ class Project
             }
         }
         if (p.Patterns.Count == 0) p.Patterns.Add(new Pattern { Name = "Pattern 1" });
-        if (p.Clips.Any(c => c.Lane < 0 && (c.Pattern < 0 || c.Pattern >= p.Patterns.Count))) throw new InvalidDataException("Playlist refers to a missing pattern.");
+        if (p.Clips.Any(c => c.Lane < 0 && c.Channel < 0 && (c.Pattern < 0 || c.Pattern >= p.Patterns.Count))) throw new InvalidDataException("Playlist refers to a missing pattern.");
+        if (p.Clips.Any(c => c.Channel >= 0 && c.Len <= 0)) throw new InvalidDataException("An audio clip has no length.");
         if (p.Clips.Any(c => c.Lane >= p.Automation.Count || c.Lane >= 0 && c.Len <= 0)) throw new InvalidDataException("Playlist refers to a missing automation lane.");
         return p;
     }
@@ -1839,7 +1845,7 @@ class Engine
     public const int SR = 44100;
     const int Frames = 1024, NBuf = 4, MaxVoices = 64;   // ~93 ms of buffered output
 
-    public class Voice { public double[] Ph; public double Z3; public Channel Ch; public int Key, Age, Len, Wait, GlideAge, GlideLen; public float Gain = 1, NotePan; public double Phase, Pos, Rate, Z1, Z2, Detune = 1, Shift, ShiftFrom, ShiftTo; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Shift: semitones it's currently bent by (slides, glide), moving from ShiftFrom to ShiftTo over GlideLen samples   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; NotePan/Detune: the note's own pan and fine pitch; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)
+    public class Voice { public double[] Ph; public double Z3; public int StopAt; public bool Audio; public Channel Ch; public int Key, Age, Len, Wait, GlideAge, GlideLen; public float Gain = 1, NotePan; public double Phase, Pos, Rate, Z1, Z2, Detune = 1, Shift, ShiftFrom, ShiftTo; public float[] Buf; public float Right; public bool Done, Live, Stereo; }   // Shift: semitones it's currently bent by (slides, glide), moving from ShiftFrom to ShiftTo over GlideLen samples   // Right/Stereo: a stereo sample's right side; Gain = velocity / 100; NotePan/Detune: the note's own pan and fine pitch; Wait = samples of silence before it starts (swing); Buf = pluck string; Live = played from a keyboard (follows the pitch wheel)   // StopAt: an audio clip's end (samples); Audio: an audio clip, played at its own pitch
 
     // Arpeggiator: a channel's held notes (from patterns, or keys held on a keyboard) play one at a time on a clock instead of together.
     class Held { public int Key, Vel, Fine; public float Pan; public long End; public bool Live; }
@@ -2126,6 +2132,15 @@ class Engine
                 int abs = loopLen > 0 && StepLimit == int.MaxValue ? (int)proj.LoopFrom + st % loopLen : st % songLen;   // the loop region, while playing live (exports play the whole song)
                 PlayStep = lastAbs = abs;
                 hits = proj.SoundingAt(abs);
+                foreach (var ac in proj.Clips)   // audio clips: one voice each, started on the clip's first 16th, or mid-clip if playback starts inside it
+                {
+                    if (ac.Channel < 0 || ac.Channel >= proj.Channels.Count || proj.TrackMuted(ac.Track)) continue;
+                    double rel = abs - ac.Start, alen = ac.Length(proj);
+                    if (rel < -1e-9 || rel >= alen - 1e-9 || !(rel < 1 - 1e-9 || st == 0 || loopLen > 0 && abs == (int)proj.LoopFrom)) continue;
+                    var sc = proj.Channels[ac.Channel];
+                    if (sc.Mute || sc.Sample == null) continue;
+                    AddVoice(new Voice { Ch = sc, Key = 60, Len = int.MaxValue / 2, StopAt = Math.Max(1, (int)((alen - rel) * sps)), Pos = (rel + ac.Offset) * sps * sc.SampleRate / SR, Audio = true });
+                }
             }
             else
             {
@@ -2274,7 +2289,10 @@ class Engine
             if (si < 0 || si >= sl.Length) { v.Done = true; return 0; }
             start = Math.Min(sl[si], smp.Length - 1); end = si + 1 < sl.Length ? Math.Min(sl[si + 1], smp.Length) : smp.Length;
         }
-        if (v.Rate == 0) v.Rate = c.SampleRate / (double)SR * Math.Pow(2, ((sl != null ? 0 : v.Key - 60) + c.Semitones()) / 12.0) * v.Detune;   // key 60 (C5) = original pitch
+        if (v.StopAt > 0 && v.Age >= v.StopAt) { v.Done = true; return 0; }   // an audio clip's end
+        if (v.Audio) sl = null;   // an audio clip plays the whole recording, slices or not
+        if (v.Audio) { start = 0; end = smp.Length; }
+        if (v.Rate == 0) v.Rate = c.SampleRate / (double)SR * (v.Audio ? 1 : Math.Pow(2, ((sl != null ? 0 : v.Key - 60) + c.Semitones()) / 12.0) * v.Detune);   // key 60 (C5) = original pitch; audio clips always
         double pitch = v.Rate * br, len = end - start, lo = c.Loop ? c.LoopStart * len : 0, hi = c.Loop ? Math.Max(lo + 64, c.LoopEnd * len) : len;
         if (c.Loop && v.Age > v.Len + SR / 30) { v.Done = true; return 0; }   // a looped note fades out over 30 ms after it ends
         double gain = c.Loop && v.Age > v.Len ? 1 - (v.Age - v.Len) / (SR / 30.0) : 1;
@@ -2300,6 +2318,7 @@ class Engine
             }
             v.Pos += pitch / c.Stretch;
         }
+        if (v.StopAt > 0) gain *= Math.Min(1, (v.StopAt - v.Age) / 220.0);   // a 5 ms fade at an audio clip's end, so a cut doesn't click
         v.Right = (float)(r * gain);
         return (float)(l * gain);
     }
@@ -2957,7 +2976,8 @@ class MainForm : Form
             c.DragDrop += (s, e) =>
             {
                 var files = e.Data.GetData(DataFormats.FileDrop) as string[];
-                if (files != null) BeginInvoke((Action)(() => OpenFiles(files)));   // after the drop returns, so Explorer isn't held up by any dialog
+                var at = ((Control)s).PointToClient(new Point(e.X, e.Y)); bool onPlaylist = s == playlist;
+                if (files != null) BeginInvoke((Action)(() => { if (onPlaylist) DropOnPlaylist(files, at); else OpenFiles(files); }));   // after the drop returns, so Explorer isn't held up by any dialog
             };
         }
         FormClosing += (s, e) => { if (!ConfirmDiscard()) { e.Cancel = true; return; } if (!screenshotMode) ClearAutosave(); midi.Close(); eng.Stop(); };   // saved or knowingly discarded: nothing to recover
@@ -4705,6 +4725,8 @@ class MainForm : Form
         g.DrawString("click to edit", Small, DimB, r.Right - 64, r.Bottom - 14);
     }
 
+    void ShowAudioEditor(int ch) { Changed(false); }   // the audio editor comes next
+
     AutoWindow autoWin;
     internal void ShowAutomation(int k)   // one automation editor at a time; it follows whichever lane opened it last
     {
@@ -5003,11 +5025,12 @@ class MainForm : Form
         g.SetClip(new RectangleF(PlHead, PlY0, W - PlHead, H - PlY0));
         foreach (var c in P.Clips)
         {
-            if (c.Track < plTop || c.Track >= plTop + shown || c.Lane < 0 && (c.Pattern < 0 || c.Pattern >= P.Patterns.Count) || c.Lane >= P.Automation.Count) continue;
+            if (c.Track < plTop || c.Track >= plTop + shown || c.Lane < 0 && c.Channel < 0 && (c.Pattern < 0 || c.Pattern >= P.Patterns.Count) || c.Lane >= P.Automation.Count || c.Channel >= P.Channels.Count) continue;
             double len = c.Length(P);
             if (c.Start > to || c.Start + len < plFrom) continue;
             var rc = new RectangleF(PlX(c.Start) + 1, PlTrackY(c.Track) + 1, (float)(len * cw) - 2, plRowH - 2);
             if (c.Lane >= 0) { PaintAutoClip(g, c, rc, cw); continue; }
+            if (c.Channel >= 0) { PaintAudioClip(g, c, rc, cw); continue; }
             var col = PatColors[c.Pattern % PatColors.Length]; if (P.TrackMuted(c.Track)) col = Color.FromArgb(90, col);
             Round(g, col, rc.X, rc.Y, rc.Width, rc.Height, 4);
             RoundEdge(g, c == plClip ? Color.White : ControlPaint.Dark(col, 0.25f), c == plClip ? 1.5f : 1, rc, 4);
@@ -5025,6 +5048,57 @@ class MainForm : Form
             using (var b = new SolidBrush(On)) g.FillPolygon(b, new[] { new PointF(x - 5, PlY0 - 8), new PointF(x + 5, PlY0 - 8), new PointF(x, PlY0 - 1) });
             g.SmoothingMode = am;
         }
+    }
+
+    readonly Dictionary<float[], float[]> peakCache = new Dictionary<float[], float[]>();   // a sample's loudest value per 256 frames, for drawing it
+    float[] Peaks(float[] a)
+    {
+        float[] pk;
+        if (peakCache.TryGetValue(a, out pk)) return pk;
+        pk = new float[a.Length / 256 + 1];
+        for (int k = 0; k < a.Length; k++) pk[k / 256] = Math.Max(pk[k / 256], Math.Abs(a[k]));
+        if (peakCache.Count > 64) peakCache.Clear();   // samples that were replaced or deleted
+        return peakCache[a] = pk;
+    }
+
+    void PaintAudioClip(Graphics g, Clip c, RectangleF rc, float cw)   // an audio clip: its name and its waveform, lined up with the song's tempo
+    {
+        var ch = P.Channels[c.Channel]; var col = Color.FromArgb(P.TrackMuted(c.Track) ? 90 : 255, 58, 84, 128);
+        Round(g, col, rc.X, rc.Y, rc.Width, rc.Height, 4);
+        RoundEdge(g, c == plClip ? Color.White : Color.FromArgb(110, 140, 190), c == plClip ? 1.5f : 1, rc, 4);
+        if (ch.Sample != null)
+        {
+            var pk = Peaks(ch.Sample); double per16 = 60.0 / P.Bpm / 4 * ch.SampleRate; float mid = rc.Y + rc.Height / 2 + 4, half = (rc.Height - 10) / 2;
+            using (var pen = new Pen(Color.FromArgb(200, 210, 225, 245)))
+                for (float x = 0; x < rc.Width; x++)
+                {
+                    int k = (int)((c.Offset + x / cw) * per16 / 256);
+                    if (k < 0 || k >= pk.Length) continue;
+                    float h = Math.Max(0.5f, pk[k] * half); g.DrawLine(pen, rc.X + x, mid - h, rc.X + x, mid + h);
+                }
+        }
+        if (rc.Width > 30) g.DrawString(ch.Name, Small, Brushes.White, new RectangleF(rc.X + 4, rc.Y, rc.Width - 6, 14), Fit);
+    }
+
+    // WAV files dropped on the playlist: each becomes a sample channel and an audio clip where it was dropped (one per track, downwards).
+    void DropOnPlaylist(string[] files, Point at)
+    {
+        var wavs = files.Where(f => IsExt(f, ".wav")).ToList();
+        if (wavs.Count == 0 || at.Y < PlY0 || at.X < PlHead) { OpenFiles(files); return; }
+        int t = Math.Max(0, Math.Min(Project.Tracks - 1, PlTrack(at.Y))); double start = Math.Max(0, PlSnapDown(PlStep(at.X)));
+        var failed = new List<string>();
+        Edit(() =>
+        {
+            foreach (var path in wavs)
+            {
+                var c = new Channel { Kind = "sample", Name = FreeName(Path.GetFileNameWithoutExtension(path)) };
+                try { Wav.Load(path, c); } catch (Exception e) { failed.Add(Path.GetFileName(path) + ": " + e.Message); continue; }
+                AddChannel1(c);
+                lock (P) P.Clips.Add(new Clip { Track = Math.Min(Project.Tracks - 1, t++), Start = start, Channel = P.Channels.Count - 1, Pattern = -1, Len = Project.SixteenthsOf(c, P.Bpm) });
+            }
+            Changed();
+        });
+        if (failed.Count > 0) MessageBox.Show(this, "Could not load:\n" + string.Join("\n", failed), "MiniDAW");
     }
 
     void PaintAutoClip(Graphics g, Clip c, RectangleF rc, float cw)   // an automation clip: its name and the stretch of curve it plays
@@ -5180,6 +5254,7 @@ class MainForm : Form
         if (!plMoved)   // a click: edit that pattern, or that automation curve
         {
             if (plMode == "move" && c.Lane >= 0) ShowAutomation(c.Lane);
+            else if (plMode == "move" && c.Channel >= 0) { selCh = c.Channel; ShowAudioEditor(c.Channel); }
             else if (plMode == "move" && c.Pattern >= 0 && c.Pattern < P.Patterns.Count) patBox.SelectedIndex = c.Pattern;
             playlist.Invalidate(); return;
         }
@@ -6038,6 +6113,23 @@ class MainForm : Form
                     "saved and opened again: a triplet note's exact position and length, the slide flag, and the channel's glide");
             }
 
+            {   // audio clips: a recording placed on the playlist, trimmed, played at its own speed from wherever playback starts
+                int sr2 = Engine.SR; double p16 = 60.0 / 128 / 4 * sr2;
+                var swell = Enumerable.Range(0, sr2 * 2).Select(k => (float)(0.5 * Math.Sin(2 * Math.PI * 300 * k / sr2) * (1 + k / (double)sr2))).ToArray();   // a swelling swell: position in it shows in its loudness
+                Func<Project> withClip = () => { var pj = Project.Demo(); pj.Clips.Clear(); foreach (var pt in pj.Patterns) foreach (var l in pt.Notes) l.Clear();
+                    pj.Channels.Add(new Channel { Kind = "sample", Name = "Vox", Insert = 5, Sample = swell, SampleRate = sr2 });
+                    pj.Clips.Add(new Clip { Track = 2, Start = 16, Len = 8, Offset = 4, Channel = 4, Pattern = -1 }); return pj; };
+                var ac = Engine.Bounce(withClip().ExportCopy(), true, 0);
+                Func<int, int, double> loudIn = (a0, a1) => { double m = 0; for (int k = a0; k < a1 && 2 * k < ac.Length; k++) m = Math.Max(m, Math.Abs(ac[2 * k])); return m; };
+                double before = loudIn(0, (int)(16 * p16) - 10), during = loudIn((int)(17 * p16), (int)(23 * p16)), after = loudIn((int)(24 * p16) + 300, (int)(28 * p16));
+                double expectAt = 0.5 * (1 + (4 + 1) * p16 / sr2) * 0.8 * 0.8;   // the swell 5 16ths in (4 trimmed + 1), through the 0.8 channel and master faders
+                double atStep17 = loudIn((int)(17 * p16), (int)(17 * p16) + 200);
+                var midProj = withClip(); midProj.LoopFrom = 20; midProj.LoopTo = 24; var midEng = new Engine { Proj = midProj, Playing = true, SongMode = true }; var midBuf = new float[2048]; midEng.Render(midBuf, 1024);
+                var sv2 = withClip(); var sb2 = Project.Parse(sv2.Lines().ToArray(), null); sv2.RemoveChannel(4);
+                check(before == 0 && during > 0.2 && after < 1e-4 && Math.Abs(atStep17 / expectAt - 1) < 0.1 && midBuf.Max(x => Math.Abs(x)) > 0.1
+                      && sb2.Clips.Count == 1 && sb2.Clips[0].Channel == 4 && sb2.Clips[0].Offset == 4 && sv2.Clips.Count == 0,
+                    "audio clips: one at bar 2 trimmed 4 16ths in plays only its 8 16ths, from the right place in the audio (" + atStep17.ToString("0.00") + " vs " + expectAt.ToString("0.00") + "); playback starting inside it plays it from there; it saves, and goes with its channel");
+            }
             {   // sampler options and the analog synth
                 int sr = Engine.SR;
                 Func<float[], Channel> sampleCh = data => new Channel { Kind = "sample", Name = "S", Insert = 1, Sample = data, SampleRate = sr };
